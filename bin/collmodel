@@ -29,9 +29,8 @@ conditions that hold there, and the builder runs once per restriction set:
 set 0 (the unrestricted algorithms) on every layout, then each set S on the
 layouts whose conditions are exactly S, over its restricted algorithms plus
 the unrestricted ones. The model file is collmodel/3. Compositional
-algorithms (--stage2, default: those restricted to hierarchical
-communicators, e.g. smp) are left out: their inner calls go through the
-selection being built.
+algorithms (--stage2, default: those with an inner key, e.g. smp) are left
+out: their inner calls go through the selection being built.
 
 Replay on recorded data in replay/data (replay/README.md), for development:
 
@@ -400,8 +399,10 @@ def restriction_sets(a, layouts, probe):
         if bad:
             sys.exit(f"--algs: not {a.op} algorithms in {a.coll_algorithms}: {', '.join(bad)}")
         algs = [x for x in algs if x.name in a.algs]
+    # default: the algorithms with an inner key; files from before the key: those restricted to hierarchical
+    has_inner = any("inner" in k for sec in cat.sections.values() for _, k in sec)
     stage2 = a.stage2.split(",") if a.stage2 is not None else \
-        [x.name for x in algs if "hierarchical" in x.restrictions]
+        [x.name for x in algs if (x.inner if has_inner else "hierarchical" in x.restrictions)]
     stage2 = [x for x in stage2 if x]
     algs1 = [x for x in algs if x.name not in stage2]
     if stage2:
@@ -455,7 +456,7 @@ def parse_args(argv):
     ap.add_argument("--coll-algorithms", metavar="PATH", help="the build's src/mpi/coll/coll_algorithms.txt: "
                     "restriction sets, with a precheck (collmodel/3)")
     ap.add_argument("--stage2", help="compositional algorithms to leave out, comma-separated (default: those "
-                    "restricted to hierarchical communicators)")
+                    "with an inner key in coll_algorithms.txt)")
     ap.add_argument("--probe-m", type=int, default=1024, help="message size of the precheck calls")
     ap.add_argument("--budget-node-h", type=float, default=2.0, help="stop after this many node-hours, all jobs")
     ap.add_argument("--tau-med", type=float, default=0.05, help="v1: stop when the estimated median error is below this")

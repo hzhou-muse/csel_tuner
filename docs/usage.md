@@ -121,8 +121,9 @@ bin/collmodel --op bcast --algs all \
   conditions hold (e.g. `800`, `release_gather` on single-node layouts). Each
   later set keeps a share of the budget in proportion to its layouts, and
   reuses the measurements made before it.
-- Compositional algorithms (`--stage2`, default those restricted to
-  `hierarchical`, e.g. `smp`) are not measured yet.
+- Compositional algorithms (`--stage2`, default those with an `inner` key
+  in `coll_algorithms.txt`, e.g. `smp`; for files without the key, those
+  restricted to `hierarchical`) are not measured yet.
 - Needs an MPICH whose `release_gather` condition has no side effects
   (pmodels/mpich#8048); with an older one the precheck of `release_gather`
   depends on how often it was evaluated.

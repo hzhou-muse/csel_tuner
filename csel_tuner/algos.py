@@ -25,6 +25,8 @@ class Alg:
         self.restrictions = [r.strip() for r in keys.get("restrictions", "").split(",") if r.strip()]
         self.extra_params = [p.strip() for p in keys.get("extra_params", "").split(",") if p.strip()]
         self.cvar_params = [p.strip() for p in keys.get("cvar_params", "").split(",") if p.strip()]
+        # inner: the (section, communicator) pairs a compositional algorithm calls through the selection
+        self.inner = [tuple(x.strip().split("@", 1)) for x in keys.get("inner", "").split(",") if x.strip()]
         coll = op[0].upper() + op[1:]
         self.leaf = keys.get("func_name") or "MPIR_%s_intra_%s" % (coll, name)
 

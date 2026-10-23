@@ -434,9 +434,24 @@ algorithm: `smp` needs `hierarchical`, which the node comm (one node) and
 the leaders' comm (one rank per node) do not have, so F2 selects the same
 algorithms as F1 for every inner call. The tool checks that: if F2 changes
 the choice for a layout an inner call uses, stage 2 is repeated with F2.
-Compositional algorithms are listed by `--stage2` (default: those with the
-`hierarchical` restriction); a `composite: 1` key in
-`coll_algorithms.txt`, which allows extra keys, would make it automatic.
+Compositional algorithms carry an `inner` key in `coll_algorithms.txt`
+(pmodels/mpich#8048): the collectives they call through the selection, as
+`<section>@<communicator>`, e.g. bcast smp `bcast-intra@node_comm,
+bcast-intra@node_roots_comm`, allreduce smp `reduce-intra@node_comm,
+allreduce-intra@node_roots_comm, bcast-intra@node_comm`. `--stage2`
+defaults to those algorithms (for files without the key: those restricted
+to `hierarchical`). From the key the tool gets, per algorithm, the ops
+whose stage-1 files stage 2 must load (other ops too: allreduce smp needs
+reduce and bcast), and the layouts the inner calls see: `node_comm` gives
+(1, ppn), `node_roots_comm` (N, 1), both in every stage-1 grid. The
+two-stage check is then per inner (op, communicator): no stage-2 algorithm
+of that op may be allowed under the precheck masks of those layouts (smp
+needs `hierarchical`, false on both). An inner call can name its own op
+(allreduce smp: `allreduce-intra@node_roots_comm`); the check covers it.
+With #8048 a forced algorithm whose restriction fails on an internal
+sub-communicator falls back to the selection even with
+`MPIR_CVAR_COLLECTIVE_FALLBACK=error`, so forcing smp measures smp with its
+inner calls selected by the loaded stage-1 file.
 `nb` depends on the nonblocking selection, which is not tuned; it is
 measured in stage 1 under MPICH's default nonblocking selection.
 
@@ -463,15 +478,12 @@ MPICH's default, per restriction set (e.g. single-node / multi-node).
   algorithm wins.
 - Budget: each later set keeps a share in proportion to its layouts, and
   reuses the measurements made before it at the same points.
-- **Stage 2 and `FALLBACK=error` conflict.** The algorithm CVAR is global:
-  forcing `smp` also forces it on smp's own inner calls on the node and
-  leaders' communicators, where `hierarchical` fails. With the default
-  fallback those calls fall back to the selection; with
-  `MPIR_CVAR_COLLECTIVE_FALLBACK=error` they fail, so `smp` fails on every
-  layout. Stage 2 needs either the default fallback (and the feasibility of
-  `hierarchical` from elsewhere) or an MPICH where a forced algorithm
-  applies only to the user's call, not to the inner calls of a
-  compositional algorithm.
+- **Forced compositional algorithms need #8048.** The algorithm CVAR is
+  global: forcing `smp` also forces it on smp's own inner calls, where
+  `hierarchical` fails. Before #8048, with
+  `MPIR_CVAR_COLLECTIVE_FALLBACK=error` those calls fail, so `smp` fails on
+  every layout; with #8048 calls on internal sub-communicators fall back
+  silently.
 
 ## 12. Limitations and next steps
 

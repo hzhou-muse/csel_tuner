@@ -32,6 +32,7 @@ bcast-intra:
     binomial
     smp
         restrictions: hierarchical
+        inner: bcast-intra@node_comm, bcast-intra@node_roots_comm
     tree
         extra_params: tree_type, k, is_non_blocking
         cvar_params: TREE_TYPE, TREE_KVAL, IS_NON_BLOCKING
@@ -70,6 +71,7 @@ def test_catalog():
     assert algs[3].leaf == "MPIDI_POSIX_mpi_bcast_release_gather" and algs[0].leaf == "MPIR_Bcast_intra_binomial"
     assert algs[4].leaf == "MPIR_Coll_nb"
     assert algs[2].extra_params == ["tree_type", "k", "is_non_blocking"]
+    assert algs[1].inner == [("bcast-intra", "node_comm"), ("bcast-intra", "node_roots_comm")]
     assert cat.conditions["comm_size"] and not cat.conditions["inplace"]
 
 
