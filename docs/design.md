@@ -345,10 +345,105 @@ shaped the design:
   also with power-of-two features. The model file is orders of magnitude
   smaller, and its inference is a few dozen lines that port to C.
 
-## 11. Limitations and next steps
+## 11. Restricted algorithms and staged sampling (planned)
 
-- **Live validation**: a v2 run on a small allocation, the tree, then each
-  layout measured under the loaded tree against every algorithm.
+So far the builders choose among the algorithms that have no
+`restrictions` in MPICH's `src/mpi/coll/coll_algorithms.txt`. On a
+single-node communicator MPICH's default instead takes
+`release_gather` (restriction `MPIDI_CH4_release_gather`), which a file of
+unrestricted algorithms then overrides. The plan:
+
+**Algorithms.** The candidates are all of the op's algorithms, from `--algs`
+or (`--algs all`) from the build's `coll_algorithms.txt` (`--coll-algorithms
+PATH`), checked against the items of the server's MPI_T enum for
+`MPIR_CVAR_<OP>_INTRA_ALGORITHM`. The file also gives each algorithm's leaf
+name (`func_name`, e.g. `MPIDI_POSIX_mpi_bcast_release_gather`), its extra
+parameters, and its restrictions. Parameters stay at their CVAR defaults.
+
+**Measurements fail instead of falling back.** The server runs with
+`MPIR_CVAR_COLLECTIVE_FALLBACK=error`, so a forced algorithm whose
+restriction fails returns an error instead of silently running `auto`.
+Needs in mpisrv: `MPI_ERRORS_RETURN` on its communicators and an error reply
+for the request (the restriction is a property of the communicator, so all
+members fail together and nothing hangs).
+
+**Precheck.** Before sampling a layout, one small request per algorithm;
+an error reply marks the algorithm infeasible there and it is never
+sampled at that layout. The result is the layout's feasible set. This
+relies on condition checks without side effects (MPICH: the release_gather
+condition used to count calls and create shared memory; now it only reads
+state, and the creation happens before the selection).
+
+**Restriction index.** The op's restrictive conditions (non-threshold
+conditions that appear in `restrictions`, including negated ones such as
+`!inplace`, each its own entry) are numbered in file order: bit k. An
+algorithm's mask is the OR of its bits; a layout's mask is the set of
+conditions that hold there (from the precheck: bit k holds where an
+algorithm needing only bit k ran). The subtree `<op>-intra-r<mask>`
+serves calls whose true conditions are exactly `mask`:
+
+- `r0` holds the unrestricted algorithms and is fitted on **every** layout:
+  it is the fallback whenever no restriction holds at run time, also on
+  layouts where one held during tuning (e.g. `release_gather` is off under
+  `MPI_THREAD_MULTIPLE`).
+- `r<S>`, S ≠ 0, is fitted on the layouts whose mask is S, and chooses
+  among the restricted algorithms whose mask is a subset of S, plus the leaf
+  `"call=<op>-intra-r0"`, whose time at a point is that of r0's choice
+  there. With one restricted algorithm, r1 is a short split on size.
+- A set with no layouts (mutually exclusive conditions) produces no subtree.
+- `<op>-intra-auto` is the dispatch: nested conditions over the bits in
+  use, each evaluated once on a path, ending in `call=` the matching
+  subtree; a set with no subtree calls its largest present subset, at worst
+  `r0`.
+
+**Stages for compositional algorithms.** An algorithm such as `smp` runs
+other collectives on sub-communicators (the node comm, the comm of node
+leaders), and those calls go through the selection itself, so its time
+depends on the file being built.
+
+1. Stage 1: sample every non-compositional algorithm (with their
+   restrictions), build the subtrees: file F1.
+2. Stage 2: relaunch the server with F1 loaded
+   (`MPIR_CVAR_COLL_SELECTION_JSON_FILE`), sample the compositional
+   algorithms, add them to the subtrees whose masks they fit: file F2.
+
+Two stages are enough when the inner calls do not reach a stage-2
+algorithm: `smp` needs `hierarchical`, which the node comm (one node) and
+the leaders' comm (one rank per node) do not have, so F2 selects the same
+algorithms as F1 for every inner call. The tool checks that: if F2 changes
+the choice for a layout an inner call uses, stage 2 is repeated with F2.
+Compositional algorithms are listed by `--stage2` (default: those with the
+`hierarchical` restriction); a `composite: 1` key in
+`coll_algorithms.txt`, which allows extra keys, would make it automatic.
+`nb` depends on the nonblocking selection, which is not tuned; it is
+measured in stage 1 under MPICH's default nonblocking selection.
+
+**Validation** scores against the best of all feasible algorithms and
+MPICH's default, per restriction set (e.g. single-node / multi-node).
+
+**Known limits.**
+- `release_gather` creates its shared memory after
+  `MPIR_CVAR_POSIX_NUM_COLLS_THRESHOLD` calls (5) on a communicator, or at
+  once when its CVAR forces it. A fresh communicator under the file runs r0
+  for its first calls; validation warms up past that.
+- mpisrv keeps every sub-communicator to the end, and with them their
+  release_gather shared memory, under `MPIR_CVAR_COLL_SHM_LIMIT_PER_NODE`
+  (64 MB). Small for bcast; reduce buffers (32 KB per rank per comm) can
+  reach it for allreduce. A later creation failure turns the algorithm
+  infeasible on that comm (an error reply mid-sampling), which the builder
+  treats like a failed precheck and reports.
+- Per-call conditions (`inplace`, `commutative`, `builtin_op`,
+  `count_ge_pof2`) depend on the call's arguments, not the layout: the
+  precheck runs per call variant. Bcast has none.
+- Without a node-count condition, `r0` cannot tell 1 x 32 from 32 x 1; the
+  restriction split removes that conflict only where a restricted
+  algorithm wins.
+
+## 12. Limitations and next steps
+
+- **Restricted and compositional algorithms** (§11): not implemented yet.
+  Until then a file overrides MPICH's `release_gather` on single-node
+  communicators.
 - **Node-aware CSEL conditions** (`num_nodes`, `ppn`) need MPICH support.
 - **Collectives:** only bcast is wired through the builders (`OPS` in
   `bin/collmodel`, leaf parameters in `bin/colltree`); mpisrv also measures
