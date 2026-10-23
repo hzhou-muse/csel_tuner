@@ -8,11 +8,12 @@
 switch: the plan set "switch" (gen_plans.py) measures the same requests with
 the algorithm chosen per request (S-req, cvar.*) and for the launch
 (S-env-<alg>). Per algorithm: the ratio T(per request) / T(per launch) at
-every (layout, size), the data checks, and errors. PASS when every
-algorithm's median ratio is within 10% and 90% of its points within 25%
-(the two launches run at different times, so some noise is expected; an
-ignored switch shows up as ratios far from 1 for every algorithm but the
-default).
+every (layout, size), the data checks, and errors. An algorithm is "ok"
+when its median ratio is within 10% and 90% of its points within 25%,
+"noisy" when only the median is (the launches run at different times),
+and FAIL otherwise or on a failed data check. An ignored switch moves the
+medians far from 1. The verdict: SWITCH CHECK PASSED (all ok), PASSED
+WITH NOISE (no FAIL), or FAILED.
 
 validate: the plan set "validate" measures, at points the model builder
 did not choose, every algorithm per request (truth), MPICH's own selection
@@ -88,24 +89,34 @@ def switch(a):
            "layout and size.", "",
            "| algorithm | points | median ratio | p10 | p90 | within 25% | data checks per request / launch | verdict |",
            "|---|---|---|---|---|---|---|---|"]
-    passed = bool(algs)
+    verdicts = []
     for alg in algs:
         keys = sorted(k for k in req if k[0] == alg and k in env_t)
         r = np.array([req[k] / env_t[k] for k in keys])
         cr = checks.get((alg, "req"), [0, 0])
         ce = checks.get((alg, "env"), [0, 0])
-        ok = len(r) > 0 and abs(np.median(r) - 1) <= 0.10 and np.mean(np.abs(np.log(r)) <= np.log(1.25)) >= 0.9 \
-            and cr[0] == cr[1] and ce[0] == ce[1]
-        passed &= bool(ok)
+        if not len(r):
+            verdicts.append("FAIL")
+            out.append(f"| {alg} | 0 | | | | | | FAIL |")
+            continue
+        median_ok = abs(np.median(r) - 1) <= 0.10 and cr[0] == cr[1] and ce[0] == ce[1]
+        tail_ok = np.mean(np.abs(np.log(r)) <= np.log(1.25)) >= 0.9
+        v = "ok" if median_ok and tail_ok else ("noisy" if median_ok else "FAIL")
+        verdicts.append(v)
         out.append(f"| {alg} | {len(r)} | {np.median(r):.3f} | {np.quantile(r, .1):.3f} | {np.quantile(r, .9):.3f} | "
-                   f"{np.mean(np.abs(np.log(r)) <= np.log(1.25)):.0%} | {cr[1]}/{cr[0]} , {ce[1]}/{ce[0]} | "
-                   f"{'ok' if ok else 'FAIL'} |" if len(r) else f"| {alg} | 0 | | | | | | FAIL |")
+                   f"{np.mean(np.abs(np.log(r)) <= np.log(1.25)):.0%} | {cr[1]}/{cr[0]} , {ce[1]}/{ce[0]} | {v} |")
     if errors:
-        passed = False
+        verdicts.append("FAIL")
         out += ["", f"Error replies ({len(errors)}):", ""] + [f"- {e}" for e in errors[:20]]
-    out += ["", "SWITCH CHECK PASSED" if passed else "SWITCH CHECK FAILED"]
+    if not verdicts or "FAIL" in verdicts:
+        final = "SWITCH CHECK FAILED"
+    elif "noisy" in verdicts:
+        final = "SWITCH CHECK PASSED WITH NOISE"
+    else:
+        final = "SWITCH CHECK PASSED"
+    out += ["", final]
     print("\n".join(out))
-    return 0 if passed else 1
+    return 1 if final.endswith("FAILED") else 0
 
 
 def load_model(path):

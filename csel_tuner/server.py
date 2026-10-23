@@ -146,13 +146,16 @@ class Server:
             self.p.kill()
             self.p.wait()
 
-    def close(self):
+    def close(self, wait=30):
+        """Ask the server to quit (it first answers the requests already
+        sent) and wait up to `wait` seconds; kill it after that. A clean exit
+        lets MPI remove its shared-memory files; a kill leaves them."""
         if self.p.poll() is None:
-            self.p.stdin.write("op=quit\n")
-            self.p.stdin.close()
             try:
-                self.p.wait(30)
-            except subprocess.TimeoutExpired:
+                self.p.stdin.write("op=quit\n")
+                self.p.stdin.close()
+                self.p.wait(wait)
+            except (subprocess.TimeoutExpired, OSError):
                 self.kill()
         if self.log:
             self.log.close()

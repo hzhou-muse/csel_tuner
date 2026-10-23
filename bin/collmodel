@@ -428,10 +428,8 @@ def main(argv=None):
         sys.exit("terminated before the builder started; the journal keeps what was measured")
     finally:
         if srv:
-            if b is not None and b.stop != "terminated":
-                srv.close()
-            else:
-                srv.kill()
+            # after SIGTERM there is little time, but a clean quit still lets MPI remove its shared memory
+            srv.close(wait=30 if b is not None and b.stop != "terminated" else 5)
     jobs[-1]["end"] = round(time.time(), 3)
     complete = b.stop not in ("terminated", "deadline")
     if not b.samplers:
