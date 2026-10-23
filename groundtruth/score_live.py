@@ -216,7 +216,7 @@ def validate(a):
         alg = model_choice(mask, n, q, i)
         r = {"model, per point": t[alg] / best if alg in t else float("nan")}
         for name, tree in trees.items():
-            key = json_choice(tree[f"{op}-intra-auto"], x, tree)
+            key = json_choice(tree[f"{op}-intra-auto"], x, tree, bits)
             alg = leaf_alg.get(key, key.split("_intra_", 1)[-1])
             r[name] = t[alg] / best if alg in t else float("nan")
             if name == "tree (offline)" and (None, n, q, m) in tuned and alg in t:

@@ -236,6 +236,7 @@ It prints the tree size, the predicted regret and the algorithms used.
 | `--tol` | 0.005 | allowed predicted geomean regret over the full tree; larger = smaller tree |
 | `--max-regret` | 1.5 | pruning never lets a point's predicted regret exceed this |
 | `--node-aware` | off | also split on `num_nodes` and `ppn` (MPICH with pmodels/mpich#8048) |
+| `--nested-dispatch` | off | dispatch on restrictions with nested conditions instead of `dispatch=` (MPICH without pmodels/mpich#8048) |
 | `--param ALG.KEY=VALUE` | | extra parameter of an algorithm leaf, e.g. `tree.k=4` |
 
 Use it with MPICH:
@@ -253,9 +254,12 @@ stops `MPI_Init` with the line and column of the error.
 From a `collmodel/3` file the output has a subtree per restriction set (the suffix is the mask of true conditions,
 bit k = the k-th non-threshold condition in `coll_algorithms.txt`),
 `name=bcast-intra-0`, `name=bcast-intra-800`, ..., and
-`name=bcast-intra-auto` dispatches on the restrictive conditions, e.g.
-`{"MPIDI_CH4_release_gather": "call=bcast-intra-800", "any":
-"call=bcast-intra-0"}`. A restricted set's leaves are its algorithms or
+`name=bcast-intra-auto` dispatches on the restrictions, e.g.
+`"dispatch=bcast-intra(0x820)"`: MPICH continues in `bcast-intra-800` on a
+single-node communicator, `bcast-intra-20` on a hierarchical one (after
+stage 2), else `bcast-intra-0`. An MPICH without `dispatch=`
+(pmodels/mpich#8048) needs `--nested-dispatch`, which writes nested
+conditions ending in `call=`. A restricted set's leaves are its algorithms or
 `"call=bcast-intra-0"`. To see which algorithms ran, set
 `MPIR_CVAR_DUMP_COLL_ALGO_COUNTERS=0` (rank 0 prints its counts at
 finalize).

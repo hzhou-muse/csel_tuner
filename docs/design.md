@@ -415,11 +415,14 @@ single-node communicators:
   `"call=<op>-intra-0"`, whose time at a point is that of r0's choice
   there. With one restricted algorithm it is a short split on size.
 - A set with no layouts (mutually exclusive conditions) produces no subtree.
-- `<op>-intra-auto` is the dispatch: nested conditions over the bits in
-  use, each evaluated once on a path, ending in `call=` the matching
-  subtree; a set with no subtree calls its largest present subset, at
-  worst `r0` (with positive restrictions a subset's algorithms are always
-  allowed).
+- `<op>-intra-auto` is the dispatch, `"dispatch=<op>-intra(<bits>)"`
+  (pmodels/mpich#8048): MPICH evaluates the restrictions in `bits` with one
+  call and continues in the matching subtree; a set with no subtree uses
+  its largest present subset, at worst `r0` (with positive restrictions a
+  subset's algorithms are always allowed), resolved when the file is
+  loaded. It costs about 20 ns per call less than nested conditions for two
+  restrictions. `--nested-dispatch` writes the nested conditions instead,
+  each evaluated once on a path, for an MPICH without `dispatch=`.
 
 **Stages for compositional algorithms.** An algorithm such as `smp` runs
 other collectives on sub-communicators (the node comm, the comm of node

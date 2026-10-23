@@ -150,6 +150,13 @@ def test_dispatch_and_choice():
     assert json_choice(trees["bcast-intra-auto"], x(4, 64, True), trees) == "MPIDI_POSIX_mpi_bcast_release_gather"
     assert json_choice(trees["bcast-intra-auto"], x(4, 4096, True), trees) == "MPIR_Bcast_intra_binomial"
     assert json_choice(trees["bcast-intra-auto"], x(8, 64, False), trees) == "MPIR_Bcast_intra_tree"
+    # the restriction-mask node chooses the same; set 0x8 (hierarchical) has no subtree: its subset 0
+    trees["bcast-intra-auto"] = "dispatch=bcast-intra(0x18)"
+    for p, m, rg, want in [(4, 64, True, "MPIDI_POSIX_mpi_bcast_release_gather"),
+                           (4, 4096, True, "MPIR_Bcast_intra_binomial"), (8, 64, False, "MPIR_Bcast_intra_tree")]:
+        assert json_choice(trees["bcast-intra-auto"], x(p, m, rg), trees, bits) == want
+    xh = dict(x(8, 64, False), cond={"hierarchical": True, "MPIDI_CH4_release_gather": False})
+    assert json_choice(trees["bcast-intra-auto"], xh, trees, bits) == "MPIR_Bcast_intra_tree"
 
 
 def test_stage2_sets_and_fixed_point():
@@ -199,9 +206,13 @@ def test_two_set_replay():
                        check=True, capture_output=True)
         t = json.load(open(tuning))
         assert set(t) == {"name=bcast-intra-0", "name=bcast-intra-10", "name=bcast-intra-auto"}
+        assert t["name=bcast-intra-auto"] == "dispatch=bcast-intra(0x10)"
+        assert "MPIDI_POSIX_mpi_bcast_release_gather" in json.dumps(t["name=bcast-intra-10"])
+        subprocess.run([sys.executable, os.path.join(REPO, "bin", "colltree"), model, "--out", tuning,
+                        "--nested-dispatch"], check=True, capture_output=True)
+        t = json.load(open(tuning))
         assert t["name=bcast-intra-auto"] == {"MPIDI_CH4_release_gather": "call=bcast-intra-10",
                                               "any": "call=bcast-intra-0"}
-        assert "MPIDI_POSIX_mpi_bcast_release_gather" in json.dumps(t["name=bcast-intra-10"])
 
 
 def test_stage2_replay():
@@ -227,8 +238,7 @@ def test_stage2_replay():
         assert all(n > 1 and q > 1 for n, q in d["sets"][0]["layouts"])
         run(os.path.join(REPO, "bin", "colltree"), m1, m2, "--out", t2)
         t = json.load(open(t2))
-        assert t["name=bcast-intra-auto"] == {"hierarchical": "call=bcast-intra-8", "any": {
-            "MPIDI_CH4_release_gather": "call=bcast-intra-10", "any": "call=bcast-intra-0"}}
+        assert t["name=bcast-intra-auto"] == "dispatch=bcast-intra(0x18)"
         sub = json.dumps(t["name=bcast-intra-8"])
         assert "MPIR_Bcast_intra_smp" in sub or "call=bcast-intra-0" in sub
 

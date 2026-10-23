@@ -204,16 +204,25 @@ def json_tree(root, alg_names, leaf):
     return obj(root)
 
 
-def json_choice(obj, x, trees=None):
+def json_choice(obj, x, trees=None, bits=None):
     """The algorithm a CSEL subtree (as json_tree writes it) chooses at one
     point, x = {"p": comm_size, "m": message size, "N": nodes, "ppn": ranks
     per node, "pof2": 0/1, "cond": {restrictive condition: bool}}: siblings
     are tried in order, the first true condition is followed, "any" always
     is; "call=NAME" continues in trees["NAME"] (a file's subtrees, keys
-    without "name="). Returns the leaf's key after "algorithm=", e.g.
-    "MPIR_Bcast_intra_binomial"."""
+    without "name="); "dispatch=PREFIX(BITS)" continues in PREFIX-<the bits
+    whose condition holds, in hex>, or its largest subset that exists
+    (bits: the restriction names, bit k = bits[k]). Returns the leaf's key
+    after "algorithm=", e.g. "MPIR_Bcast_intra_binomial"."""
     feature = {"comm_size": "p", "avg_msg_size": "m", "num_nodes": "N", "ppn": "ppn"}
     while True:
+        if isinstance(obj, str) and obj.startswith("dispatch="):
+            prefix, mask = obj[len("dispatch="):].rstrip(")").split("(")
+            mask = int(mask, 0)
+            m = sum(1 << k for k, b in enumerate(bits) if mask >> k & 1 and x["cond"].get(b, False))
+            subs = [s for s in range(m + 1) if s & ~m == 0 and "%s-%x" % (prefix, s) in trees]
+            obj = trees["%s-%x" % (prefix, max(subs, key=lambda s: (bin(s).count("1"), -s)))]
+            continue
         if isinstance(obj, str):
             if not obj.startswith("call="):
                 raise ValueError("leaf %r" % obj)

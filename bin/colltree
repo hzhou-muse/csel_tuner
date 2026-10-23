@@ -22,9 +22,11 @@ restriction set; the output then has one subtree per set
 - "name=<op>-intra-<S in hex>", fitted on the layouts where exactly the
   conditions S hold, choosing among S's restricted algorithms and the leaf
   "call=<op>-intra-0" (timed as r0's choice at each point, from S's model);
-- "name=<op>-intra-auto", the dispatch: nested restrictive conditions, each
-  tested once, ending in "call=" the subtree of the conditions that hold
-  (a set without a subtree: its largest subset that has one, at worst r0).
+- "name=<op>-intra-auto", the dispatch: "dispatch=<op>-intra(<bits>)", the
+  restriction-mask node of pmodels/mpich#8048 (MPICH continues in the subtree
+  of the restrictions that hold, or of its largest subset that has one, at
+  worst r0); with --nested-dispatch, for an MPICH without it, nested
+  restrictive conditions ending in "call=" those subtrees.
 
 With a stage-2 file (bin/collmodel --stage1) as the second argument, its
 sets are added: each chooses between the compositional algorithms and
@@ -120,6 +122,8 @@ def main(argv=None):
                     help="pruning never lets a point's predicted regret rise above this")
     ap.add_argument("--max-leaves", type=int, default=1024, help="size of the full tree before pruning")
     ap.add_argument("--param", action="append", default=[], metavar="ALG.KEY=VALUE")
+    ap.add_argument("--nested-dispatch", action="store_true", help="dispatch on restrictions with nested "
+                    "conditions (for an MPICH without dispatch=, pmodels/mpich#8048)")
     a = ap.parse_args(argv)
     d = json.load(open(a.model))
     if d.get("format") not in ("collmodel/2", "collmodel/3") or d.get("stage", 1) != 1:
@@ -198,7 +202,14 @@ def main(argv=None):
             out[f"name={set_name(op, mask)}"] = json_tree(t, x["algs"], sub)
             report(set_name(op, mask) + " (stage 2)", t, path, x["algs"], len(lays))
             masks.add(mask)
-        out[f"name={op}-intra-auto"] = dispatch(op, d["conditions"], sorted(masks))
+        if a.nested_dispatch:
+            out[f"name={op}-intra-auto"] = dispatch(op, d["conditions"], sorted(masks))
+        else:
+            bits = 0
+            for m in masks:
+                bits |= m
+            out[f"name={op}-intra-auto"] = "dispatch=%s-intra(0x%x)" % (op, bits) if bits else \
+                "call=" + set_name(op, 0)
     depth = json_depth(out)
     if depth > 64:
         sys.exit(f"tree nests {depth} levels; MPICH's parser allows 64 (try a larger --tol)")
