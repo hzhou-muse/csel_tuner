@@ -59,6 +59,12 @@
  * MPISRV_CVAR_SWITCH=1; without it cvar.* requests are refused.
  * check=1 (bcast) first broadcasts a pattern and verifies it on every rank;
  * its reply also lists the local ranks used on the first node (node0_locals).
+ * probe=1 runs only the untimed call (and the check): whether the operation
+ * runs on this layout with these CVARs. Its reply has k=0 and no times.
+ * Sub-communicators return errors (MPI_ERRORS_RETURN): when a call fails on
+ * any member (e.g. a forced algorithm whose restriction fails, with
+ * MPIR_CVAR_COLLECTIVE_FALLBACK=error), the measurement stops and the reply
+ * is {"status":"error","seq":..,"layout":..,"cvars":..,"msg":"<MPI error>"}.
  * See docs/design.md.
  *
  * Environment: MPISRV_IDLE selects how ranks wait for the next request:
@@ -111,6 +117,7 @@ struct req {
     int cold;
     int check;
     int sync_call;              /* sync=call: barrier before every call */
+    int probe;                  /* probe=1: the untimed call only */
     char tag[TAG_LEN];
     int ncvar;                  /* cvar.NAME=VALUE tokens, applied for this request only */
     char cvar_name[MAX_CVARS][CVAR_LEN];
@@ -118,6 +125,8 @@ struct req {
 };
 
 struct result {
+    int failed;                 /* a call failed on some member */
+    char msg[MPI_MAX_ERROR_STRING];     /* error string of the first failure on comm rank 0 */
     long m;
     int k;
     int check_err;              /* -1: not checked */
@@ -153,6 +162,7 @@ static struct {
     MPI_Comm comm;
 } comms[MAX_COMMS];
 static int num_comms;
+static int call_err;            /* first error code of an MPI call in this measurement */
 
 /* ---- topology ---------------------------------------------------------- */
 
@@ -362,6 +372,8 @@ static MPI_Comm get_comm(const struct req *rq)
     }
     MPI_Comm c;
     MPI_Comm_split(MPI_COMM_WORLD, color, key, &c);
+    if (c != MPI_COMM_NULL)
+        MPI_Comm_set_errhandler(c, MPI_ERRORS_RETURN);
     if (num_comms < MAX_COMMS) {
         comms[num_comms].key = *rq;
         comms[num_comms].comm = c;
@@ -553,6 +565,8 @@ static const char *parse(char *line, struct req *rq)
                 return "pair must be a,b";
         } else if (!strcmp(tok, "root")) {
             rq->root = atoi(val);
+        } else if (!strcmp(tok, "probe")) {
+            rq->probe = atoi(val) != 0;
         } else if (!strcmp(tok, "batches")) {
             rq->batches = atoi(val);
         } else if (!strcmp(tok, "target_us")) {
@@ -690,19 +704,24 @@ static double run(const struct req *rq, MPI_Comm c, int crank, long count, int k
         }
         /* ping-pong and bcast use one buffer, like bench/pingpong.c */
         char *s = sbuf + off, *r = rbuf + off;
+        int rc;
         if (rq->op == OP_PINGPONG) {
             if (crank == 0) {
-                MPI_Send(s, count, MPI_BYTE, 1, 0, c);
-                MPI_Recv(s, count, MPI_BYTE, 1, 0, c, MPI_STATUS_IGNORE);
+                rc = MPI_Send(s, count, MPI_BYTE, 1, 0, c);
+                if (rc == MPI_SUCCESS)
+                    rc = MPI_Recv(s, count, MPI_BYTE, 1, 0, c, MPI_STATUS_IGNORE);
             } else {
-                MPI_Recv(s, count, MPI_BYTE, 0, 0, c, MPI_STATUS_IGNORE);
-                MPI_Send(s, count, MPI_BYTE, 0, 0, c);
+                rc = MPI_Recv(s, count, MPI_BYTE, 0, 0, c, MPI_STATUS_IGNORE);
+                if (rc == MPI_SUCCESS)
+                    rc = MPI_Send(s, count, MPI_BYTE, 0, 0, c);
             }
         } else if (rq->op == OP_BCAST) {
-            MPI_Bcast(s, count, MPI_BYTE, rq->root, c);
+            rc = MPI_Bcast(s, count, MPI_BYTE, rq->root, c);
         } else {
-            MPI_Allreduce(s, r, count, MPI_INT, MPI_SUM, c);
+            rc = MPI_Allreduce(s, r, count, MPI_INT, MPI_SUM, c);
         }
+        if (rc != MPI_SUCCESS && !call_err)
+            call_err = rc;
         if (rq->sync_call)
             sum += MPI_Wtime() - t0;
     }
@@ -716,13 +735,34 @@ static int check_bcast(const struct req *rq, MPI_Comm c, int crank)
     unsigned char *b = (unsigned char *) sbuf;
     for (long i = 0; i < n; i++)
         b[i] = crank == rq->root ? (unsigned char) (i * 131 + rq->seq + 7) : 0;
-    MPI_Bcast(b, n, MPI_BYTE, rq->root, c);
+    int rc = MPI_Bcast(b, n, MPI_BYTE, rq->root, c);
+    if (rc != MPI_SUCCESS && !call_err)
+        call_err = rc;
     int bad = 0;
     for (long i = 0; i < n; i++)
         if (b[i] != (unsigned char) (i * 131 + rq->seq + 7))
             bad++;
     MPI_Allreduce(MPI_IN_PLACE, &bad, 1, MPI_INT, MPI_SUM, c);
     return bad;
+}
+
+/* Whether a call has failed on any member; comm rank 0 gets the message. The
+ * failure is agreed on with an MPI_Allreduce of MPI_INT, which a restriction
+ * on the measured operation does not affect. */
+static int any_failed(MPI_Comm c, int crank, struct result *res)
+{
+    int failed = call_err != MPI_SUCCESS;
+    MPI_Allreduce(MPI_IN_PLACE, &failed, 1, MPI_INT, MPI_MAX, c);
+    if (failed && crank == 0) {
+        res->failed = 1;
+        if (call_err) {
+            int len;
+            MPI_Error_string(call_err, res->msg, &len);
+        } else {
+            snprintf(res->msg, sizeof(res->msg), "the call failed on another member");
+        }
+    }
+    return failed;
 }
 
 static void measure(const struct req *rq, MPI_Comm c, struct result *res)
@@ -732,8 +772,18 @@ static void measure(const struct req *rq, MPI_Comm c, struct result *res)
     long count = rq->op == OP_ALLREDUCE ? rq->m / (long) sizeof(int) : rq->m;
     double w0 = MPI_Wtime();
 
+    call_err = MPI_SUCCESS;
+    res->failed = 0;
+    res->msg[0] = '\0';
+    res->k = 0;
+    res->spread = 0;
+    res->m = rq->op == OP_ALLREDUCE ? count * (long) sizeof(int) : count;
     res->check_err = rq->check && rq->op == OP_BCAST ? check_bcast(rq, c, crank) : -1;
     run(rq, c, crank, count, 1);        /* first-call exclusion */
+    if (any_failed(c, crank, res) || rq->probe) {
+        res->wall_us = (MPI_Wtime() - w0) * 1e6;
+        return;
+    }
     res->spun_up = spinup_us > 0;
     if (res->spun_up && idle_mode == IDLE_SPLIT) {      /* only if some member was asleep */
         int cold = !hot;
@@ -768,6 +818,8 @@ static void measure(const struct req *rq, MPI_Comm c, struct result *res)
     }
     MPI_Reduce(e, emax, rq->batches, MPI_DOUBLE, MPI_MAX, 0, c);
     MPI_Reduce(e, emin, rq->batches, MPI_DOUBLE, MPI_MIN, 0, c);
+    if (any_failed(c, crank, res))
+        return;
     if (crank == 0) {
         double div = rq->op == OP_PINGPONG ? 2.0 * k : k;
         for (int j = 0; j < rq->batches; j++)
@@ -862,8 +914,8 @@ static void reply_info(int seq)
 
 static void reply_result(const struct req *rq, const struct result *res)
 {
-    fprintf(out, "{\"status\":\"ok\",\"seq\":%d,\"op\":\"%s\",\"m\":%ld,", rq->seq,
-            op_names[rq->op], res->m);
+    fprintf(out, "{\"status\":\"%s\",\"seq\":%d,\"op\":\"%s\",\"m\":%ld,",
+            res->failed ? "error" : "ok", rq->seq, op_names[rq->op], res->m);
     if (rq->op == OP_PINGPONG)
         fprintf(out, "\"pair\":[%d,%d],", rq->pair[0], rq->pair[1]);
     else
@@ -871,7 +923,7 @@ static void reply_result(const struct req *rq, const struct result *res)
                 place_names[rq->place], rq->node_off, rq->node_stride);
     if (rq->op == OP_BCAST)
         fprintf(out, "\"root\":%d,", rq->root);
-    if (res->check_err >= 0) {
+    if (res->check_err >= 0 && !res->failed) {
         fprintf(out, "\"check\":\"%s\",\"check_err\":%d,", res->check_err ? "fail" : "ok",
                 res->check_err);
         /* placement record: local ranks used on the first node */
@@ -894,9 +946,18 @@ static void reply_result(const struct req *rq, const struct result *res)
         }
         fprintf(out, "},");
     }
+    if (res->failed) {
+        fprintf(out, "\"msg\":\"");
+        put_string(res->msg);
+        fprintf(out, "\",\"wall_us\":%.1f,\"tag\":\"%s\"}\n", res->wall_us, rq->tag);
+        fflush(out);
+        return;
+    }
+    if (rq->probe)
+        fprintf(out, "\"probe\":1,");
     fprintf(out, "\"cache\":\"%s\",\"sync\":\"%s\",\"k\":%d,\"t_us\":[", rq->cold ? "cold" : "hot",
             rq->sync_call ? "call" : "batch", res->k);
-    for (int j = 0; j < rq->batches; j++)
+    for (int j = 0; j < (rq->probe ? 0 : rq->batches); j++)
         fprintf(out, "%s%.4f", j ? "," : "", res->t_us[j]);
     fprintf(out, "],\"t_rank_spread\":%.4f,\"wall_us\":%.1f,\"tag\":\"%s\"}\n",
             res->spread, res->wall_us, rq->tag);
