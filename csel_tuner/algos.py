@@ -2,14 +2,16 @@
 
     cat = Catalog.load("coll_algorithms.txt")
     algs = cat.algorithms("bcast")        # [Alg], in file order, plus nb
-    bits = cat.restriction_bits("bcast")  # restrictive conditions: bit k = bits[k]
-    algs[0].mask(bits), algs[0].leaf      # e.g. 0, "MPIR_Bcast_intra_binomial"
+    bits = cat.restriction_bits()         # restrictive conditions: bit k = bits[k], for every op
+    algs[0].requires(bits), algs[0].leaf  # e.g. (0, 0), "MPIR_Bcast_intra_binomial"
 
-An algorithm's restrictions are conditions that must hold for it to run. The
-non-threshold ones (e.g. MPIDI_CH4_release_gather, hierarchical, !inplace;
-a negated condition is its own entry) are numbered in file order over the
-collective's algorithms; an algorithm's mask is the OR of its bits. Mask 0:
-no restriction.
+An algorithm's restrictions are conditions that must hold (`c`) or must not
+hold (`!c`) for it to run. The restrictive conditions are the non-threshold
+entries of the file's `conditions:` list, numbered in that order (one
+numbering for every collective; appending a condition keeps the others'
+numbers). A restriction set is the mask of the conditions that are true; an
+algorithm runs in set S when its required bits are in S and its excluded
+bits are not (allowed()). requires() == (0, 0): no restriction.
 """
 import re
 
@@ -23,12 +25,26 @@ class Alg:
         coll = op[0].upper() + op[1:]
         self.leaf = keys.get("func_name") or "MPIR_%s_intra_%s" % (coll, name)
 
-    def mask(self, bits):
-        m = 0
+    def requires(self, bits):
+        """(bits that must be set, bits that must be clear)"""
+        pos = neg = 0
         for r in self.restrictions:
-            if r in bits:
-                m |= 1 << bits.index(r)
-        return m
+            name = r.lstrip("!")
+            if name in bits:
+                if r.startswith("!"):
+                    neg |= 1 << bits.index(name)
+                else:
+                    pos |= 1 << bits.index(name)
+        return pos, neg
+
+    def mask(self, bits):
+        """the bits the algorithm's restrictions involve; 0: unrestricted"""
+        pos, neg = self.requires(bits)
+        return pos | neg
+
+    def allowed(self, bits, s):
+        pos, neg = self.requires(bits)
+        return pos & ~s == 0 and neg & s == 0
 
     def __repr__(self):
         return "Alg(%s%s)" % (self.name, ", " + ",".join(self.restrictions) if self.restrictions else "")
@@ -75,13 +91,14 @@ class Catalog:
             out.append(Alg(op, "nb", {"func_name": "MPIR_Coll_nb"}))
         return out
 
-    def restriction_bits(self, op, kind="intra"):
-        bits = []
+    def restriction_bits(self):
+        """The restrictive (non-threshold) conditions in file order: bit k = [k]."""
+        return [c for c, thresh in self.conditions.items() if not thresh]
+
+    def check(self, op, kind="intra"):
+        """Every restriction of the op's algorithms is a listed restrictive condition."""
+        bits = self.restriction_bits()
         for a in self.algorithms(op, kind):
             for r in a.restrictions:
-                name = r.lstrip("!")
-                if name not in self.conditions:
-                    raise KeyError("%s: restriction %s is not a listed condition" % (a.name, r))
-                if not self.conditions[name] and r not in bits:
-                    bits.append(r)
-        return bits
+                if r.lstrip("!") not in bits:
+                    raise KeyError("%s: restriction %s is not a listed non-threshold condition" % (a.name, r))

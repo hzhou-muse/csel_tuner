@@ -118,7 +118,7 @@ bin/collmodel --op bcast --algs all \
   left out (e.g. `nb` without a nonblocking selection that works here).
 - Then one builder per restriction set: `r0` (unrestricted algorithms) on
   every layout, then each other set on the layouts where exactly its
-  conditions hold (e.g. `r2`, `release_gather` on single-node layouts). Each
+  conditions hold (e.g. `r1024`, `release_gather` on single-node layouts). Each
   later set keeps a share of the budget in proportion to its layouts, and
   reuses the measurements made before it.
 - Compositional algorithms (`--stage2`, default those restricted to
@@ -233,10 +233,11 @@ The file defines `name=bcast-intra-auto`, which replaces MPICH's built-in
 subtree of that name; everything else keeps its defaults. A malformed file
 stops `MPI_Init` with the line and column of the error.
 
-From a `collmodel/3` file the output has a subtree per restriction set,
-`name=bcast-intra-r0`, `name=bcast-intra-r2`, ..., and
+From a `collmodel/3` file the output has a subtree per restriction set (the suffix is the mask of true conditions,
+bit k = the k-th non-threshold condition in `coll_algorithms.txt`),
+`name=bcast-intra-r0`, `name=bcast-intra-r1024`, ..., and
 `name=bcast-intra-auto` dispatches on the restrictive conditions, e.g.
-`{"MPIDI_CH4_release_gather": "call=bcast-intra-r2", "any":
+`{"MPIDI_CH4_release_gather": "call=bcast-intra-r1024", "any":
 "call=bcast-intra-r0"}`. A restricted set's leaves are its algorithms or
 `"call=bcast-intra-r0"`. To see which algorithms ran, set
 `MPIR_CVAR_DUMP_COLL_ALGO_COUNTERS=0` (rank 0 prints its counts at

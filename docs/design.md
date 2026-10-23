@@ -380,27 +380,34 @@ relies on condition checks without side effects (MPICH: the release_gather
 condition used to count calls and create shared memory; now it only reads
 state, and the creation happens before the selection).
 
-**Restriction index.** The op's restrictive conditions (non-threshold
-conditions that appear in `restrictions`, including negated ones such as
-`!inplace`, each its own entry) are numbered in file order: bit k. An
-algorithm's mask is the OR of its bits; a layout's mask is the set of
-conditions that hold there (from the precheck: bit k holds where an
-algorithm needing only bit k ran). The subtree `<op>-intra-r<mask>`
-serves calls whose true conditions are exactly `mask`:
+**Restriction index.** Bit k is the k-th restrictive (non-threshold)
+condition of the file's `conditions:` list, one numbering for every
+collective (MPICH's list today: `inplace` 0, `pof2` 1, ..., `hierarchical`
+4, ..., `MPIDI_CH4_release_gather` 10), so a set's name means the same in
+every op, and appending a condition keeps the others' numbers. A set's mask
+is the conditions that are true. A restriction `c` requires bit c set, `!c`
+requires it clear; an algorithm is allowed in set S when both hold. A
+layout's mask comes from the precheck: an algorithm that ran has its
+required bits true and its excluded bits false; one that failed pins a bit
+when all its other requirements are known; a bit no algorithm decides is
+taken as false and reported. The model file records the bit names. The
+subtree `<op>-intra-r<mask>` serves calls whose true conditions are exactly
+`mask`, e.g. `bcast-intra-r1024` for single-node communicators:
 
 - `r0` holds the unrestricted algorithms and is fitted on **every** layout:
-  it is the fallback whenever no restriction holds at run time, also on
-  layouts where one held during tuning (e.g. `release_gather` is off under
-  `MPI_THREAD_MULTIPLE`).
+  it is the fallback whenever no other set applies at run time, also on
+  layouts where one applied during tuning (e.g. `release_gather` is off
+  under `MPI_THREAD_MULTIPLE`).
 - `r<S>`, S ≠ 0, is fitted on the layouts whose mask is S, and chooses
-  among the restricted algorithms whose mask is a subset of S, plus the leaf
+  among the restricted algorithms allowed in S, plus the leaf
   `"call=<op>-intra-r0"`, whose time at a point is that of r0's choice
-  there. With one restricted algorithm, r1 is a short split on size.
+  there. With one restricted algorithm it is a short split on size.
 - A set with no layouts (mutually exclusive conditions) produces no subtree.
 - `<op>-intra-auto` is the dispatch: nested conditions over the bits in
   use, each evaluated once on a path, ending in `call=` the matching
-  subtree; a set with no subtree calls its largest present subset, at worst
-  `r0`.
+  subtree; a set with no subtree calls its largest present subset whose
+  algorithms are all allowed there (a subset may hold a `!c` algorithm
+  that the larger set excludes), at worst `r0`.
 
 **Stages for compositional algorithms.** An algorithm such as `smp` runs
 other collectives on sub-communicators (the node comm, the comm of node
