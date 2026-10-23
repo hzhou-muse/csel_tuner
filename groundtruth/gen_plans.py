@@ -10,6 +10,8 @@
     python3 gen_plans.py --set R      --out plans/setR
     python3 gen_plans.py --set Ndebug --out plans/Ndebug
     python3 gen_plans.py --set Idebug --out plans/Idebug
+    python3 gen_plans.py --set switch --out plans/switch --nodes 8
+    python3 gen_plans.py --set validate --out plans/validate --nodes 8
 
 Writes <out>/launches.txt, one launch per line in priority order:
     id  nodes  ppn  alg  idle  plan-file
@@ -38,8 +40,15 @@ def sizes_per_octave(per_octave, max_m):
     return sorted(out | {max_m})
 
 
-def bcast(m, n, ppn, tag, batches, nodes=None, check=False, sync=None, place=None):
+ALG_CVAR = "MPIR_CVAR_BCAST_INTRA_ALGORITHM"
+
+
+def bcast(m, n, ppn, tag, batches, nodes=None, check=False, sync=None, place=None, alg=None):
+    """One request line; alg: the algorithm for this request only (cvar.*,
+    needs the runtime CVAR switch), else the launch's."""
     s = f"op=bcast m={m} p={n * ppn} ppn={ppn}"
+    if alg:
+        s += f" cvar.{ALG_CVAR}={alg}"
     if place:
         s += f" place={place}"
     if nodes:
@@ -250,9 +259,62 @@ def set_idebug(a, rng):
     write(a.out, launches, rng, shuffle=False)
 
 
+def axis_values(top):
+    """1, 2, 3, 4, 6, 8, 12, ... up to top, and top itself (csel_tuner.layouts)."""
+    out, k = {top}, 1
+    while k <= top:
+        out.add(k)
+        if 3 * k // 2 <= top and k >= 2:
+            out.add(3 * k // 2)
+        k *= 2
+    return sorted(out)
+
+
+def set_switch(a, rng):
+    """Per-request algorithm switch check: the same requests with the
+    algorithm chosen per request (cvar.*, one launch, "S-req") and for the
+    whole launch (environment, one launch per algorithm, "S-env-<alg>"); the
+    times must agree. Layouts include single-node non-power-of-two ppn,
+    where circ_graph used to hang, and every algorithm's data is checked."""
+    sizes = sizes_per_octave(0.5, a.max_m)
+    lay = [l for l in [(2, 8), (a.nodes, a.ppn), (1, 24), (1, 48)] if l[0] <= a.nodes and l[1] <= a.ppn]
+    req = []
+    for alg in FIXED:
+        for n, q in lay:
+            req += [bcast(m, n, q, "S-req-check", 1, check=True, alg=alg) for m in CHECK_SIZES if m <= a.max_m]
+            req += [bcast(m, n, q, "S-req", 5, sync="call", alg=alg) for m in sizes]
+    launches = [("S-req", a.nodes, a.ppn, "auto", "spin", req)]
+    for alg in FIXED:
+        launches.append((f"S-env-{alg}", a.nodes, a.ppn, alg, "spin",
+                         layout_requests(lay, sizes, 5, f"S-env-{alg}", sync="call")))
+    write(a.out, launches, rng)
+
+
+def set_validate(a, rng):
+    """Validation of a tuning file, at points the model builder did not
+    choose: --v-layouts layouts drawn at random from those it may use (N and
+    ppn in 1, 2, 3, 4, 6, 8, 12, ...), --v-per-octave sizes per octave.
+    Three plan directories, one launch each:
+      truth/    every algorithm, per request (cvar.*): the fastest at each point
+      default/  MPICH's own selection (auto)
+      tuned/    auto again, to be run with MPIR_CVAR_COLL_SELECTION_JSON_FILE set
+    groundtruth/score_live.py validate scores them."""
+    allowed = [(n, q) for n in axis_values(a.nodes) for q in axis_values(a.ppn) if n * q > 1]
+    lay = sorted(rng.sample(allowed, min(a.v_layouts, len(allowed))))
+    sizes = sizes_per_octave(a.v_per_octave, a.max_m)
+    truth = []
+    for alg in FIXED:
+        truth += [bcast(m, n, q, "V-truth", 5, sync="call", alg=alg) for n, q in lay for m in sizes]
+    plain = lambda tag: [bcast(m, n, q, tag, 5, sync="call") for n, q in lay for m in sizes]
+    write(os.path.join(a.out, "truth"), [("V-truth", a.nodes, a.ppn, "auto", "spin", truth)], rng)
+    write(os.path.join(a.out, "default"), [("V-default", a.nodes, a.ppn, "auto", "spin", plain("V-default"))], rng)
+    write(os.path.join(a.out, "tuned"), [("V-tuned", a.nodes, a.ppn, "auto", "spin", plain("V-tuned"))], rng)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--set", required=True, choices=["debug", "A", "B", "Rdebug", "R", "Ndebug", "Idebug"])
+    ap.add_argument("--set", required=True, choices=["debug", "A", "B", "Rdebug", "R", "Ndebug", "Idebug", "switch",
+                                                        "validate"])
     ap.add_argument("--out", required=True)
     ap.add_argument("--nodes", type=int, default=32, help="nodes in the allocation")
     ap.add_argument("--ppn", type=int, default=96, help="ranks per node of the full launch")
@@ -266,13 +328,16 @@ def main():
     g.add_argument("--batches", type=int, default=5)
     g.add_argument("--sync", choices=["batch", "call"], default=None,
                    help="timing mode for set B (default: mpisrv's back-to-back batches)")
+    g = ap.add_argument_group("set validate")
+    g.add_argument("--v-layouts", type=int, default=16)
+    g.add_argument("--v-per-octave", type=float, default=1)
     g = ap.add_argument_group("set R")
     g.add_argument("--r-per-octave", type=float, default=2)
     g.add_argument("--r-sessions", type=int, default=2)
     a = ap.parse_args()
     rng = random.Random(a.seed)
     {"debug": set_debug, "A": set_a, "B": set_b, "Rdebug": set_rdebug, "R": set_r,
-     "Ndebug": set_ndebug, "Idebug": set_idebug}[a.set](a, rng)
+     "Ndebug": set_ndebug, "Idebug": set_idebug, "switch": set_switch, "validate": set_validate}[a.set](a, rng)
 
 
 if __name__ == "__main__":

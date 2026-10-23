@@ -238,6 +238,30 @@ sweeps), and the 2-node checks of rank placement (Ndebug) and idle modes
 (Idebug). Each launch line in `launches.txt` names its algorithm and idle
 mode (`MODE[:IDLE_NS[:SPINUP_US]]`).
 
+Two sets check a live build and a tuning file, scored by
+`groundtruth/score_live.py`:
+
+```sh
+# the per-request algorithm switch: per request vs. per launch, every algorithm
+python3 groundtruth/gen_plans.py --set switch --out plans/switch --nodes 8 --ppn 96
+groundtruth/run_set.sh plans/switch results/switch 900
+python3 groundtruth/score_live.py switch results/switch            # ends with SWITCH CHECK PASSED
+
+# a tuning file at random points the builder did not choose
+python3 groundtruth/gen_plans.py --set validate --out plans/validate --nodes 8 --ppn 96
+groundtruth/run_set.sh plans/validate/truth results/validate/truth 1800      # every algorithm, per request
+groundtruth/run_set.sh plans/validate/default results/validate/default 600   # MPICH's own selection
+MPIR_CVAR_COLL_SELECTION_JSON_FILE=$PWD/bcast_tuning.json \
+    groundtruth/run_set.sh plans/validate/tuned results/validate/tuned 600   # with the tuning file
+python3 groundtruth/score_live.py validate --truth results/validate/truth --default results/validate/default \
+    --tuned results/validate/tuned --model bcast.json --tuning bcast_tuning.json
+```
+
+The validation reports the regret of MPICH's default, of MPICH with the
+tuning file, of the tree's and the model's own choices, whether MPICH
+applied the file, and whether the default beats every candidate algorithm
+somewhere (then the candidates miss one, e.g. `release_gather`).
+
 ## 10. Troubleshooting
 
 | Symptom | Cause / fix |

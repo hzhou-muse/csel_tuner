@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""Score the live checks (numpy only).
+
+    python3 score_live.py switch RESULT_DIR
+    python3 score_live.py validate --truth DIR --default DIR --tuned DIR --model MODEL.json \\
+        --tuning TUNING.json [--tuning-node-aware T.json] [--json SUMMARY.json]
+
+switch: the plan set "switch" (gen_plans.py) measures the same requests with
+the algorithm chosen per request (S-req, cvar.*) and for the launch
+(S-env-<alg>). Per algorithm: the ratio T(per request) / T(per launch) at
+every (layout, size), the data checks, and errors. PASS when every
+algorithm's median ratio is within 10% and 90% of its points within 25%
+(the two launches run at different times, so some noise is expected; an
+ignored switch shows up as ratios far from 1 for every algorithm but the
+default).
+
+validate: the plan set "validate" measures, at points the model builder
+did not choose, every algorithm per request (truth), MPICH's own selection
+(default) and auto with the tuning file loaded (tuned). Regret =
+T(selection) / T(fastest algorithm), over all points and split into layouts
+the builder measured and those it did not, for:
+  default            MPICH's own selection, measured
+  tuned              MPICH with the tuning file, measured
+  tree (offline)     the algorithm the tuning file picks, timed by truth
+  model, per point   the model's own choice, timed by truth
+plus tuned / T(tree's algorithm) (about 1 if MPICH applied the file), and
+the model's own regret estimate for comparison.
+"""
+import argparse
+import glob
+import json
+import os
+import sys
+
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+ALG_CVAR = "MPIR_CVAR_BCAST_INTRA_ALGORITHM"
+
+
+def records(path):
+    """(info env, [ok non-check bcast replies], [check replies], [errors]) of one JSONL file."""
+    env, ok, checks, errors = {}, [], [], []
+    for line in open(path):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if r.get("op") == "info":
+            env = r.get("env", {})
+        elif r.get("status") == "error":
+            errors.append(r.get("msg", ""))
+        elif r.get("op") == "bcast" and r.get("status") == "ok":
+            (checks if "check" in r else ok).append(r)
+    return env, ok, checks, errors
+
+
+def alg_of(r, env):
+    return r.get("cvars", {}).get(ALG_CVAR, env.get(ALG_CVAR, "auto"))
+
+
+def gm(x):
+    x = np.asarray(x, float)
+    return float(np.exp(np.log(x).mean())) if len(x) else float("nan")
+
+
+def switch(a):
+    req, env_t, checks, errors = {}, {}, {}, []
+    for path in sorted(glob.glob(os.path.join(a.dir, "*.jsonl"))):
+        name = os.path.basename(path)[:-6]
+        env, ok, chk, err = records(path)
+        errors += [f"{name}: {e}" for e in err]
+        mode = "req" if name.startswith("S-req") else "env"
+        for r in ok:
+            key = (alg_of(r, env), r["p"] // r["ppn"], r["ppn"], r["m"])
+            (req if mode == "req" else env_t)[key] = float(np.median(r["t_us"]))
+        for r in chk:
+            c = checks.setdefault((alg_of(r, env), mode), [0, 0])
+            c[0] += 1
+            c[1] += r["check"] == "ok"
+    algs = sorted({k[0] for k in req} | {k[0] for k in env_t})
+    out = ["# Per-request algorithm switch check", "",
+           "Ratio = T(algorithm per request, cvar.*) / T(algorithm for the launch, environment), same "
+           "layout and size.", "",
+           "| algorithm | points | median ratio | p10 | p90 | within 25% | data checks per request / launch | verdict |",
+           "|---|---|---|---|---|---|---|---|"]
+    passed = bool(algs)
+    for alg in algs:
+        keys = sorted(k for k in req if k[0] == alg and k in env_t)
+        r = np.array([req[k] / env_t[k] for k in keys])
+        cr = checks.get((alg, "req"), [0, 0])
+        ce = checks.get((alg, "env"), [0, 0])
+        ok = len(r) > 0 and abs(np.median(r) - 1) <= 0.10 and np.mean(np.abs(np.log(r)) <= np.log(1.25)) >= 0.9 \
+            and cr[0] == cr[1] and ce[0] == ce[1]
+        passed &= bool(ok)
+        out.append(f"| {alg} | {len(r)} | {np.median(r):.3f} | {np.quantile(r, .1):.3f} | {np.quantile(r, .9):.3f} | "
+                   f"{np.mean(np.abs(np.log(r)) <= np.log(1.25)):.0%} | {cr[1]}/{cr[0]} , {ce[1]}/{ce[0]} | "
+                   f"{'ok' if ok else 'FAIL'} |" if len(r) else f"| {alg} | 0 | | | | | | FAIL |")
+    if errors:
+        passed = False
+        out += ["", f"Error replies ({len(errors)}):", ""] + [f"- {e}" for e in errors[:20]]
+    out += ["", "SWITCH CHECK PASSED" if passed else "SWITCH CHECK FAILED"]
+    print("\n".join(out))
+    return 0 if passed else 1
+
+
+def load_model(path):
+    from csel_tuner.single import LayoutModel
+    d = json.load(open(path))
+    if d.get("format") != "collmodel/2":
+        sys.exit(f"{path}: not a collmodel/2 file")
+    models = {alg: LayoutModel.from_json({"model": d["models"][alg]}) for alg in d["algs"]}
+    measured = {(s["N"], s["ppn"]) for s in d.get("selection", [])}
+    return d, models, measured
+
+
+def times(directory):
+    """{(alg or None, N, ppn, m): t} of the result directory, and the launch env."""
+    out, env_all = {}, {}
+    for path in sorted(glob.glob(os.path.join(directory, "*.jsonl"))):
+        env, ok, _, _ = records(path)
+        env_all.update(env)
+        for r in ok:
+            out[(r.get("cvars", {}).get(ALG_CVAR), r["p"] // r["ppn"], r["ppn"], r["m"])] = \
+                float(np.median(r["t_us"]))
+    return out, env_all
+
+
+def summary(r):
+    r = np.asarray(r, float)
+    return {"n": int(len(r)), "geomean": gm(r), "p95": float(np.quantile(r, .95)), "max": float(r.max()),
+            "frac_gt_1.1": float(np.mean(r > 1.1))}
+
+
+def validate(a):
+    from csel_tuner.tree import json_choice
+    d, models, measured = load_model(a.model)
+    algs, sizes = d["algs"], np.array(d["sizes"])
+    truth, _ = times(a.truth)
+    default, env_d = times(a.default)
+    tuned, env_t = times(a.tuned)
+    trees = {"tree (offline)": json.load(open(a.tuning))}
+    if a.tuning_node_aware:
+        trees["tree, node-aware (offline)"] = json.load(open(a.tuning_node_aware))
+    trees = {k: next(iter(v.values())) for k, v in trees.items()}   # the one subtree in each file
+    points = sorted({k[1:] for k in truth if k[0] is not None})
+    pred = {}
+    rows = {name: [] for name in ["default", "tuned", *trees, "model, per point"]}
+    split = {name: ([], []) for name in rows}
+    consistency, skipped = [], 0
+    for n, q, m in points:
+        t = {alg: truth.get((alg, n, q, m)) for alg in algs}
+        if any(v is None for v in t.values()):
+            skipped += 1
+            continue
+        best = min(t.values())
+        x = {"p": n * q, "m": m, "N": n, "ppn": q, "pof2": float((n * q) & (n * q - 1) == 0)}
+        if (n, q) not in pred:
+            pred[(n, q)] = np.array([models[alg].predict(n, q) for alg in algs])
+        i = int(np.argmin(np.abs(np.log2(sizes) - np.log2(max(m, 1)))))
+        r = {"model, per point": t[algs[int(np.argmin(pred[(n, q)][:, i]))]] / best}
+        for name, tree in trees.items():
+            alg = json_choice(tree, x).split("_intra_", 1)[-1]
+            r[name] = t[alg] / best if alg in t else float("nan")
+            if name == "tree (offline)" and (None, n, q, m) in tuned and alg in t:
+                consistency.append(tuned[(None, n, q, m)] / t[alg])
+        if (None, n, q, m) in default:
+            r["default"] = default[(None, n, q, m)] / best
+        if (None, n, q, m) in tuned:
+            r["tuned"] = tuned[(None, n, q, m)] / best
+        for name, v in r.items():
+            if v == v:
+                rows[name].append(v)
+                split[name][0 if (n, q) in measured else 1].append(v)
+    est = d["meta"].get("estimate", {})
+    out = ["# Validation of the tuning file", "",
+           f"{len(points) - skipped} points ({len({p[:2] for p in points})} layouts); regret = T(selection) / "
+           f"T(fastest algorithm at that point), the fastest taken from the per-request measurements.", "",
+           "| selection | points | geomean | p95 | max | > 1.1 | geomean, layouts the builder measured / not |",
+           "|---|---|---|---|---|---|---|"]
+    res = {}
+    for name, v in rows.items():
+        if not v:
+            continue
+        s = summary(v)
+        res[name] = dict(s, measured=gm(split[name][0]), unmeasured=gm(split[name][1]))
+        out.append(f"| {name} | {s['n']} | {s['geomean']:.3f} | {s['p95']:.2f} | {s['max']:.2f} | "
+                   f"{s['frac_gt_1.1']:.0%} | {gm(split[name][0]):.3f} / {gm(split[name][1]):.3f} |")
+    d_r = np.array(rows["default"]) if rows["default"] else np.array([])
+    if len(d_r) and np.mean(d_r < 0.95) > 0:
+        res["default faster than every candidate"] = {"fraction": float(np.mean(d_r < 0.95)),
+                                                      "median_factor": float(np.median(d_r[d_r < 0.95]))}
+        out += ["", f"MPICH's default is more than 5% faster than every candidate algorithm at "
+                f"{np.mean(d_r < 0.95):.0%} of the points (median {np.median(d_r[d_r < 0.95]):.2f}x): it uses an "
+                "algorithm the builder did not consider (e.g. release_gather, smp, nb); add it to --algs."]
+    if consistency:
+        c = np.array(consistency)
+        res["tuned / truth(tree algorithm)"] = {"median": float(np.median(c)), "p10": float(np.quantile(c, .1)),
+                                                "p90": float(np.quantile(c, .9))}
+        out += ["", f"MPICH with the tuning file vs. the tree's algorithm timed per request: median "
+                f"{np.median(c):.3f} (p10 {np.quantile(c, .1):.3f}, p90 {np.quantile(c, .9):.3f}); about 1 if MPICH "
+                "applied the file."]
+    out += ["", f"The model's own estimate: regret geomean {est.get('regret_geomean')}, p95 {est.get('regret_p95')} "
+            f"(stop: {d['meta'].get('stop')}, {d['meta'].get('n_layouts')} layouts, {d['meta'].get('node_h')} node-h)."]
+    if "MPIR_CVAR_COLL_SELECTION_JSON_FILE" not in env_t:
+        out.append("\nWARNING: the tuned launch's environment has no MPIR_CVAR_COLL_SELECTION_JSON_FILE.")
+    if "MPIR_CVAR_COLL_SELECTION_JSON_FILE" in env_d:
+        out.append("\nWARNING: the default launch's environment has MPIR_CVAR_COLL_SELECTION_JSON_FILE set.")
+    print("\n".join(out))
+    if a.json:
+        with open(a.json, "w") as f:
+            json.dump({"points": len(points) - skipped, "results": res, "model_estimate": est}, f, indent=1)
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+    s = sub.add_parser("switch")
+    s.add_argument("dir")
+    v = sub.add_parser("validate")
+    for k in ("truth", "default", "tuned", "model", "tuning"):
+        v.add_argument("--" + k, required=True)
+    v.add_argument("--tuning-node-aware")
+    v.add_argument("--json")
+    a = ap.parse_args()
+    if a.cmd == "switch":
+        sys.exit(switch(a))
+    if a.cmd == "validate":
+        sys.exit(validate(a))
+    ap.print_help()
+    sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

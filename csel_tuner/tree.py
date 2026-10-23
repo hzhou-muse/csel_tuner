@@ -194,3 +194,28 @@ def json_tree(root, alg_names, leaf):
         out["any"] = {key: params}
         return out
     return obj(root)
+
+
+def json_choice(obj, x):
+    """The algorithm a CSEL subtree (as json_tree writes it) chooses at one
+    point, x = {"p": comm_size, "m": message size, "N": nodes, "ppn": ranks
+    per node, "pof2": 0/1}: siblings are tried in order, the first true
+    condition is followed, "any" always is. Returns the leaf's key after
+    "algorithm=", e.g. "MPIR_Bcast_intra_binomial"."""
+    feature = {"comm_size": "p", "avg_msg_size": "m", "num_nodes": "N", "ppn": "ppn"}
+    while True:
+        for key, sub in obj.items():
+            if key.startswith("algorithm="):
+                return key[len("algorithm="):]
+            if key == "any":
+                ok = True
+            elif key in ("pof2", "!pof2"):
+                ok = (x["pof2"] > 0.5) == (key == "pof2")
+            else:
+                name, t = key.rstrip(")").split("(")
+                ok = x[feature[name]] <= int(t)
+            if ok:
+                obj = sub
+                break
+        else:
+            raise ValueError("no sibling matched (an object must end with \"any\")")
