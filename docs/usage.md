@@ -150,6 +150,22 @@ bin/collmodel --algs binomial,scatter_recursive_doubling_allgather,scatter_ring_
 The budget counts every job of the run; the deadline is this job's
 (walltime minus a margin for writing the model).
 
+**Stage 2, compositional algorithms** (e.g. smp; docs/design.md §11), after
+stage 1, on an allocation of the same size:
+
+```sh
+bin/colltree bcast.json --out bcast_tuning.json                       # F1
+bin/collmodel --stage1 bcast.json --inner-selection bcast_tuning.json \
+    --coll-algorithms $MPICH_SRC/src/mpi/coll/coll_algorithms.txt \
+    --site aurora --nodes 8 --ppn 96 --budget-node-h 1 --out bcast2.json --log bcast2.jsonl
+bin/colltree bcast.json bcast2.json --out bcast_tuning2.json          # F2
+```
+
+- The launch loads F1, so smp's inner calls follow it; the candidates per
+  new set are the stage-2 algorithms and `auto` (F1's choice, measured).
+- It stops before building if an inner call could itself run a stage-2
+  algorithm (the two-stage check), and needs pmodels/mpich#8048.
+
 ### 6.2 One algorithm (v1)
 
 ```sh
@@ -289,7 +305,7 @@ python3 groundtruth/score_live.py switch results/switch            # ends with S
 
 # a tuning file at random points the builder did not choose
 python3 groundtruth/gen_plans.py --set validate --out plans/validate --nodes 8 --ppn 96 \
-    [--v-algs binomial,...,nb --v-single-node-algs release_gather]
+    [--v-algs binomial,...,nb --v-single-node-algs release_gather --v-hier-algs smp]
 groundtruth/run_set.sh plans/validate/truth results/validate/truth 1800      # every algorithm, per request
 groundtruth/run_set.sh plans/validate/default results/validate/default 600   # MPICH's own selection
 MPIR_CVAR_COLL_SELECTION_JSON_FILE=$PWD/bcast_tuning.json \
@@ -304,7 +320,10 @@ applied the file, and whether the default beats every candidate algorithm
 somewhere (then the candidates miss one, e.g. `release_gather`). Regret is
 against the fastest of every algorithm measured and MPICH's default, split
 into single-node and multi-node layouts. `--model` takes a collmodel/2 or
-/3 file and `--tuning` a file with one or several subtrees.
+/3 file and `--tuning` a file with one or several subtrees. After stage 2,
+give `--model bcast.json --model bcast2.json --tuning bcast_tuning2.json`,
+and run `truth/` with `MPIR_CVAR_COLL_SELECTION_JSON_FILE` set to the
+tuning file too, so that smp's inner calls follow it.
 
 ## 10. Troubleshooting
 

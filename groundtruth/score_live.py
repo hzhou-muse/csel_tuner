@@ -2,7 +2,7 @@
 """Score the live checks (numpy only).
 
     python3 score_live.py switch RESULT_DIR
-    python3 score_live.py validate --truth DIR --default DIR --tuned DIR --model MODEL.json \\
+    python3 score_live.py validate --truth DIR --default DIR --tuned DIR --model MODEL.json [--model STAGE2.json] \\
         --tuning TUNING.json [--tuning-node-aware T.json] [--json SUMMARY.json]
 
 switch: the plan set "switch" (gen_plans.py) measures the same requests with
@@ -119,32 +119,37 @@ def switch(a):
     return 1 if final.endswith("FAILED") else 0
 
 
-def load_model(path):
-    """(model file, {set mask: (algs, {alg: LayoutModel})}, measured layouts, {layout: mask}).
-    collmodel/2 is one set, mask 0."""
+def load_model(paths):
+    """(first model file, {set mask: (algs, {alg: LayoutModel}, fallback)}, measured layouts,
+    {layout: mask}) of one or several model files (stage 1, then stage 2). collmodel/2 is one
+    set, mask 0; a stage-2 set's "auto" candidate stands for its fallback set's choice."""
     from csel_tuner.single import LayoutModel
-    d = json.load(open(path))
-    if d.get("format") == "collmodel/2":
-        sets = {0: (d["algs"], d)}
-        sel = d.get("selection", [])
-    elif d.get("format") == "collmodel/3":
-        sets = {x["mask"]: (x["algs"], x["model"]) for x in d["sets"]}
-        sel = [s for x in d["sets"] for s in x["model"].get("selection", [])]
-    else:
-        sys.exit(f"{path}: not a collmodel/2 or /3 file")
-    models = {mask: (algs, {alg: LayoutModel.from_json({"model": m["models"][alg]}) for alg in algs})
-              for mask, (algs, m) in sets.items()}
+    models, sel, masks, first = {}, [], {}, None
+    for path in paths:
+        d = json.load(open(path))
+        first = first or d
+        if d.get("format") == "collmodel/2":
+            sets = [(0, d["algs"], d, None)]
+            sel += d.get("selection", [])
+        elif d.get("format") == "collmodel/3":
+            sets = [(x["mask"], x["algs"], x["model"], x.get("fallback")) for x in d["sets"]]
+            sel += [s for x in d["sets"] for s in x["model"].get("selection", [])]
+        else:
+            sys.exit(f"{path}: not a collmodel/2 or /3 file")
+        for mask, algs, m, fb in sets:
+            models[mask] = (algs, {alg: LayoutModel.from_json({"model": m["models"][alg]}) for alg in algs}, fb)
+        masks.update({(n, q): m for n, q, m in d.get("layout_masks", [])})   # stage 2 adds bits
     measured = {(s["N"], s["ppn"]) for s in sel}
-    masks = {(n, q): m for n, q, m in d.get("layout_masks", [])}
-    return d, models, measured, masks
+    return first, models, measured, masks
 
 
 def layout_mask(masks, n, q):
     """The restriction mask of a layout: recorded by the precheck, or else that
-    of the recorded layouts of the same kind (single-node or not), or 0."""
+    of the recorded layouts of the same kind (single-node, one rank per node, or
+    neither), or 0."""
     if (n, q) in masks:
         return masks[(n, q)]
-    same = {m for (n2, q2), m in masks.items() if (n2 == 1) == (n == 1) and n2 * q2 > 1}
+    same = {m for (n2, q2), m in masks.items() if (n2 == 1) == (n == 1) and (q2 == 1) == (q == 1) and n2 * q2 > 1}
     return same.pop() if len(same) == 1 else 0
 
 
@@ -169,6 +174,14 @@ def summary(r):
 def validate(a):
     from csel_tuner.tree import json_choice
     d, models, measured, masks = load_model(a.model)
+
+    def model_choice(mask, n, q, i):
+        """The model's algorithm at (n, q) and size index i; "auto" goes to the fallback set."""
+        algs, mods, fb = models.get(mask, models[0])
+        if (mask, n, q) not in pred:
+            pred[(mask, n, q)] = np.array([mods[alg].predict(n, q) for alg in algs])
+        alg = algs[int(np.argmin(pred[(mask, n, q)][:, i]))]
+        return model_choice(fb, n, q, i) if alg == "auto" and fb is not None else alg
     sizes = np.array(d["sizes"])
     op = d["what"].split("-")[0]
     bits = d.get("conditions", [])
@@ -190,19 +203,18 @@ def validate(a):
     consistency, skipped, default_wins = [], 0, []
     for n, q, m in points:
         mask = layout_mask(masks, n, q)
-        set_algs, set_models = models.get(mask, models[0])
+        set_algs = models.get(mask, models[0])[0]
         t = {alg: truth[(alg, n, q, m)] for alg in algs if (alg, n, q, m) in truth}
-        if any(alg not in t for alg in set_algs):
+        if any(alg not in t for alg in set_algs if alg != "auto"):
             skipped += 1
             continue
         # the fastest of every algorithm measured here and MPICH's default
         best = min(list(t.values()) + ([default[(None, n, q, m)]] if (None, n, q, m) in default else []))
         x = {"p": n * q, "m": m, "N": n, "ppn": q, "pof2": float((n * q) & (n * q - 1) == 0),
              "cond": {b: bool(mask >> k & 1) for k, b in enumerate(bits)}}
-        if (n, q) not in pred:
-            pred[(n, q)] = np.array([set_models[alg].predict(n, q) for alg in set_algs])
         i = int(np.argmin(np.abs(np.log2(sizes) - np.log2(max(m, 1)))))
-        r = {"model, per point": t[set_algs[int(np.argmin(pred[(n, q)][:, i]))]] / best}
+        alg = model_choice(mask, n, q, i)
+        r = {"model, per point": t[alg] / best if alg in t else float("nan")}
         for name, tree in trees.items():
             key = json_choice(tree[f"{op}-intra-auto"], x, tree)
             alg = leaf_alg.get(key, key.split("_intra_", 1)[-1])
@@ -270,8 +282,10 @@ def main():
     s = sub.add_parser("switch")
     s.add_argument("dir")
     v = sub.add_parser("validate")
-    for k in ("truth", "default", "tuned", "model", "tuning"):
+    for k in ("truth", "default", "tuned", "tuning"):
         v.add_argument("--" + k, required=True)
+    v.add_argument("--model", required=True, action="append",
+                   help="model file; give it twice for stage 1 and stage 2")
     v.add_argument("--tuning-node-aware")
     v.add_argument("--json")
     a = ap.parse_args()

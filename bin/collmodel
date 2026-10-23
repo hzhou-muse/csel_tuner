@@ -32,6 +32,20 @@ the unrestricted ones. The model file is collmodel/3. Compositional
 algorithms (--stage2, default: those with an inner key, e.g. smp) are left
 out: their inner calls go through the selection being built.
 
+Stage 2, the compositional algorithms (those with an inner key, e.g. smp),
+after stage 1 (docs/design.md, section 11):
+
+    bin/colltree bcast.json --out bcast_tuning.json                # stage 1's file, F1
+    bin/collmodel --stage1 bcast.json --inner-selection bcast_tuning.json \
+        --coll-algorithms ... --out bcast2.json --site aurora --nodes 8 --ppn 96 --log bcast2.log
+    bin/colltree bcast.json bcast2.json --out bcast_tuning2.json   # F2
+
+The server runs with F1 loaded, so a forced smp's inner calls go through
+F1. The run prechecks the stage-2 algorithms, checks that their inner calls
+cannot run a stage-2 algorithm themselves, and builds a model per new
+restriction set over the stage-2 algorithms and "auto" (MPICH with F1:
+F1's choice there).
+
 Replay on recorded data in replay/data (replay/README.md), for development:
 
     bin/collmodel --algs binomial,tree --out m.json --replay [--seed 0]
@@ -76,7 +90,7 @@ import numpy as np  # noqa: E402
 
 from csel_tuner.algos import Catalog  # noqa: E402
 from csel_tuner.layouts import axis_values, size_grid  # noqa: E402
-from csel_tuner.restrict import plan_sets, precheck, set_name  # noqa: E402
+from csel_tuner.restrict import fixed_point, plan_sets, precheck, set_name, stage2_sets  # noqa: E402
 from csel_tuner.multi import Builder2  # noqa: E402
 from csel_tuner.single import Builder  # noqa: E402
 
@@ -84,7 +98,7 @@ VERSION = "collmodel 0.3"
 OPS = {"bcast": "MPIR_CVAR_BCAST_INTRA_ALGORITHM"}
 # settings that change which requests the builder makes: a resumed job must keep them
 SAME_ON_RESUME = ["mode", "op", "algs", "seed", "batches", "sync", "prune", "nodes", "ppn_max", "max_m",
-                  "stage2", "probe_m"]
+                  "stage2", "probe_m", "stage1"]
 
 
 class Terminated(Exception):
@@ -167,6 +181,8 @@ def live(a):
     from csel_tuner.server import Server
     # a forced algorithm whose restriction fails must fail, not run the default
     env = {"MPIR_CVAR_COLLECTIVE_FALLBACK": "error"}
+    if a.inner_selection:
+        env["MPIR_CVAR_COLL_SELECTION_JSON_FILE"] = os.path.abspath(a.inner_selection)
     env.update(kv.split("=", 1) for kv in a.env)
     several = len(a.algs) > 1 or bool(a.coll_algorithms)     # catalog: always several, with the precheck
     if a.switch != "request" and not several:
@@ -216,14 +232,15 @@ def replay(a):
     layouts = sorted({(n, p) for n, p in zip(gt.N, gt.ppn)})
     sizes = sorted(int(m) for m in gt.m.unique())
     rep = Replay2(load_sessions(), a.seed)
-    # --replay-alias NAME=REC@single|multi: NAME replays REC's data and runs only on such layouts
+    # --replay-alias NAME=REC@single|multi|hier: NAME replays REC's data and runs only on such
+    # layouts (hier: several nodes and several ranks per node)
     alias = {}
     for x in a.replay_alias:
         name, rest = x.split("=", 1)
         rec, where = rest.split("@", 1)
-        if rec not in FIXED + ["auto"] or where not in ("single", "multi"):
-            sys.exit(f"--replay-alias {x}: need NAME=REC@single|multi with REC a recorded algorithm")
-        alias[name] = (rec, where == "single")
+        if rec not in FIXED + ["auto"] or where not in ("single", "multi", "hier"):
+            sys.exit(f"--replay-alias {x}: need NAME=REC@single|multi|hier with REC a recorded algorithm")
+        alias[name] = (rec, where)
 
     def make_req(n, ppn, alg, m):
         return dict(op=a.op, alg=alg, m=m, p=n * ppn, ppn=ppn)
@@ -236,10 +253,12 @@ def replay(a):
         return out
 
     def probe(req):     # the recorded algorithms run everywhere, aliases where they say, others nowhere
+        n, ppn = req["p"] // req["ppn"], req["ppn"]
         if req["alg"] in alias:
-            ok = (req["p"] == req["ppn"]) == alias[req["alg"]][1]
+            where = alias[req["alg"]][1]
+            ok = n == 1 if where == "single" else n > 1 and (where == "multi" or ppn > 1)
         else:
-            ok = req["alg"] in FIXED
+            ok = req["alg"] in FIXED + ["auto"]
         return {"status": "ok" if ok else "error", "msg": "" if ok else "not in the recorded data", "wall_us": 0.0}
     meta = {"replay": {"data": "replay/data", "seed": a.seed}}
     return send, make_req, probe, layouts, sizes, NODES, max(p for _, p in layouts), max(sizes), meta, None
@@ -365,7 +384,9 @@ def model_file(a, built, cat, sizes, nodes, ppn_max, meta, jobs, complete, cost)
         if not b.samplers:
             continue
         body = model_body(names, b, sizes)
+        fallback = dict(cat.get("fallbacks", [])).get(mask)
         sets.append({"mask": mask, "name": set_name(a.op, mask), "layouts": [list(l) for l in lays],
+                     **({"fallback": fallback} if fallback is not None else {}),
                      "algs": names, "model": body, "stop": b.stop, "n_layouts": len(b.samplers),
                      "meta": builder_meta(a, names, b)})
     return {"format": "collmodel/3", "what": f"{a.op}-latency", "domain": domain,
@@ -427,6 +448,59 @@ def restriction_sets(a, layouts, probe):
     return sets, info
 
 
+def stage2_restriction_sets(a, layouts, probe):
+    """Stage 2: precheck of the compositional algorithms with the stage-1 file
+    loaded, the two-stage check, and the new sets: ([(mask, layouts, names)], info)."""
+    cat = Catalog.load(a.coll_algorithms)
+    cat.check(a.op)
+    bits = cat.restriction_bits()
+    s1 = json.load(open(a.stage1))
+    if s1.get("format") != "collmodel/3" or s1.get("stage", 1) != 1:
+        sys.exit(f"--stage1 {a.stage1}: not a stage-1 collmodel/3 file (bin/collmodel --coll-algorithms)")
+    if s1["conditions"] != bits:
+        sys.exit(f"--stage1 {a.stage1}: built with a different coll_algorithms.txt (restrictions differ)")
+    masks1 = {(n, q): m for n, q, m in s1["layout_masks"]}
+    if set(layouts) != set(masks1):
+        sys.exit(f"--stage1 {a.stage1}: its layouts differ from this allocation's (run stage 2 on the same "
+                 "allocation size)")
+    algs = cat.algorithms(a.op)
+    names2 = a.stage2.split(",") if a.stage2 is not None else [x.name for x in algs if x.inner]
+    if a.algs != ["all"]:
+        names2 = [x for x in names2 if x in a.algs]
+    algs2 = [x for x in algs if x.name in names2]
+    if not algs2:
+        sys.exit("stage 2: no compositional algorithms (none with an inner key)")
+    if a.inner_selection:
+        f1 = json.load(open(a.inner_selection))
+        missing = sorted({sec for x in algs2 for sec, _ in x.inner if f"name={sec}-auto" not in f1})
+        if missing:
+            sys.exit(f"--inner-selection {a.inner_selection}: no subtree for {', '.join(missing)}")
+    elif not a.replay:
+        sys.exit("stage 2 needs --inner-selection (the stage-1 tuning file)")
+    feas2 = {lay: {x.name for x in algs2 if probe(lay[0], lay[1], x.name)[0]} for lay in layouts}
+    problems, notes = fixed_point(algs2, feas2, a.op)
+    for n in notes:
+        print("two-stage check: " + n, file=sys.stderr)
+    if problems:
+        sys.exit("two-stage check failed: an inner call can run a stage-2 algorithm:\n  " + "\n  ".join(problems))
+    sets, masks2, notes2 = stage2_sets(algs2, bits, masks1, feas2)
+    for n in notes2:
+        print("stage 2: " + n, file=sys.stderr)
+    for mask, lays, names, fb in sets:
+        print(f"set {set_name(a.op, mask)}: {len(lays)} layouts, algorithms {', '.join(names)}; "
+              f"falls back to {set_name(a.op, fb)}", file=sys.stderr)
+    info = {"stage": 2, "stage1": os.path.abspath(a.stage1),
+            "inner_selection": os.path.abspath(a.inner_selection) if a.inner_selection else None,
+            "conditions": bits,
+            "algorithms": dict({x.name: {"leaf": x.leaf, "mask": x.mask(bits), "restrictions": x.restrictions,
+                                         "inner": ["@".join(i) for i in x.inner]} for x in algs2},
+                               auto={"leaf": None, "mask": 0, "restrictions": []}),
+            "layout_masks": [[l[0], l[1], m] for l, m in sorted(masks2.items())],
+            "feasible": [[l[0], l[1], sorted(f)] for l, f in sorted(feas2.items())],
+            "fallbacks": [[m, fb] for m, _, _, fb in sets], "two_stage_notes": notes}
+    return [(m, lays, names) for m, lays, names, _ in sets], info
+
+
 def drop_unfinished(b):
     """After SIGTERM: keep only layouts whose recording finished (the history
     entry is written last), in case the signal landed in the middle of one."""
@@ -448,7 +522,7 @@ def write_atomic(path, d):
 def parse_args(argv):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--op", default="bcast", choices=sorted(OPS))
-    g = ap.add_mutually_exclusive_group(required=True)
+    g = ap.add_mutually_exclusive_group()
     g.add_argument("--alg", help="one algorithm (builder v1): a value of the op's algorithm CVAR")
     g.add_argument("--algs", help="several algorithms, comma-separated (builder v2: selection); all: every "
                    "algorithm in --coll-algorithms")
@@ -458,6 +532,10 @@ def parse_args(argv):
     ap.add_argument("--stage2", help="compositional algorithms to leave out, comma-separated (default: those "
                     "with an inner key in coll_algorithms.txt)")
     ap.add_argument("--probe-m", type=int, default=1024, help="message size of the precheck calls")
+    ap.add_argument("--stage1", metavar="MODEL", help="stage 2: the stage-1 model file (collmodel/3); measures "
+                    "the compositional algorithms")
+    ap.add_argument("--inner-selection", metavar="JSON", help="stage 2: the stage-1 tuning file, loaded in the "
+                    "launch (MPIR_CVAR_COLL_SELECTION_JSON_FILE) for the inner calls")
     ap.add_argument("--budget-node-h", type=float, default=2.0, help="stop after this many node-hours, all jobs")
     ap.add_argument("--tau-med", type=float, default=0.05, help="v1: stop when the estimated median error is below this")
     ap.add_argument("--tau-p90", type=float, default=0.20, help="v1: ... and the estimated p90 error is below this")
@@ -491,13 +569,18 @@ def parse_args(argv):
                    help="seconds of driver idle time after which a batch starts with a re-warm request")
     g = ap.add_argument_group("replay")
     g.add_argument("--replay", action="store_true", help="replay recorded data in replay/data (see replay/README.md)")
-    g.add_argument("--replay-alias", action="append", default=[], metavar="NAME=REC@single|multi",
-                   help="replay algorithm NAME from the recorded REC, runnable only on single-node (or only on "
-                        "multi-node) layouts; e.g. release_gather=auto@single (MPICH's default on one node)")
+    g.add_argument("--replay-alias", action="append", default=[], metavar="NAME=REC@single|multi|hier",
+                   help="replay algorithm NAME from the recorded REC, runnable only on single-node, multi-node, "
+                        "or multi-node layouts with several ranks per node (hier); e.g. release_gather=auto@single "
+                        "(MPICH's default on one node)")
     a = ap.parse_args(argv)
-    a.algs = a.algs.split(",") if a.algs else [a.alg]
+    if not (a.alg or a.algs or a.stage1):
+        ap.error("one of --alg, --algs or --stage1 is required")
+    a.algs = a.algs.split(",") if a.algs else [a.alg] if a.alg else ["all"]
     if a.algs == ["all"] and not a.coll_algorithms:
         ap.error("--algs all needs --coll-algorithms")
+    if a.stage1 and not a.coll_algorithms:
+        ap.error("--stage1 needs --coll-algorithms")
     if a.site:
         if not (a.nodes and a.ppn):
             ap.error("--site needs --nodes and --ppn")
@@ -531,7 +614,7 @@ def main(argv=None):
         job = {"start": round(t_start, 3), "mode": "replay" if a.replay else "live", "op": a.op, "algs": a.algs,
                "seed": a.seed, "batches": a.batches, "sync": a.sync, "prune": a.prune, "nodes": nodes,
                "ppn_max": ppn_max, "max_m": max_m, "hosts": meta.get("hosts"), "tool": VERSION,
-               "stage2": a.stage2, "probe_m": a.probe_m}
+               "stage2": a.stage2, "probe_m": a.probe_m, "stage1": a.stage1}
         if journal.jobs:
             first = journal.jobs[0]
             diff = [k for k in SAME_ON_RESUME if first.get(k) != job.get(k)]
@@ -553,7 +636,11 @@ def main(argv=None):
             (lambda: (journal.earlier_seconds() + time.time() - t_start) * nodes / 3600)
         measure = make_measure(journal, send, make_req)
         cat = None
-        if a.coll_algorithms:
+        if a.stage1:
+            sets, cat = stage2_restriction_sets(a, layouts, make_probe(journal, probe, make_req, a.probe_m))
+            if not sets:
+                sys.exit("stage 2: no layout where a compositional algorithm runs; nothing to build")
+        elif a.coll_algorithms:
             sets, cat = restriction_sets(a, layouts, make_probe(journal, probe, make_req, a.probe_m))
         else:
             sets = [(0, layouts, a.algs)]

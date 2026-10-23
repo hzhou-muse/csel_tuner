@@ -19,12 +19,19 @@ A collmodel/3 file (bin/collmodel --coll-algorithms) has a model per
 restriction set; the output then has one subtree per set
 (docs/design.md, section 11):
 - "name=<op>-intra-0", the unrestricted algorithms, fitted on every layout;
-- "name=<op>-intra-r<S>", fitted on the layouts where exactly the conditions
-  S hold, choosing among S's restricted algorithms and the leaf
+- "name=<op>-intra-<S in hex>", fitted on the layouts where exactly the
+  conditions S hold, choosing among S's restricted algorithms and the leaf
   "call=<op>-intra-0" (timed as r0's choice at each point, from S's model);
 - "name=<op>-intra-auto", the dispatch: nested restrictive conditions, each
   tested once, ending in "call=" the subtree of the conditions that hold
   (a set without a subtree: its largest subset that has one, at worst r0).
+
+With a stage-2 file (bin/collmodel --stage1) as the second argument, its
+sets are added: each chooses between the compositional algorithms and
+"call=" the stage-1 set its layouts had (the "auto" candidate, measured with
+the stage-1 file loaded), and the dispatch covers the sets of both stages:
+
+    bin/colltree bcast.json bcast2.json --out bcast_tuning2.json
 """
 import argparse
 import json
@@ -103,18 +110,25 @@ def dispatch(op, bits, present):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("model", help="collmodel/2 or collmodel/3 file")
+    ap.add_argument("model", help="collmodel/2 or collmodel/3 file (stage 1)")
+    ap.add_argument("stage2", nargs="?", help="stage-2 collmodel/3 file (bin/collmodel --stage1): adds its sets")
     ap.add_argument("--out", required=True, help="selection JSON to write")
     ap.add_argument("--tol", type=float, default=0.005, help="allowed predicted geomean regret over the full tree")
-    ap.add_argument("--node-aware", action="store_true", help="also split on num_nodes and ppn (future CSEL)")
+    ap.add_argument("--node-aware", action="store_true", help="also split on num_nodes and ppn (MPICH with "
+                    "pmodels/mpich#8048)")
     ap.add_argument("--max-regret", type=float, default=1.5,
                     help="pruning never lets a point's predicted regret rise above this")
     ap.add_argument("--max-leaves", type=int, default=1024, help="size of the full tree before pruning")
     ap.add_argument("--param", action="append", default=[], metavar="ALG.KEY=VALUE")
     a = ap.parse_args(argv)
     d = json.load(open(a.model))
-    if d.get("format") not in ("collmodel/2", "collmodel/3"):
-        sys.exit(f"{a.model}: not a collmodel/2 or /3 file (from bin/collmodel --algs)")
+    if d.get("format") not in ("collmodel/2", "collmodel/3") or d.get("stage", 1) != 1:
+        sys.exit(f"{a.model}: not a stage-1 collmodel/2 or /3 file (from bin/collmodel --algs)")
+    d2 = json.load(open(a.stage2)) if a.stage2 else None
+    if d2 is not None and (d2.get("format") != "collmodel/3" or d2.get("stage") != 2 or
+                           d.get("format") != "collmodel/3" or d2["conditions"] != d["conditions"] or
+                           d2["what"] != d["what"]):
+        sys.exit(f"{a.stage2}: not a stage-2 file for {a.model} (same op and coll_algorithms.txt)")
     op = d["what"].split("-")[0]
     sizes = np.array(d["sizes"])
     (n_lo, n_hi), (p_lo, p_hi) = d["domain"]["N"], d["domain"]["ppn"]
@@ -127,6 +141,8 @@ def main(argv=None):
         params.setdefault(alg, {})[key] = parse_value(v)
     coll = op[0].upper() + op[1:]
     names = {alg: x["leaf"] for alg, x in d.get("algorithms", {}).items()}
+    if d2 is not None:
+        names.update({alg: x["leaf"] for alg, x in d2["algorithms"].items() if x["leaf"]})
     leaf = lambda alg: ("algorithm=" + names.get(alg, f"MPIR_{coll}_intra_{alg}"), params.get(alg, {}))
     X = points(layouts, sizes)
     lines = []
@@ -167,7 +183,22 @@ def main(argv=None):
             sub = lambda alg: "call=" + set_name(op, 0) if alg == "r0" else leaf(alg)
             out[f"name={set_name(op, mask)}"] = json_tree(t, opts, sub)
             report(set_name(op, mask), t, path, opts, len(lays))
-        out[f"name={op}-intra-auto"] = dispatch(op, d["conditions"], sorted(sets))
+        masks = set(sets)
+        for x in (d2["sets"] if d2 is not None else []):
+            # stage 2: the compositional algorithms or "auto", MPICH with the stage-1 file, which here
+            # is the stage-1 set the layouts had before (fallback)
+            mask, fb = x["mask"], x["fallback"]
+            if fb not in sets and fb not in masks:
+                sys.exit(f"{a.stage2}: set {set_name(op, mask)} falls back to {set_name(op, fb)}, which "
+                         f"{a.model} does not have")
+            lays = [tuple(l) for l in x["layouts"]]
+            Xs = points(lays, sizes)
+            t, path = fit(Xs, predictions(x["model"], x["algs"], lays), feats, a)
+            sub = lambda alg, fb=fb: "call=" + set_name(op, fb) if alg == "auto" else leaf(alg)
+            out[f"name={set_name(op, mask)}"] = json_tree(t, x["algs"], sub)
+            report(set_name(op, mask) + " (stage 2)", t, path, x["algs"], len(lays))
+            masks.add(mask)
+        out[f"name={op}-intra-auto"] = dispatch(op, d["conditions"], sorted(masks))
     depth = json_depth(out)
     if depth > 64:
         sys.exit(f"tree nests {depth} levels; MPICH's parser allows 64 (try a larger --tol)")

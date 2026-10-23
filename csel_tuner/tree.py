@@ -186,7 +186,14 @@ def json_tree(root, alg_names, leaf):
             if cond in out:             # cannot be reached again on this chain
                 cur = right
                 continue
-            out[cond] = obj(left)
+            val = obj(left)
+            # the previous sibling, a lower threshold of the same feature with the same value, is
+            # redundant: whatever matches it matches this one too
+            if out and f != "pof2":
+                last = next(reversed(out))
+                if last.startswith(CSEL_NAME[f] + "(") and out[last] == val:
+                    del out[last]
+            out[cond] = val
             cur = right
         lf = leaf(alg_names[cur.alg])
         val = lf if isinstance(lf, str) else {lf[0]: lf[1]}

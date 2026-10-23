@@ -350,9 +350,11 @@ shaped the design:
 
 Status: stage 1 is implemented (`csel_tuner/algos.py`,
 `csel_tuner/restrict.py`, `bin/collmodel --coll-algorithms`, `bin/colltree`
-on collmodel/3, mpisrv `probe=1` and error replies) and tested on the replay
-(with `--replay-alias release_gather=auto@single`) and in local functional
-runs; stage 2 is not.
+on collmodel/3, mpisrv `probe=1` and error replies), and so is stage 2 for a
+compositional algorithm whose inner calls are its own op (bcast smp:
+`bin/collmodel --stage1`). Both are tested on the replay (with
+`--replay-alias`) and in local functional runs; stage 2 across ops
+(allreduce smp needs reduce and bcast files) is not.
 
 Before, the builders chose among the algorithms that have no
 `restrictions` in MPICH's `src/mpi/coll/coll_algorithms.txt`. On a
@@ -426,15 +428,26 @@ depends on the file being built.
 
 1. Stage 1: sample every non-compositional algorithm (with their
    restrictions), build the subtrees: file F1.
-2. Stage 2: relaunch the server with F1 loaded
-   (`MPIR_CVAR_COLL_SELECTION_JSON_FILE`), sample the compositional
-   algorithms, add them to the subtrees whose masks they fit: file F2.
+2. Stage 2 (`bin/collmodel --stage1 MODEL1 --inner-selection F1`):
+   relaunch the server with F1 loaded (`MPIR_CVAR_COLL_SELECTION_JSON_FILE`)
+   and precheck the compositional algorithms; they decide new bits (smp:
+   `hierarchical`), so some layouts move from their stage-1 mask S' to a
+   new mask S. Each new set S is built on its layouts over its stage-2
+   algorithms and `auto`, which with F1 loaded is F1's choice there,
+   measured in the same launch.
+3. `bin/colltree MODEL1 MODEL2` writes F2: F1's subtrees unchanged, a
+   subtree per new set S whose leaves are a stage-2 algorithm or
+   `call=<op>-intra-<S'>` (the `auto` candidate), and a dispatch over the
+   sets of both stages.
 
 Two stages are enough when the inner calls do not reach a stage-2
 algorithm: `smp` needs `hierarchical`, which the node comm (one node) and
 the leaders' comm (one rank per node) do not have, so F2 selects the same
-algorithms as F1 for every inner call. The tool checks that: if F2 changes
-the choice for a layout an inner call uses, stage 2 is repeated with F2.
+algorithms as F1 for every inner call. The tool checks this on the stage-2
+precheck before building (a stage-2 algorithm that ran at an inner call's
+layout fails the check); with pmodels/mpich#8048 a single-node communicator
+is not `hierarchical`, so user layouts and inner sub-communicators of the
+same shape have the same conditions.
 Compositional algorithms carry an `inner` key in `coll_algorithms.txt`
 (pmodels/mpich#8048): the collectives they call through the selection, as
 `<section>@<communicator>`, e.g. bcast smp `bcast-intra@node_comm,

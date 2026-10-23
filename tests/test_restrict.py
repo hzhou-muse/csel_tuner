@@ -152,6 +152,25 @@ def test_dispatch_and_choice():
     assert json_choice(trees["bcast-intra-auto"], x(8, 64, False), trees) == "MPIR_Bcast_intra_tree"
 
 
+def test_stage2_sets_and_fixed_point():
+    from csel_tuner.restrict import fixed_point, stage2_sets
+    cat = catalog()
+    bits = cat.restriction_bits()
+    smp = [a for a in cat.algorithms("bcast") if a.name == "smp"]
+    layouts = [(1, 4), (2, 1), (2, 4), (4, 2)]
+    masks1 = {(1, 4): 16, (2, 1): 0, (2, 4): 0, (4, 2): 0}
+    feas2 = {lay: {"smp"} if lay[0] > 1 and lay[1] > 1 else set() for lay in layouts}
+    sets, masks2, notes = stage2_sets(smp, bits, masks1, feas2)
+    assert sets == [(8, [(2, 4), (4, 2)], ["smp", "auto"], 0)] and notes == []
+    assert masks2 == {(1, 4): 16, (2, 1): 0, (2, 4): 8, (4, 2): 8}
+    assert fixed_point(smp, feas2, "bcast") == ([], [])
+    # smp running on its own node_comm layout (1, 4) would need a third stage
+    bad = dict(feas2)
+    bad[(1, 4)] = {"smp"}
+    problems, _ = fixed_point(smp, bad, "bcast")
+    assert problems and "node_comm" in problems[0]
+
+
 def have_data():
     d = os.path.join(REPO, "replay", "data")
     return os.path.exists(os.path.join(d, "gt.csv.gz")) and os.path.exists(os.path.join(d, "sessions.csv.gz"))
@@ -185,6 +204,35 @@ def test_two_set_replay():
         assert "MPIDI_POSIX_mpi_bcast_release_gather" in json.dumps(t["name=bcast-intra-10"])
 
 
+def test_stage2_replay():
+    """Stage 2 on the replay: smp replayed from scatter_ring_allgather on the
+    layouts with several nodes and ranks per node; a set 0x8 (hierarchical in
+    the fixture's numbering) choosing between smp and call=the stage-1 set."""
+    if not have_data():
+        print("skipped: no replay data")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        cat = os.path.join(tmp, "coll_algorithms.txt")
+        with open(cat, "w") as f:
+            f.write(CATALOG)
+        m1, t1, m2, t2 = (os.path.join(tmp, x) for x in ("m1.json", "t1.json", "m2.json", "t2.json"))
+        run = lambda *args: subprocess.run([sys.executable, *args], check=True, capture_output=True, text=True)
+        run(os.path.join(REPO, "bin", "collmodel"), "--replay", "--algs", "all", "--coll-algorithms", cat,
+            "--replay-alias", "release_gather=auto@single", "--budget-node-h", "0.3", "--out", m1)
+        run(os.path.join(REPO, "bin", "colltree"), m1, "--out", t1)
+        r = run(os.path.join(REPO, "bin", "collmodel"), "--replay", "--stage1", m1, "--coll-algorithms", cat,
+                "--replay-alias", "smp=scatter_ring_allgather@hier", "--budget-node-h", "0.3", "--out", m2)
+        d = json.load(open(m2))
+        assert d["stage"] == 2 and [(x["mask"], x["fallback"], x["algs"]) for x in d["sets"]] == [(8, 0, ["smp", "auto"])]
+        assert all(n > 1 and q > 1 for n, q in d["sets"][0]["layouts"])
+        run(os.path.join(REPO, "bin", "colltree"), m1, m2, "--out", t2)
+        t = json.load(open(t2))
+        assert t["name=bcast-intra-auto"] == {"hierarchical": "call=bcast-intra-8", "any": {
+            "MPIDI_CH4_release_gather": "call=bcast-intra-10", "any": "call=bcast-intra-0"}}
+        sub = json.dumps(t["name=bcast-intra-8"])
+        assert "MPIR_Bcast_intra_smp" in sub or "call=bcast-intra-0" in sub
+
+
 if __name__ == "__main__":
     test_catalog()
     test_precheck_and_sets()
@@ -192,4 +240,6 @@ if __name__ == "__main__":
     test_infer_complementary()
     test_dispatch_and_choice()
     test_two_set_replay()
+    test_stage2_sets_and_fixed_point()
+    test_stage2_replay()
     print("ok")
