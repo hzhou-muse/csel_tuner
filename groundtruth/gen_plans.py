@@ -298,13 +298,18 @@ def set_validate(a, rng):
       truth/    every algorithm, per request (cvar.*): the fastest at each point
       default/  MPICH's own selection (auto)
       tuned/    auto again, to be run with MPIR_CVAR_COLL_SELECTION_JSON_FILE set
-    groundtruth/score_live.py validate scores them."""
+    groundtruth/score_live.py validate scores them. --v-algs replaces the
+    algorithms of truth/; those in --v-single-node-algs (e.g. release_gather)
+    are measured on the single-node layouts only."""
     allowed = [(n, q) for n in axis_values(a.nodes) for q in axis_values(a.ppn) if n * q > 1]
     lay = sorted(rng.sample(allowed, min(a.v_layouts, len(allowed))))
     sizes = sizes_per_octave(a.v_per_octave, a.max_m)
+    algs = a.v_algs.split(",") if a.v_algs else FIXED
+    single = set(a.v_single_node_algs.split(",")) if a.v_single_node_algs else set()
     truth = []
-    for alg in FIXED:
-        truth += [bcast(m, n, q, "V-truth", 5, sync="call", alg=alg) for n, q in lay for m in sizes]
+    for alg in algs + sorted(single - set(algs)):
+        truth += [bcast(m, n, q, "V-truth", 5, sync="call", alg=alg) for n, q in lay for m in sizes
+                  if alg not in single or n == 1]
     plain = lambda tag: [bcast(m, n, q, tag, 5, sync="call") for n, q in lay for m in sizes]
     write(os.path.join(a.out, "truth"), [("V-truth", a.nodes, a.ppn, "auto", "spin", truth)], rng)
     write(os.path.join(a.out, "default"), [("V-default", a.nodes, a.ppn, "auto", "spin", plain("V-default"))], rng)
@@ -331,6 +336,9 @@ def main():
     g = ap.add_argument_group("set validate")
     g.add_argument("--v-layouts", type=int, default=16)
     g.add_argument("--v-per-octave", type=float, default=1)
+    g.add_argument("--v-algs", help="algorithms of truth/, comma-separated (default: the six unrestricted ones)")
+    g.add_argument("--v-single-node-algs", help="algorithms measured in truth/ on single-node layouts only "
+                   "(e.g. release_gather)")
     g = ap.add_argument_group("set R")
     g.add_argument("--r-per-octave", type=float, default=2)
     g.add_argument("--r-sessions", type=int, default=2)

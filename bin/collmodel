@@ -15,6 +15,24 @@ or with any launcher (mpisrv and its max-m argument are appended):
 
     bin/collmodel --alg binomial --out bcast_binomial.json --launcher "mpiexec -n 64 -ppn 32"
 
+All of the op's algorithms, restricted ones included (docs/design.md,
+section 11), from the build's coll_algorithms.txt:
+
+    bin/collmodel --algs all --coll-algorithms $MPICH_SRC/src/mpi/coll/coll_algorithms.txt \
+        --out bcast.json --site aurora --nodes 8 --ppn 96 --log bcast.log
+
+With --coll-algorithms the run starts with a precheck: one probe call of
+every algorithm at every allowed layout (the server runs with
+MPIR_CVAR_COLLECTIVE_FALLBACK=error, so an algorithm whose restriction
+fails returns an error). From it each layout gets the set of restrictive
+conditions that hold there, and the builder runs once per restriction set:
+set 0 (the unrestricted algorithms) on every layout, then each set S on the
+layouts whose conditions are exactly S, over its restricted algorithms plus
+the unrestricted ones. The model file is collmodel/3. Compositional
+algorithms (--stage2, default: those restricted to hierarchical
+communicators, e.g. smp) are left out: their inner calls go through the
+selection being built.
+
 Replay on recorded data in replay/data (replay/README.md), for development:
 
     bin/collmodel --algs binomial,tree --out m.json --replay [--seed 0]
@@ -57,14 +75,17 @@ sys.path.insert(0, REPO)
 
 import numpy as np  # noqa: E402
 
+from csel_tuner.algos import Catalog  # noqa: E402
 from csel_tuner.layouts import axis_values, size_grid  # noqa: E402
+from csel_tuner.restrict import plan_sets, precheck, set_name  # noqa: E402
 from csel_tuner.multi import Builder2  # noqa: E402
 from csel_tuner.single import Builder  # noqa: E402
 
-VERSION = "collmodel 0.2"
+VERSION = "collmodel 0.3"
 OPS = {"bcast": "MPIR_CVAR_BCAST_INTRA_ALGORITHM"}
 # settings that change which requests the builder makes: a resumed job must keep them
-SAME_ON_RESUME = ["mode", "op", "algs", "seed", "batches", "sync", "prune", "nodes", "ppn_max", "max_m"]
+SAME_ON_RESUME = ["mode", "op", "algs", "seed", "batches", "sync", "prune", "nodes", "ppn_max", "max_m",
+                  "stage2", "probe_m"]
 
 
 class Terminated(Exception):
@@ -143,15 +164,18 @@ class Journal:
 
 
 def live(a):
-    """(send, make_req, layouts, sizes, nodes, ppn_max, max_m, meta, server)"""
+    """(send, make_req, probe, layouts, sizes, nodes, ppn_max, max_m, meta, server)"""
     from csel_tuner.server import Server
-    env = dict(kv.split("=", 1) for kv in a.env)
-    if a.switch != "request" and len(a.algs) == 1:
+    # a forced algorithm whose restriction fails must fail, not run the default
+    env = {"MPIR_CVAR_COLLECTIVE_FALLBACK": "error"}
+    env.update(kv.split("=", 1) for kv in a.env)
+    several = len(a.algs) > 1 or bool(a.coll_algorithms)     # catalog: always several, with the precheck
+    if a.switch != "request" and not several:
         env[OPS[a.op]] = a.algs[0]  # the launch's algorithm
     srv = Server(launcher=shlex.split(a.launcher), env=env, max_m=a.max_m, timeout=a.timeout,
                  warmup=(a.op,), server=a.server)
     info = srv.world
-    by_request = a.switch == "request" or len(a.algs) > 1 or (a.switch == "auto" and info.get("cvar_switch") == 1)
+    by_request = a.switch == "request" or several or (a.switch == "auto" and info.get("cvar_switch") == 1)
     if by_request and info.get("cvar_switch") != 1:
         srv.close()
         sys.exit("per-request algorithms (--switch request or --algs): the server reports no runtime CVAR "
@@ -171,16 +195,20 @@ def live(a):
         if time.time() - srv.last > a.rewarm_gap:
             srv.measure(**dict(reqs[0], m=rewarm_m, batches=1, target_us=20000, tag="rewarm"))
         return [{"status": "ok", "t_us": rep["t_us"], "wall_us": rep["wall_us"]} for rep in srv.measure_many(reqs)]
+
+    def probe(req):
+        rep = srv.request(**req)
+        return {"status": rep["status"], "msg": rep.get("msg", ""), "wall_us": rep.get("wall_us", 0.0)}
     meta = {"launch": {"cmd": srv.cmd, "env": env}, "algorithm_by": "request" if by_request else "launch",
             "library": info.get("library"), "hosts": info.get("hosts"),
             "topology_warnings": info.get("topology_warnings")}
-    return send, make_req, layouts, sizes, nodes, ppn_max, info["max_m"], meta, srv
+    return send, make_req, probe, layouts, sizes, nodes, ppn_max, info["max_m"], meta, srv
 
 
 def replay(a):
     """The same as live(), answered from the recorded data in replay/data."""
     sys.path.insert(0, os.path.join(REPO, "replay"))
-    from common import NODES, NoData, load_gt, load_sessions
+    from common import FIXED, NODES, NoData, load_gt, load_sessions
     from replay_v2 import Replay2
     try:
         gt = load_gt()
@@ -189,6 +217,14 @@ def replay(a):
     layouts = sorted({(n, p) for n, p in zip(gt.N, gt.ppn)})
     sizes = sorted(int(m) for m in gt.m.unique())
     rep = Replay2(load_sessions(), a.seed)
+    # --replay-alias NAME=REC@single|multi: NAME replays REC's data and runs only on such layouts
+    alias = {}
+    for x in a.replay_alias:
+        name, rest = x.split("=", 1)
+        rec, where = rest.split("@", 1)
+        if rec not in FIXED + ["auto"] or where not in ("single", "multi"):
+            sys.exit(f"--replay-alias {x}: need NAME=REC@single|multi with REC a recorded algorithm")
+        alias[name] = (rec, where == "single")
 
     def make_req(n, ppn, alg, m):
         return dict(op=a.op, alg=alg, m=m, p=n * ppn, ppn=ppn)
@@ -196,11 +232,18 @@ def replay(a):
     def send(reqs, occurrences):
         out = []
         for r, k in zip(reqs, occurrences):
-            t, wall = rep.one(r["alg"], r["p"] // r["ppn"], r["ppn"], r["m"], k)
+            t, wall = rep.one(alias.get(r["alg"], (r["alg"],))[0], r["p"] // r["ppn"], r["ppn"], r["m"], k)
             out.append({"status": "ok", "t_us": [float(t)], "wall_us": float(wall)})
         return out
+
+    def probe(req):     # the recorded algorithms run everywhere, aliases where they say, others nowhere
+        if req["alg"] in alias:
+            ok = (req["p"] == req["ppn"]) == alias[req["alg"]][1]
+        else:
+            ok = req["alg"] in FIXED
+        return {"status": "ok" if ok else "error", "msg": "" if ok else "not in the recorded data", "wall_us": 0.0}
     meta = {"replay": {"data": "replay/data", "seed": a.seed}}
-    return send, make_req, layouts, sizes, NODES, max(p for _, p in layouts), max(sizes), meta, None
+    return send, make_req, probe, layouts, sizes, NODES, max(p for _, p in layouts), max(sizes), meta, None
 
 
 def make_measure(journal, send, make_req):
@@ -211,6 +254,8 @@ def make_measure(journal, send, make_req):
     counts = {}
 
     def measure(n, ppn, alg, ms):
+        """reuse: {request key: reply} answered earlier (by another set's builder),
+        returned again at no cost"""
         reqs = [make_req(n, ppn, alg, m) for m in ms]
         out, todo = [None] * len(reqs), []
         for i, r in enumerate(reqs):
@@ -228,8 +273,29 @@ def make_measure(journal, send, make_req):
                 out[i] = rep
                 journal.write({"req": reqs[i], "rep": rep})
             journal.flush()
+        for r, rep in zip(reqs, out):
+            measure.answered[req_key(r)] = rep
         return [(float(np.median(r["t_us"])), float(r["wall_us"])) for r in out]
+    measure.answered = {}
     return measure
+
+
+def reusing(measure, make_req):
+    """measure() that answers requests made before this call from their earlier replies (wall time 0)."""
+    old = dict(measure.answered)
+
+    def f(n, ppn, alg, ms):
+        out = [None] * len(ms)
+        for i, m in enumerate(ms):
+            rep = old.get(req_key(make_req(n, ppn, alg, m)))
+            if rep is not None:
+                out[i] = (float(np.median(rep["t_us"])), 0.0)
+        todo = [i for i in range(len(ms)) if out[i] is None]
+        if todo:
+            for i, v in zip(todo, measure(n, ppn, alg, [ms[i] for i in todo])):
+                out[i] = v
+        return out
+    return f
 
 
 def rnd(x, nd=4):
@@ -254,32 +320,109 @@ def model_v2(algs, b, sizes):
                            for l, s in sorted(b.samplers.items()) for lo, hi, x, y in s.crossovers]}
 
 
-def model_file(a, b, sizes, nodes, ppn_max, meta, jobs, complete, cost):
-    if len(a.algs) > 1:
-        d = model_v2(a.algs, b, sizes)
-    else:
-        d = b.model().to_json(sizes)
-        d["alg"] = a.algs[0]
-        d["jumps"] = [{"N": n, "ppn": p, "lo": lo, "hi": hi, "ratio": round(float(r), 3)}
-                      for (n, p), g in sorted(b.samplers.items()) for lo, hi, r in g.jumps]
-    d["what"] = f"{a.op}-latency"
-    d["domain"] = {"N": [1, nodes], "ppn": [1, ppn_max], "m": [int(sizes[0]), int(sizes[-1])]}
-    d["meta"] = {"created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                 "tool": VERSION, **meta, "complete": complete, "n_measurements": b.n_meas,
-                 "n_layouts": len(b.samplers), "node_h": round(cost(), 4), "nodes_billed": nodes,
-                 "stop": b.stop, "jobs": jobs}
-    if len(a.algs) > 1:
-        d["meta"].update({"tau_gm": a.tau_gm, "tau_p95": a.tau_p95, "prune": a.prune,
-                          "measurements_per_alg": b.n_meas_alg,
-                          "estimate": dict(zip(["regret_geomean", "regret_p95"], b.estimate() or [None, None])),
-                          "checks": [{"N": l[0], "ppn": l[1], "kind": k, "regret_geomean": rnd(gm),
-                                      "regret_p95": rnd(p9)} for l, k, gm, p9, _, _ in b.checks]})
-    else:
-        d["meta"].update({"tau_med": a.tau_med, "tau_p90": a.tau_p90,
-                          "estimate": dict(zip(["med", "p90"], b.estimate() or [None, None])),
-                          "checks": [{"N": l[0], "ppn": l[1], "kind": k, "med": rnd(md), "p90": rnd(p9)}
-                                     for l, k, md, p9, _, _ in b.checks]})
+def builder_meta(a, names, b):
+    """The builder's settings, stop and estimate, for the model file's meta."""
+    if len(names) > 1:
+        return {"tau_gm": a.tau_gm, "tau_p95": a.tau_p95, "prune": a.prune,
+                "measurements_per_alg": b.n_meas_alg,
+                "estimate": dict(zip(["regret_geomean", "regret_p95"], b.estimate() or [None, None])),
+                "checks": [{"N": l[0], "ppn": l[1], "kind": k, "regret_geomean": rnd(gm),
+                            "regret_p95": rnd(p9)} for l, k, gm, p9, _, _ in b.checks]}
+    return {"tau_med": a.tau_med, "tau_p90": a.tau_p90,
+            "estimate": dict(zip(["med", "p90"], b.estimate() or [None, None])),
+            "checks": [{"N": l[0], "ppn": l[1], "kind": k, "med": rnd(md), "p90": rnd(p9)}
+                       for l, k, md, p9, _, _ in b.checks]}
+
+
+def model_body(names, b, sizes):
+    if len(names) > 1:
+        return model_v2(names, b, sizes)
+    d = b.model().to_json(sizes)
+    d["alg"] = names[0]
+    d["jumps"] = [{"N": n, "ppn": p, "lo": lo, "hi": hi, "ratio": round(float(r), 3)}
+                  for (n, p), g in sorted(b.samplers.items()) for lo, hi, r in g.jumps]
     return d
+
+
+def model_file(a, built, cat, sizes, nodes, ppn_max, meta, jobs, complete, cost):
+    """built: [(mask, layouts, algorithm names, builder)], set 0 first. Without
+    a catalog (one set): collmodel/1 or /2; with one: collmodel/3, a model per
+    restriction set."""
+    common = {"created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "tool": VERSION, **meta, "complete": complete,
+              "n_measurements": sum(x[3].n_meas for x in built),
+              "n_layouts": sum(len(x[3].samplers) for x in built), "node_h": round(cost(), 4),
+              "nodes_billed": nodes, "jobs": jobs}
+    domain = {"N": [1, nodes], "ppn": [1, ppn_max], "m": [int(sizes[0]), int(sizes[-1])]}
+    if cat is None:
+        _, _, names, b = built[0]
+        d = model_body(names, b, sizes)
+        d["what"] = f"{a.op}-latency"
+        d["domain"] = domain
+        d["meta"] = dict(common, stop=b.stop, **builder_meta(a, names, b))
+        return d
+    sets = []
+    for mask, lays, names, b in built:
+        if not b.samplers:
+            continue
+        body = model_body(names, b, sizes)
+        sets.append({"mask": mask, "name": set_name(a.op, mask), "layouts": [list(l) for l in lays],
+                     "algs": names, "model": body, "stop": b.stop, "n_layouts": len(b.samplers),
+                     "meta": builder_meta(a, names, b)})
+    return {"format": "collmodel/3", "what": f"{a.op}-latency", "domain": domain,
+            "sizes": [int(x) for x in sizes], **cat, "sets": sets,
+            "meta": dict(common, stop=built[-1][3].stop)}
+
+
+def make_probe(journal, probe, make_req, probe_m):
+    """probe(n, ppn, alg) -> (ok, msg): one call of the algorithm on the layout,
+    journaled like a measurement."""
+    def f(n, ppn, alg):
+        req = dict(make_req(n, ppn, alg, probe_m), batches=1, probe=1)
+        rep = journal.take(req)
+        if rep is None:
+            rep = probe(req)
+            journal.write({"req": req, "rep": rep})
+            journal.flush()
+        return rep["status"] == "ok", rep.get("msg", "")
+    return f
+
+
+def restriction_sets(a, layouts, probe):
+    """Precheck and restriction sets from the catalog: ([(mask, layouts, names)], catalog info)."""
+    cat = Catalog.load(a.coll_algorithms)
+    algs = cat.algorithms(a.op)
+    bits = cat.restriction_bits(a.op)
+    if a.algs != ["all"]:
+        known = {x.name for x in algs}
+        bad = [x for x in a.algs if x not in known]
+        if bad:
+            sys.exit(f"--algs: not {a.op} algorithms in {a.coll_algorithms}: {', '.join(bad)}")
+        algs = [x for x in algs if x.name in a.algs]
+    stage2 = a.stage2.split(",") if a.stage2 is not None else \
+        [x.name for x in algs if "hierarchical" in x.restrictions]
+    stage2 = [x for x in stage2 if x]
+    algs1 = [x for x in algs if x.name not in stage2]
+    if stage2:
+        print(f"stage 2 (not measured here): {', '.join(stage2)}", file=sys.stderr)
+    feas, masks, notes = precheck(probe, layouts, algs1, bits)
+    for n in notes:
+        print("precheck: " + n, file=sys.stderr)
+    # an unrestricted algorithm that fails somewhere is left out everywhere
+    broken = {x.name for x in algs1 if x.mask(bits) == 0 and any(x.name not in f for f in feas.values())}
+    if broken:
+        print(f"precheck: left out (fails without a restriction): {', '.join(sorted(broken))}", file=sys.stderr)
+    algs1 = [x for x in algs1 if x.name not in broken]
+    sets = plan_sets(algs1, bits, masks)
+    for mask, lays, names in sets:
+        print(f"set {set_name(a.op, mask)}: {len(lays)} layouts, algorithms {', '.join(names)}", file=sys.stderr)
+    info = {"conditions": bits,
+            "algorithms": {x.name: {"leaf": x.leaf, "mask": x.mask(bits), "restrictions": x.restrictions}
+                           for x in algs},
+            "layout_masks": [[l[0], l[1], m] for l, m in sorted(masks.items())],
+            "feasible": [[l[0], l[1], sorted(f)] for l, f in sorted(feas.items())],
+            "stage2": stage2, "left_out": sorted(broken), "precheck_notes": notes}
+    return sets, info
 
 
 def drop_unfinished(b):
@@ -305,8 +448,14 @@ def parse_args(argv):
     ap.add_argument("--op", default="bcast", choices=sorted(OPS))
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--alg", help="one algorithm (builder v1): a value of the op's algorithm CVAR")
-    g.add_argument("--algs", help="several algorithms, comma-separated (builder v2: selection)")
+    g.add_argument("--algs", help="several algorithms, comma-separated (builder v2: selection); all: every "
+                   "algorithm in --coll-algorithms")
     ap.add_argument("--out", required=True, help="model file to write (JSON)")
+    ap.add_argument("--coll-algorithms", metavar="PATH", help="the build's src/mpi/coll/coll_algorithms.txt: "
+                    "restriction sets, with a precheck (collmodel/3)")
+    ap.add_argument("--stage2", help="compositional algorithms to leave out, comma-separated (default: those "
+                    "restricted to hierarchical communicators)")
+    ap.add_argument("--probe-m", type=int, default=1024, help="message size of the precheck calls")
     ap.add_argument("--budget-node-h", type=float, default=2.0, help="stop after this many node-hours, all jobs")
     ap.add_argument("--tau-med", type=float, default=0.05, help="v1: stop when the estimated median error is below this")
     ap.add_argument("--tau-p90", type=float, default=0.20, help="v1: ... and the estimated p90 error is below this")
@@ -340,8 +489,13 @@ def parse_args(argv):
                    help="seconds of driver idle time after which a batch starts with a re-warm request")
     g = ap.add_argument_group("replay")
     g.add_argument("--replay", action="store_true", help="replay recorded data in replay/data (see replay/README.md)")
+    g.add_argument("--replay-alias", action="append", default=[], metavar="NAME=REC@single|multi",
+                   help="replay algorithm NAME from the recorded REC, runnable only on single-node (or only on "
+                        "multi-node) layouts; e.g. release_gather=auto@single (MPICH's default on one node)")
     a = ap.parse_args(argv)
     a.algs = a.algs.split(",") if a.algs else [a.alg]
+    if a.algs == ["all"] and not a.coll_algorithms:
+        ap.error("--algs all needs --coll-algorithms")
     if a.site:
         if not (a.nodes and a.ppn):
             ap.error("--site needs --nodes and --ppn")
@@ -367,12 +521,15 @@ def main(argv=None):
     t_start = time.time()
     signal.signal(signal.SIGTERM, on_sigterm)
     journal = Journal(a.log, a.resume)
-    srv = b = None
+    srv = None
+    built = []      # [(mask, layouts, algorithm names, builder)], in build order
     try:
-        send, make_req, layouts, sizes, nodes, ppn_max, max_m, meta, srv = (replay if a.replay else live)(a)
+        send, make_req, probe, layouts, sizes, nodes, ppn_max, max_m, meta, srv = \
+            (replay if a.replay else live)(a)
         job = {"start": round(t_start, 3), "mode": "replay" if a.replay else "live", "op": a.op, "algs": a.algs,
                "seed": a.seed, "batches": a.batches, "sync": a.sync, "prune": a.prune, "nodes": nodes,
-               "ppn_max": ppn_max, "max_m": max_m, "hosts": meta.get("hosts"), "tool": VERSION}
+               "ppn_max": ppn_max, "max_m": max_m, "hosts": meta.get("hosts"), "tool": VERSION,
+               "stage2": a.stage2, "probe_m": a.probe_m}
         if journal.jobs:
             first = journal.jobs[0]
             diff = [k for k in SAME_ON_RESUME if first.get(k) != job.get(k)]
@@ -385,19 +542,19 @@ def main(argv=None):
         journal.flush()
         jobs = [{k: j.get(k) for k in ("start", "end", "hosts")} for j in journal.jobs] + \
                [{"start": job["start"], "end": None, "hosts": job["hosts"]}]
-        # live: bill the real elapsed time of all jobs (launch, driver, fitting); replay: the recorded wall time
-        clock = None if a.replay else (lambda: journal.clock(t_start))
+        # live: bill the real elapsed time of all jobs (launch, driver, fitting); replay: the recorded wall
+        # time of every set's builder
+        clock = (lambda: sum(x[3].wall_us for x in built) * 1e-6) if a.replay else \
+            (lambda: journal.clock(t_start))
         # what the run has cost so far, for the model file (the budget clock above may lag while replaying)
-        cost = (lambda: b.spent()) if a.replay else \
+        cost = (lambda: built[-1][3].spent()) if a.replay else \
             (lambda: (journal.earlier_seconds() + time.time() - t_start) * nodes / 3600)
-        kw = dict(n_max=nodes, ppn_max=ppn_max, seed=a.seed, clock=clock)
         measure = make_measure(journal, send, make_req)
-        if len(a.algs) > 1:
-            b = Builder2(measure, a.algs, layouts, sizes, tau_gm=a.tau_gm, tau_p95=a.tau_p95,
-                         prune=a.prune or None, **kw)
+        cat = None
+        if a.coll_algorithms:
+            sets, cat = restriction_sets(a, layouts, make_probe(journal, probe, make_req, a.probe_m))
         else:
-            b = Builder(lambda n, ppn, ms: measure(n, ppn, a.algs[0], ms), layouts, sizes, tau_med=a.tau_med,
-                        tau_p90=a.tau_p90, **kw)
+            sets = [(0, layouts, a.algs)]
         state = {"ckpt": time.time(), "layout": time.time(), "slowest": 0.0}
 
         def on_layout(bb):
@@ -406,7 +563,7 @@ def main(argv=None):
             state["layout"] = now
             if a.checkpoint_every and now - state["ckpt"] >= a.checkpoint_every:
                 try:
-                    write_atomic(a.out, model_file(a, bb, sizes, nodes, ppn_max, meta, jobs, False, cost))
+                    write_atomic(a.out, model_file(a, built, cat, sizes, nodes, ppn_max, meta, jobs, False, cost))
                     state["ckpt"] = now
                 except Terminated:
                     raise
@@ -417,29 +574,51 @@ def main(argv=None):
             if a.deadline and t_start + a.deadline - time.time() < 1.5 * state["slowest"] + 10:
                 return "deadline"
             return None
-        b.on_layout, b.stop_check = on_layout, stop_check
-        try:
-            b.run(budget_node_h=a.budget_node_h, nodes_billed=nodes)
-        except Terminated:
-            b.stop = "terminated"
-            drop_unfinished(b)
-            print("SIGTERM: writing the model from the finished layouts", file=sys.stderr)
+        # each later set keeps a share of the budget in proportion to its layouts
+        share = [len(x[1]) / sum(len(y[1]) for y in sets) * a.budget_node_h for x in sets]
+        for i, (mask, lays, names) in enumerate(sets):
+            kw = dict(n_max=max(n for n, _ in lays), ppn_max=max(q for _, q in lays), seed=a.seed, clock=clock)
+            meas = measure if i == 0 else reusing(measure, make_req)
+            if len(names) > 1:
+                b = Builder2(meas, names, lays, sizes, tau_gm=a.tau_gm, tau_p95=a.tau_p95,
+                             prune=a.prune or None, **kw)
+            else:
+                b = Builder(lambda n, ppn, ms, alg=names[0]: meas(n, ppn, alg, ms), lays, sizes,
+                            tau_med=a.tau_med, tau_p90=a.tau_p90, **kw)
+            built.append((mask, lays, names, b))
+            b.on_layout, b.stop_check = on_layout, stop_check
+            try:
+                b.run(budget_node_h=a.budget_node_h - sum(share[i + 1:]), nodes_billed=nodes)
+            except Terminated:
+                b.stop = "terminated"
+                drop_unfinished(b)
+                print("SIGTERM: writing the model from the finished layouts", file=sys.stderr)
+                break
+            if b.stop == "deadline" and i < len(sets) - 1:
+                print(f"stop: {b.stop} in set {set_name(a.op, mask)}; later sets not built", file=sys.stderr)
+                break
     except Terminated:
         sys.exit("terminated before the builder started; the journal keeps what was measured")
     finally:
         if srv:
             # after SIGTERM there is little time, but a clean quit still lets MPI remove its shared memory
-            srv.close(wait=30 if b is not None and b.stop != "terminated" else 5)
+            srv.close(wait=30 if built and built[-1][3].stop != "terminated" else 5)
     jobs[-1]["end"] = round(time.time(), 3)
-    complete = b.stop not in ("terminated", "deadline")
-    if not b.samplers:
-        sys.exit(f"stop: {b.stop} before the first layout was measured; no model written")
+    b = built[-1][3]
+    complete = len(built) == len(sets) and all(x[3].stop not in ("terminated", "deadline") for x in built)
+    if not built[0][3].samplers:
+        sys.exit(f"stop: {built[0][3].stop} before the first layout was measured; no model written")
     try:
-        write_atomic(a.out, model_file(a, b, sizes, nodes, ppn_max, meta, jobs, complete, cost))
+        write_atomic(a.out, model_file(a, built, cat, sizes, nodes, ppn_max, meta, jobs, complete, cost))
     except Exception as e:
         sys.exit(f"no model written ({type(e).__name__}: {e}); the journal {a.log} keeps the measurements for --resume")
-    print(f"{a.out}: {len(b.samplers)} layouts, {b.n_meas} measurements ({journal.n_cached} from the journal), "
-          f"{cost():.3f} node-h, stop: {b.stop}")
+    if cat is not None:
+        for mask, _, _, x in built:
+            print(f"  set {set_name(a.op, mask)}: {len(x.samplers)} layouts, {x.n_meas} measurements, "
+                  f"stop: {x.stop}")
+    print(f"{a.out}: {sum(len(x[3].samplers) for x in built)} layouts, {sum(x[3].n_meas for x in built)} "
+          f"measurements ({journal.n_cached} from the journal), {cost():.3f} node-h, stop: {b.stop}"
+          + ("" if complete or cat is None else " (incomplete)"))
 
 
 if __name__ == "__main__":

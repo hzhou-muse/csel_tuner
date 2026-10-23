@@ -345,9 +345,15 @@ shaped the design:
   also with power-of-two features. The model file is orders of magnitude
   smaller, and its inference is a few dozen lines that port to C.
 
-## 11. Restricted algorithms and staged sampling (planned)
+## 11. Restricted algorithms and staged sampling
 
-So far the builders choose among the algorithms that have no
+Status: stage 1 is implemented (`csel_tuner/algos.py`,
+`csel_tuner/restrict.py`, `bin/collmodel --coll-algorithms`, `bin/colltree`
+on collmodel/3, mpisrv `probe=1` and error replies) and tested on the replay
+(with `--replay-alias release_gather=auto@single`) and in local functional
+runs; stage 2 is not.
+
+Before, the builders chose among the algorithms that have no
 `restrictions` in MPICH's `src/mpi/coll/coll_algorithms.txt`. On a
 single-node communicator MPICH's default instead takes
 `release_gather` (restriction `MPIDI_CH4_release_gather`), which a file of
@@ -438,6 +444,17 @@ MPICH's default, per restriction set (e.g. single-node / multi-node).
 - Without a node-count condition, `r0` cannot tell 1 x 32 from 32 x 1; the
   restriction split removes that conflict only where a restricted
   algorithm wins.
+- Budget: each later set keeps a share in proportion to its layouts, and
+  reuses the measurements made before it at the same points.
+- **Stage 2 and `FALLBACK=error` conflict.** The algorithm CVAR is global:
+  forcing `smp` also forces it on smp's own inner calls on the node and
+  leaders' communicators, where `hierarchical` fails. With the default
+  fallback those calls fall back to the selection; with
+  `MPIR_CVAR_COLLECTIVE_FALLBACK=error` they fail, so `smp` fails on every
+  layout. Stage 2 needs either the default fallback (and the feasibility of
+  `hierarchical` from elsewhere) or an MPICH where a forced algorithm
+  applies only to the user's call, not to the inner calls of a
+  compositional algorithm.
 
 ## 12. Limitations and next steps
 

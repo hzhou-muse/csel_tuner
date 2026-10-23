@@ -173,7 +173,8 @@ def select(root, x):
 
 def json_tree(root, alg_names, leaf):
     """CSEL JSON object for the tree. alg_names: index -> algorithm name;
-    leaf(name) -> (key, params) of an algorithm leaf."""
+    leaf(name) -> (key, params) of an algorithm leaf, or a string such as
+    "call=<subtree>" that stands for the leaf itself."""
     def obj(node):
         out = {}
         cur = node
@@ -188,22 +189,30 @@ def json_tree(root, alg_names, leaf):
                 continue
             out[cond] = obj(left)
             cur = right
-        key, params = leaf(alg_names[cur.alg])
+        lf = leaf(alg_names[cur.alg])
+        val = lf if isinstance(lf, str) else {lf[0]: lf[1]}
         if not out:
-            return {key: params}
-        out["any"] = {key: params}
+            return val
+        out["any"] = val
         return out
     return obj(root)
 
 
-def json_choice(obj, x):
+def json_choice(obj, x, trees=None):
     """The algorithm a CSEL subtree (as json_tree writes it) chooses at one
     point, x = {"p": comm_size, "m": message size, "N": nodes, "ppn": ranks
-    per node, "pof2": 0/1}: siblings are tried in order, the first true
-    condition is followed, "any" always is. Returns the leaf's key after
-    "algorithm=", e.g. "MPIR_Bcast_intra_binomial"."""
+    per node, "pof2": 0/1, "cond": {restrictive condition: bool}}: siblings
+    are tried in order, the first true condition is followed, "any" always
+    is; "call=NAME" continues in trees["NAME"] (a file's subtrees, keys
+    without "name="). Returns the leaf's key after "algorithm=", e.g.
+    "MPIR_Bcast_intra_binomial"."""
     feature = {"comm_size": "p", "avg_msg_size": "m", "num_nodes": "N", "ppn": "ppn"}
     while True:
+        if isinstance(obj, str):
+            if not obj.startswith("call="):
+                raise ValueError("leaf %r" % obj)
+            obj = trees[obj[len("call="):]]
+            continue
         for key, sub in obj.items():
             if key.startswith("algorithm="):
                 return key[len("algorithm="):]
@@ -211,6 +220,8 @@ def json_choice(obj, x):
                 ok = True
             elif key in ("pof2", "!pof2"):
                 ok = (x["pof2"] > 0.5) == (key == "pof2")
+            elif "(" not in key:
+                ok = x["cond"][key.lstrip("!")] != key.startswith("!")
             else:
                 name, t = key.rstrip(")").split("(")
                 ok = x[feature[name]] <= int(t)

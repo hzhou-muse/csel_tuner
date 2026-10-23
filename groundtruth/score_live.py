@@ -120,13 +120,32 @@ def switch(a):
 
 
 def load_model(path):
+    """(model file, {set mask: (algs, {alg: LayoutModel})}, measured layouts, {layout: mask}).
+    collmodel/2 is one set, mask 0."""
     from csel_tuner.single import LayoutModel
     d = json.load(open(path))
-    if d.get("format") != "collmodel/2":
-        sys.exit(f"{path}: not a collmodel/2 file")
-    models = {alg: LayoutModel.from_json({"model": d["models"][alg]}) for alg in d["algs"]}
-    measured = {(s["N"], s["ppn"]) for s in d.get("selection", [])}
-    return d, models, measured
+    if d.get("format") == "collmodel/2":
+        sets = {0: (d["algs"], d)}
+        sel = d.get("selection", [])
+    elif d.get("format") == "collmodel/3":
+        sets = {x["mask"]: (x["algs"], x["model"]) for x in d["sets"]}
+        sel = [s for x in d["sets"] for s in x["model"].get("selection", [])]
+    else:
+        sys.exit(f"{path}: not a collmodel/2 or /3 file")
+    models = {mask: (algs, {alg: LayoutModel.from_json({"model": m["models"][alg]}) for alg in algs})
+              for mask, (algs, m) in sets.items()}
+    measured = {(s["N"], s["ppn"]) for s in sel}
+    masks = {(n, q): m for n, q, m in d.get("layout_masks", [])}
+    return d, models, measured, masks
+
+
+def layout_mask(masks, n, q):
+    """The restriction mask of a layout: recorded by the precheck, or else that
+    of the recorded layouts of the same kind (single-node or not), or 0."""
+    if (n, q) in masks:
+        return masks[(n, q)]
+    same = {m for (n2, q2), m in masks.items() if (n2 == 1) == (n == 1) and n2 * q2 > 1}
+    return same.pop() if len(same) == 1 else 0
 
 
 def times(directory):
@@ -149,59 +168,76 @@ def summary(r):
 
 def validate(a):
     from csel_tuner.tree import json_choice
-    d, models, measured = load_model(a.model)
-    algs, sizes = d["algs"], np.array(d["sizes"])
+    d, models, measured, masks = load_model(a.model)
+    sizes = np.array(d["sizes"])
+    op = d["what"].split("-")[0]
+    bits = d.get("conditions", [])
+    leaf_alg = {x["leaf"]: alg for alg, x in d.get("algorithms", {}).items()}
     truth, _ = times(a.truth)
     default, env_d = times(a.default)
     tuned, env_t = times(a.tuned)
+    algs = sorted({k[0] for k in truth if k[0] is not None})
     trees = {"tree (offline)": json.load(open(a.tuning))}
     if a.tuning_node_aware:
         trees["tree, node-aware (offline)"] = json.load(open(a.tuning_node_aware))
-    trees = {k: next(iter(v.values())) for k, v in trees.items()}   # the one subtree in each file
+    # every subtree of a file by name; the selection starts at <op>-intra-auto
+    trees = {k: {n.split("=", 1)[1]: t for n, t in v.items()} for k, v in trees.items()}
     points = sorted({k[1:] for k in truth if k[0] is not None})
     pred = {}
     rows = {name: [] for name in ["default", "tuned", *trees, "model, per point"]}
     split = {name: ([], []) for name in rows}
-    consistency, skipped = [], 0
+    by_node = {name: ([], []) for name in rows}
+    consistency, skipped, default_wins = [], 0, []
     for n, q, m in points:
-        t = {alg: truth.get((alg, n, q, m)) for alg in algs}
-        if any(v is None for v in t.values()):
+        mask = layout_mask(masks, n, q)
+        set_algs, set_models = models.get(mask, models[0])
+        t = {alg: truth[(alg, n, q, m)] for alg in algs if (alg, n, q, m) in truth}
+        if any(alg not in t for alg in set_algs):
             skipped += 1
             continue
-        best = min(t.values())
-        x = {"p": n * q, "m": m, "N": n, "ppn": q, "pof2": float((n * q) & (n * q - 1) == 0)}
+        # the fastest of every algorithm measured here and MPICH's default
+        best = min(list(t.values()) + ([default[(None, n, q, m)]] if (None, n, q, m) in default else []))
+        x = {"p": n * q, "m": m, "N": n, "ppn": q, "pof2": float((n * q) & (n * q - 1) == 0),
+             "cond": {b.lstrip("!"): bool(mask >> k & 1) != b.startswith("!") for k, b in enumerate(bits)}}
         if (n, q) not in pred:
-            pred[(n, q)] = np.array([models[alg].predict(n, q) for alg in algs])
+            pred[(n, q)] = np.array([set_models[alg].predict(n, q) for alg in set_algs])
         i = int(np.argmin(np.abs(np.log2(sizes) - np.log2(max(m, 1)))))
-        r = {"model, per point": t[algs[int(np.argmin(pred[(n, q)][:, i]))]] / best}
+        r = {"model, per point": t[set_algs[int(np.argmin(pred[(n, q)][:, i]))]] / best}
         for name, tree in trees.items():
-            alg = json_choice(tree, x).split("_intra_", 1)[-1]
+            key = json_choice(tree[f"{op}-intra-auto"], x, tree)
+            alg = leaf_alg.get(key, key.split("_intra_", 1)[-1])
             r[name] = t[alg] / best if alg in t else float("nan")
             if name == "tree (offline)" and (None, n, q, m) in tuned and alg in t:
                 consistency.append(tuned[(None, n, q, m)] / t[alg])
         if (None, n, q, m) in default:
             r["default"] = default[(None, n, q, m)] / best
+            default_wins.append(default[(None, n, q, m)] / min(t.values()))
         if (None, n, q, m) in tuned:
             r["tuned"] = tuned[(None, n, q, m)] / best
         for name, v in r.items():
             if v == v:
                 rows[name].append(v)
                 split[name][0 if (n, q) in measured else 1].append(v)
-    est = d["meta"].get("estimate", {})
+                by_node[name][0 if n == 1 else 1].append(v)
+    est = d["meta"].get("estimate") or next((x["meta"].get("estimate", {}) for x in d.get("sets", [])
+                                             if x["mask"] == 0), {})
     out = ["# Validation of the tuning file", "",
            f"{len(points) - skipped} points ({len({p[:2] for p in points})} layouts); regret = T(selection) / "
-           f"T(fastest algorithm at that point), the fastest taken from the per-request measurements.", "",
-           "| selection | points | geomean | p95 | max | > 1.1 | geomean, layouts the builder measured / not |",
-           "|---|---|---|---|---|---|---|"]
+           f"T(fastest at that point), the fastest of every algorithm measured per request and MPICH's default.", "",
+           "| selection | points | geomean | p95 | max | > 1.1 | geomean, layouts the builder measured / not "
+           "| geomean, single-node / multi-node |",
+           "|---|---|---|---|---|---|---|---|"]
     res = {}
     for name, v in rows.items():
         if not v:
             continue
         s = summary(v)
-        res[name] = dict(s, measured=gm(split[name][0]), unmeasured=gm(split[name][1]))
+        res[name] = dict(s, measured=gm(split[name][0]), unmeasured=gm(split[name][1]),
+                         single_node=gm(by_node[name][0]), multi_node=gm(by_node[name][1]))
         out.append(f"| {name} | {s['n']} | {s['geomean']:.3f} | {s['p95']:.2f} | {s['max']:.2f} | "
-                   f"{s['frac_gt_1.1']:.0%} | {gm(split[name][0]):.3f} / {gm(split[name][1]):.3f} |")
-    d_r = np.array(rows["default"]) if rows["default"] else np.array([])
+                   f"{s['frac_gt_1.1']:.0%} | {gm(split[name][0]):.3f} / {gm(split[name][1]):.3f} | "
+                   f"{gm(by_node[name][0]):.3f} / {gm(by_node[name][1]):.3f} |")
+    d_r = np.array(default_wins)
     if len(d_r) and np.mean(d_r < 0.95) > 0:
         res["default faster than every candidate"] = {"fraction": float(np.mean(d_r < 0.95)),
                                                       "median_factor": float(np.median(d_r[d_r < 0.95]))}

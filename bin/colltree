@@ -14,6 +14,17 @@ size of its grid, and pruned to the smallest tree whose predicted geomean
 regret is within --tol of the full tree's. Without --node-aware it uses
 comm_size, avg_msg_size and pof2 (MPICH main today); --node-aware adds
 num_nodes and ppn, conditions MPICH does not have yet.
+
+A collmodel/3 file (bin/collmodel --coll-algorithms) has a model per
+restriction set; the output then has one subtree per set
+(docs/design.md, section 11):
+- "name=<op>-intra-r0", the unrestricted algorithms, fitted on every layout;
+- "name=<op>-intra-r<S>", fitted on the layouts where exactly the conditions
+  S hold, choosing among S's restricted algorithms and the leaf
+  "call=<op>-intra-r0" (timed as r0's choice at each point, from S's model);
+- "name=<op>-intra-auto", the dispatch: nested restrictive conditions, each
+  tested once, ending in "call=" the subtree of the conditions that hold
+  (a set without a subtree: its largest subset that has one, at worst r0).
 """
 import argparse
 import json
@@ -26,8 +37,9 @@ sys.path.insert(0, os.path.dirname(HERE))
 import numpy as np  # noqa: E402
 
 from csel_tuner.layouts import axis_values  # noqa: E402
+from csel_tuner.restrict import set_name  # noqa: E402
 from csel_tuner.single import LayoutModel, is_pof2  # noqa: E402
-from csel_tuner.tree import fit_tree, json_tree, prune_to  # noqa: E402
+from csel_tuner.tree import fit_tree, json_tree, prune_to, select  # noqa: E402
 
 # extra parameters of algorithm leaves (coll_algorithms.txt extra_params), at
 # the CVAR defaults the measurements ran with; --param alg.key=value overrides
@@ -49,9 +61,48 @@ def parse_value(v):
         return v
 
 
+def points(layouts, sizes):
+    """Feature arrays over every layout x size, in layout-major order."""
+    X = {k: [] for k in ("N", "ppn", "p", "m", "pof2")}
+    for n, q in layouts:
+        for m in sizes:
+            for k, v in (("N", n), ("ppn", q), ("p", n * q), ("m", m), ("pof2", float(is_pof2(n * q)))):
+                X[k].append(v)
+    return {k: np.array(v, float) for k, v in X.items()}
+
+
+def predictions(d, algs, layouts):
+    """log2 T of each algorithm (columns) at every point of points(layouts, sizes)."""
+    models = {alg: LayoutModel.from_json({"model": d["models"][alg]}) for alg in algs}
+    return np.vstack([np.array([models[alg].predict(n, q) for alg in algs]).T for n, q in layouts])
+
+
+def fit(X, L, feats, a):
+    t = fit_tree(X, L, feats, max_leaves=a.max_leaves)
+    return prune_to(t, a.tol, a.max_regret)
+
+
+def dispatch(op, bits, present):
+    """The <op>-intra-auto subtree: nested conditions over the bits that some
+    present set uses, ending in call= the set of the conditions that hold, or
+    its largest present subset."""
+    used = [k for k in range(len(bits)) if any(s >> k & 1 for s in present)]
+
+    def target(s):
+        best = max((x for x in present if x & ~s == 0), key=lambda x: (bin(x).count("1"), -x))
+        return "call=" + set_name(op, best)
+
+    def node(i, s):
+        if i == len(used):
+            return target(s)
+        on, off = node(i + 1, s | 1 << used[i]), node(i + 1, s)
+        return off if on == off else {bits[used[i]]: on, "any": off}
+    return node(0, 0)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("model", help="collmodel/2 file")
+    ap.add_argument("model", help="collmodel/2 or collmodel/3 file")
     ap.add_argument("--out", required=True, help="selection JSON to write")
     ap.add_argument("--tol", type=float, default=0.005, help="allowed predicted geomean regret over the full tree")
     ap.add_argument("--node-aware", action="store_true", help="also split on num_nodes and ppn (future CSEL)")
@@ -61,43 +112,70 @@ def main(argv=None):
     ap.add_argument("--param", action="append", default=[], metavar="ALG.KEY=VALUE")
     a = ap.parse_args(argv)
     d = json.load(open(a.model))
-    if d.get("format") != "collmodel/2":
-        sys.exit(f"{a.model}: not a collmodel/2 file (from tools/collmodel.py --algs)")
+    if d.get("format") not in ("collmodel/2", "collmodel/3"):
+        sys.exit(f"{a.model}: not a collmodel/2 or /3 file (from bin/collmodel --algs)")
     op = d["what"].split("-")[0]
-    algs, sizes = d["algs"], np.array(d["sizes"])
-    models = {alg: LayoutModel.from_json({"model": d["models"][alg]}) for alg in algs}
+    sizes = np.array(d["sizes"])
     (n_lo, n_hi), (p_lo, p_hi) = d["domain"]["N"], d["domain"]["ppn"]
     layouts = [(n, q) for n in axis_values(n_hi) for q in axis_values(p_hi) if n * q > 1]
-    X = {k: [] for k in ("N", "ppn", "p", "m", "pof2")}
-    L = []
-    for n, q in layouts:
-        L.append(np.array([models[alg].predict(n, q) for alg in algs]).T)
-        for m in sizes:
-            for k, v in (("N", n), ("ppn", q), ("p", n * q), ("m", m), ("pof2", float(is_pof2(n * q)))):
-                X[k].append(v)
-    X = {k: np.array(v, float) for k, v in X.items()}
-    L = np.vstack(L)
     feats = ["N", "ppn", "p", "m", "pof2"] if a.node_aware else ["p", "m", "pof2"]
-    t = fit_tree(X, L, feats, max_leaves=a.max_leaves)
-    t, path = prune_to(t, a.tol, a.max_regret)
     params = {k: dict(v) for k, v in PARAMS.get(op, {}).items()}
     for kv in a.param:
         k, v = kv.split("=", 1)
         alg, key = k.split(".", 1)
         params.setdefault(alg, {})[key] = parse_value(v)
     coll = op[0].upper() + op[1:]
-    leaf = lambda alg: (f"algorithm=MPIR_{coll}_intra_{alg}", params.get(alg, {}))
-    out = {f"name={op}-intra-auto": json_tree(t, algs, leaf)}
+    names = {alg: x["leaf"] for alg, x in d.get("algorithms", {}).items()}
+    leaf = lambda alg: ("algorithm=" + names.get(alg, f"MPIR_{coll}_intra_{alg}"), params.get(alg, {}))
+    X = points(layouts, sizes)
+    lines = []
+
+    def report(name, t, path, algs, n_lay):
+        used = sorted({algs[l.alg] for l in t.leaves()})
+        lines.append(f"{name}: {len(t.leaves())} leaves over {n_lay} layouts x {len(sizes)} sizes; predicted "
+                     f"geomean regret {path[0][1]:.4f} (full tree, {path[0][0]} leaves) -> {path[-1][1]:.4f}; "
+                     f"algorithms used: {', '.join(used)}")
+
+    if d["format"] == "collmodel/2":
+        algs = d["algs"]
+        t, path = fit(X, predictions(d, algs, layouts), feats, a)
+        out = {f"name={op}-intra-auto": json_tree(t, algs, leaf)}
+        report(a.out, t, path, algs, len(layouts))
+    else:
+        sets = {x["mask"]: x for x in d["sets"]}
+        if 0 not in sets:
+            sys.exit(f"{a.model}: no set 0 (unrestricted algorithms)")
+        r0 = sets[0]
+        t0, path = fit(X, predictions(r0["model"], r0["algs"], layouts), feats, a)
+        out = {f"name={set_name(op, 0)}": json_tree(t0, r0["algs"], leaf)}
+        report(set_name(op, 0), t0, path, r0["algs"], len(layouts))
+        for mask in sorted(sets):
+            if mask == 0:
+                continue
+            x = sets[mask]
+            lays = [tuple(l) for l in x["layouts"]]
+            Xs = points(lays, sizes)
+            Ls = predictions(x["model"], x["algs"], lays)
+            # the r0 option: S's model's time of what r0 chooses at each point
+            col = {alg: j for j, alg in enumerate(x["algs"])}
+            pick = [col[r0["algs"][select(t0, {k: v[i] for k, v in Xs.items()})]] for i in range(len(Xs["p"]))]
+            own = [alg for alg in x["algs"] if d["algorithms"][alg]["mask"]]
+            opts = own + ["r0"]
+            L = np.column_stack([Ls[:, col[alg]] for alg in own] + [Ls[np.arange(len(pick)), pick]])
+            t, path = fit(Xs, L, feats, a)
+            sub = lambda alg: "call=" + set_name(op, 0) if alg == "r0" else leaf(alg)
+            out[f"name={set_name(op, mask)}"] = json_tree(t, opts, sub)
+            report(set_name(op, mask), t, path, opts, len(lays))
+        out[f"name={op}-intra-auto"] = dispatch(op, d["conditions"], sorted(sets))
     depth = json_depth(out)
     if depth > 64:
         sys.exit(f"tree nests {depth} levels; MPICH's parser allows 64 (try a larger --tol)")
     with open(a.out, "w") as f:
         json.dump(out, f, indent=2)
         f.write("\n")
-    used = sorted({alg for alg in (algs[l.alg] for l in t.leaves())})
-    print(f"{a.out}: {len(t.leaves())} leaves over {len(layouts)} layouts x {len(sizes)} sizes; "
-          f"predicted geomean regret {path[0][1]:.4f} (full tree, {path[0][0]} leaves) -> {path[-1][1]:.4f}; "
-          f"features {','.join(feats)}; nesting {depth}; algorithms used: {', '.join(used)}")
+    for line in lines:
+        print(line)
+    print(f"{a.out}: features {','.join(feats)}; nesting {depth}")
 
 
 if __name__ == "__main__":

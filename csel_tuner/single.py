@@ -342,8 +342,9 @@ def initial_layouts(allowed, n_max, ppn_max):
     mid_n = nearest_allowed([n for n in ns if 2 < n < n_max] or [2], np.log2(n_max * 2) / 2)
     mid_p = nearest_allowed([p for p in ps if 1 < p < ppn_max] or [1], np.log2(ppn_max) / 2)
     lay = [(n, p) for n in sorted({2, mid_n, n_max}) for p in sorted({1, mid_p, ppn_max})]
-    p1 = min(p for n, p in allowed if n == 1 and p > 1)     # N = 1: from its smallest layout
-    lay += [(1, p) for p in sorted({p1, mid_p, ppn_max})]
+    single = [p for n, p in allowed if n == 1 and p > 1]
+    if single:                                              # N = 1: from its smallest layout
+        lay += [(1, p) for p in sorted({min(single), mid_p, ppn_max})]
     return [l for l in lay if l in allowed and l[0] * l[1] > 1]
 
 

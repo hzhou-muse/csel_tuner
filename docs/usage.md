@@ -100,6 +100,35 @@ bin/collmodel --op bcast \
 - `--log` keeps a journal of every measurement, which lets a later job
   continue the run (§6.4). Always give one on a cluster.
 
+**Every algorithm, restricted ones included** (docs/design.md §11):
+
+```sh
+bin/collmodel --op bcast --algs all \
+    --coll-algorithms $MPICH_SRC/src/mpi/coll/coll_algorithms.txt \
+    --site aurora --nodes 8 --ppn 96 --budget-node-h 2 --out bcast.json --log bcast.jsonl
+```
+
+- `--coll-algorithms` is the `coll_algorithms.txt` of the MPICH build under
+  test. `--algs all` takes every algorithm of the op from it (plus `nb`);
+  `--algs a,b,...` with `--coll-algorithms` takes those.
+- The run starts with a precheck: one probe call (`--probe-m`, 1 KB) of each
+  algorithm at each allowed layout. The server runs with
+  `MPIR_CVAR_COLLECTIVE_FALLBACK=error`, so an algorithm whose restriction
+  fails returns an error. An unrestricted algorithm that fails anywhere is
+  left out (e.g. `nb` without a nonblocking selection that works here).
+- Then one builder per restriction set: `r0` (unrestricted algorithms) on
+  every layout, then each other set on the layouts where exactly its
+  conditions hold (e.g. `r2`, `release_gather` on single-node layouts). Each
+  later set keeps a share of the budget in proportion to its layouts, and
+  reuses the measurements made before it.
+- Compositional algorithms (`--stage2`, default those restricted to
+  `hierarchical`, e.g. `smp`) are not measured yet.
+- Needs an MPICH whose `release_gather` condition has no side effects
+  (pmodels/mpich#8048); with an older one the precheck of `release_gather`
+  depends on how often it was evaluated.
+- The model file is `collmodel/3`: the catalog's conditions, each layout's
+  mask and feasible algorithms, and one model per set.
+
 A PBS job on Aurora that stops cleanly before its walltime and continues a
 run an earlier job did not finish:
 
@@ -204,6 +233,15 @@ The file defines `name=bcast-intra-auto`, which replaces MPICH's built-in
 subtree of that name; everything else keeps its defaults. A malformed file
 stops `MPI_Init` with the line and column of the error.
 
+From a `collmodel/3` file the output has a subtree per restriction set,
+`name=bcast-intra-r0`, `name=bcast-intra-r2`, ..., and
+`name=bcast-intra-auto` dispatches on the restrictive conditions, e.g.
+`{"MPIDI_CH4_release_gather": "call=bcast-intra-r2", "any":
+"call=bcast-intra-r0"}`. A restricted set's leaves are its algorithms or
+`"call=bcast-intra-r0"`. To see which algorithms ran, set
+`MPIR_CVAR_DUMP_COLL_ALGO_COUNTERS=0` (rank 0 prints its counts at
+finalize).
+
 ## 8. Replay (development)
 
 The builders can run against recorded measurements instead of a cluster.
@@ -248,7 +286,8 @@ groundtruth/run_set.sh plans/switch results/switch 900
 python3 groundtruth/score_live.py switch results/switch            # ends with SWITCH CHECK PASSED
 
 # a tuning file at random points the builder did not choose
-python3 groundtruth/gen_plans.py --set validate --out plans/validate --nodes 8 --ppn 96
+python3 groundtruth/gen_plans.py --set validate --out plans/validate --nodes 8 --ppn 96 \
+    [--v-algs binomial,...,nb --v-single-node-algs release_gather]
 groundtruth/run_set.sh plans/validate/truth results/validate/truth 1800      # every algorithm, per request
 groundtruth/run_set.sh plans/validate/default results/validate/default 600   # MPICH's own selection
 MPIR_CVAR_COLL_SELECTION_JSON_FILE=$PWD/bcast_tuning.json \
@@ -260,7 +299,10 @@ python3 groundtruth/score_live.py validate --truth results/validate/truth --defa
 The validation reports the regret of MPICH's default, of MPICH with the
 tuning file, of the tree's and the model's own choices, whether MPICH
 applied the file, and whether the default beats every candidate algorithm
-somewhere (then the candidates miss one, e.g. `release_gather`).
+somewhere (then the candidates miss one, e.g. `release_gather`). Regret is
+against the fastest of every algorithm measured and MPICH's default, split
+into single-node and multi-node layouts. `--model` takes a collmodel/2 or
+/3 file and `--tuning` a file with one or several subtrees.
 
 ## 10. Troubleshooting
 
@@ -272,6 +314,8 @@ somewhere (then the candidates miss one, e.g. `release_gather`).
 | launches fail right after a killed one | stale `/dev/shm/mpich_shm_*` files filling shared memory; remove your own |
 | `tree nests N levels` | MPICH's parser allows 64; use a larger `--tol` |
 | `unknown condition` at `MPI_Init` | a `--node-aware` file on an MPICH without `num_nodes`/`ppn` conditions |
+| `precheck: X fails at ... without restrictions` | an unrestricted algorithm errors on a layout; it is left out; the message is MPICH's |
+| `Algorithm selected is not supported` in an error reply | a forced algorithm whose restriction fails, with `MPIR_CVAR_COLLECTIVE_FALLBACK=error` |
 
 ## 11. Tests
 
@@ -280,6 +324,7 @@ python3 tests/test_interp.py     # numpy only
 python3 tests/test_tree.py       # numpy only
 python3 tests/test_replay.py     # replay end to end; needs pandas and replay data, else skipped
 python3 tests/test_resume.py     # a cut journal resumes to the same model; same needs
+python3 tests/test_restrict.py   # catalog, precheck, sets, dispatch; the two-set build needs replay data
 ```
 
 They also run under pytest.
