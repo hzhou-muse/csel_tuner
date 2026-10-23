@@ -418,8 +418,7 @@ def restriction_sets(a, layouts, probe):
     for mask, lays, names in sets:
         print(f"set {set_name(a.op, mask)}: {len(lays)} layouts, algorithms {', '.join(names)}", file=sys.stderr)
     info = {"conditions": bits,
-            "algorithms": {x.name: {"leaf": x.leaf, "mask": x.mask(bits), "requires": list(x.requires(bits)),
-                                    "restrictions": x.restrictions}
+            "algorithms": {x.name: {"leaf": x.leaf, "mask": x.mask(bits), "restrictions": x.restrictions}
                            for x in algs},
             "layout_masks": [[l[0], l[1], m] for l, m in sorted(masks.items())],
             "feasible": [[l[0], l[1], sorted(f)] for l, f in sorted(feas.items())],

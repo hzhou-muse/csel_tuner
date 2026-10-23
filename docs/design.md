@@ -380,19 +380,27 @@ relies on condition checks without side effects (MPICH: the release_gather
 condition used to count calls and create shared memory; now it only reads
 state, and the creation happens before the selection).
 
-**Restriction index.** Bit k is the k-th restrictive (non-threshold)
-condition of the file's `conditions:` list, one numbering for every
-collective (MPICH's list today: `inplace` 0, `pof2` 1, ..., `hierarchical`
-4, ..., `MPIDI_CH4_release_gather` 10), so a set's name means the same in
-every op, and appending a condition keeps the others' numbers. A set's mask
-is the conditions that are true. A restriction `c` requires bit c set, `!c`
-requires it clear; an algorithm is allowed in set S when both hold. A
-layout's mask comes from the precheck: an algorithm that ran has its
-required bits true and its excluded bits false; one that failed pins a bit
-when all its other requirements are known; a bit no algorithm decides is
-taken as false and reported. The model file records the bit names. The
-subtree `<op>-intra-r<mask>` serves calls whose true conditions are exactly
-`mask`, e.g. `bcast-intra-r1024` for single-node communicators:
+**Restriction index.** Restrictions are positive: each names a condition
+that must hold (MPICH's `coll_algorithms.txt` has no negated restrictions;
+a restriction that needs a condition false names its own condition, e.g.
+`not_inplace`). Bit k is the k-th restrictive (non-threshold) condition of
+the file's `conditions:` list, one numbering for every collective, so a
+set's name means the same in every op, and appending a condition keeps the
+others' numbers (MPICH's list: `inplace` 0, `not_inplace` 1, ...,
+`hierarchical` 5, ..., `MPIDI_CH4_release_gather` 11). An algorithm's mask
+is the OR of its restrictions' bits; a set's mask is the conditions that
+are true; an algorithm runs in set S when its mask is a subset of S, so
+whatever runs in a set also runs in any larger one. A layout's mask comes
+from the precheck: the bits of every algorithm that ran; an algorithm that
+failed with all but one of its bits known true makes that one false; a bit
+no algorithm decides is taken as false and reported. Complementary
+conditions such as `inplace` / `not_inplace` give sets with exactly one of
+the two; the others are empty and skipped. The model file records the bit
+names. (Older MPICH files use `!inplace`; such a restriction is read as a
+condition of its own, numbered after the listed ones, and tested as
+`!inplace` in the tree.) The subtree `<op>-intra-r<mask>` serves calls whose
+true conditions are exactly `mask`, e.g. `bcast-intra-r2048` for
+single-node communicators:
 
 - `r0` holds the unrestricted algorithms and is fitted on **every** layout:
   it is the fallback whenever no other set applies at run time, also on
@@ -405,9 +413,9 @@ subtree `<op>-intra-r<mask>` serves calls whose true conditions are exactly
 - A set with no layouts (mutually exclusive conditions) produces no subtree.
 - `<op>-intra-auto` is the dispatch: nested conditions over the bits in
   use, each evaluated once on a path, ending in `call=` the matching
-  subtree; a set with no subtree calls its largest present subset whose
-  algorithms are all allowed there (a subset may hold a `!c` algorithm
-  that the larger set excludes), at worst `r0`.
+  subtree; a set with no subtree calls its largest present subset, at
+  worst `r0` (with positive restrictions a subset's algorithms are always
+  allowed).
 
 **Stages for compositional algorithms.** An algorithm such as `smp` runs
 other collectives on sub-communicators (the node comm, the comm of node
@@ -445,9 +453,10 @@ MPICH's default, per restriction set (e.g. single-node / multi-node).
   reach it for allreduce. A later creation failure turns the algorithm
   infeasible on that comm (an error reply mid-sampling), which the builder
   treats like a failed precheck and reports.
-- Per-call conditions (`inplace`, `commutative`, `builtin_op`,
-  `count_ge_pof2`) depend on the call's arguments, not the layout: the
-  precheck runs per call variant. Bcast has none.
+- Per-call conditions (`inplace`, `not_inplace`, `commutative`,
+  `builtin_op`, `count_ge_pof2`) depend on the call's arguments, not the
+  layout: the precheck runs per call variant, and mpisrv makes no in-place
+  calls yet, so only the `not_inplace` sets are built. Bcast has none.
 - Without a node-count condition, `r0` cannot tell 1 x 32 from 32 x 1; the
   restriction split removes that conflict only where a restricted
   algorithm wins.

@@ -83,19 +83,14 @@ def fit(X, L, feats, a):
 
 
 def dispatch(op, bits, present):
-    """The <op>-intra-auto subtree. present: {set mask: OR of the excluded bits
-    (!c restrictions) of its algorithms}. Nested conditions over the bits that
-    matter, ending in call= the set of the conditions that hold, or else its
-    largest present subset whose algorithms are all allowed there (at worst
-    set 0, which has only unrestricted algorithms)."""
-    used = 0
-    for x, neg in present.items():
-        used |= x | neg
-    used = [k for k in range(len(bits)) if used >> k & 1]
+    """The <op>-intra-auto subtree: nested conditions over the bits that some
+    present set uses, ending in call= the set of the conditions that hold, or
+    its largest present subset (restrictions are positive, so whatever a
+    subset allows is allowed there too; at worst set 0)."""
+    used = [k for k in range(len(bits)) if any(s >> k & 1 for s in present)]
 
     def target(s):
-        ok = [x for x, neg in present.items() if x & ~s == 0 and neg & s == 0]
-        best = max(ok, key=lambda x: (bin(x).count("1"), -x))
+        best = max((x for x in present if x & ~s == 0), key=lambda x: (bin(x).count("1"), -x))
         return "call=" + set_name(op, best)
 
     def node(i, s):
@@ -172,11 +167,7 @@ def main(argv=None):
             sub = lambda alg: "call=" + set_name(op, 0) if alg == "r0" else leaf(alg)
             out[f"name={set_name(op, mask)}"] = json_tree(t, opts, sub)
             report(set_name(op, mask), t, path, opts, len(lays))
-        neg = {mask: 0 for mask in sets}
-        for mask, x in sets.items():
-            for alg in x["algs"]:
-                neg[mask] |= d["algorithms"][alg].get("requires", [0, 0])[1]
-        out[f"name={op}-intra-auto"] = dispatch(op, d["conditions"], neg)
+        out[f"name={op}-intra-auto"] = dispatch(op, d["conditions"], sorted(sets))
     depth = json_depth(out)
     if depth > 64:
         sys.exit(f"tree nests {depth} levels; MPICH's parser allows 64 (try a larger --tol)")

@@ -198,7 +198,7 @@ def validate(a):
         # the fastest of every algorithm measured here and MPICH's default
         best = min(list(t.values()) + ([default[(None, n, q, m)]] if (None, n, q, m) in default else []))
         x = {"p": n * q, "m": m, "N": n, "ppn": q, "pof2": float((n * q) & (n * q - 1) == 0),
-             "cond": {b.lstrip("!"): bool(mask >> k & 1) != b.startswith("!") for k, b in enumerate(bits)}}
+             "cond": {b: bool(mask >> k & 1) for k, b in enumerate(bits)}}
         if (n, q) not in pred:
             pred[(n, q)] = np.array([set_models[alg].predict(n, q) for alg in set_algs])
         i = int(np.argmin(np.abs(np.log2(sizes) - np.log2(max(m, 1)))))

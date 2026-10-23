@@ -221,7 +221,8 @@ def json_choice(obj, x, trees=None):
             elif key in ("pof2", "!pof2"):
                 ok = (x["pof2"] > 0.5) == (key == "pof2")
             elif "(" not in key:
-                ok = x["cond"][key.lstrip("!")] != key.startswith("!")
+                # a restrictive condition; an old-style "!c" restriction is a condition of its own
+                ok = x["cond"][key] if key in x["cond"] else x["cond"][key.lstrip("!")] != key.startswith("!")
             else:
                 name, t = key.rstrip(")").split("(")
                 ok = x[feature[name]] <= int(t)

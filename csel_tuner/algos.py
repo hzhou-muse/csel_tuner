@@ -3,15 +3,18 @@
     cat = Catalog.load("coll_algorithms.txt")
     algs = cat.algorithms("bcast")        # [Alg], in file order, plus nb
     bits = cat.restriction_bits()         # restrictive conditions: bit k = bits[k], for every op
-    algs[0].requires(bits), algs[0].leaf  # e.g. (0, 0), "MPIR_Bcast_intra_binomial"
+    algs[0].mask(bits), algs[0].leaf      # e.g. 0, "MPIR_Bcast_intra_binomial"
 
-An algorithm's restrictions are conditions that must hold (`c`) or must not
-hold (`!c`) for it to run. The restrictive conditions are the non-threshold
-entries of the file's `conditions:` list, numbered in that order (one
-numbering for every collective; appending a condition keeps the others'
-numbers). A restriction set is the mask of the conditions that are true; an
-algorithm runs in set S when its required bits are in S and its excluded
-bits are not (allowed()). requires() == (0, 0): no restriction.
+An algorithm's restrictions are conditions that must hold for it to run.
+The restrictive conditions are the non-threshold entries of the file's
+`conditions:` list, numbered in that order (one numbering for every
+collective; appending a condition keeps the others' numbers). An
+algorithm's mask is the OR of its restrictions' bits (0: unrestricted), and
+it runs in a restriction set S (the mask of the conditions that are true)
+when its mask is a subset of S, so whatever runs in S also runs in any
+larger set. MPICH files from before restrictions became positive-only use
+`!c` (e.g. `!inplace`); each such restriction is read as a condition of its
+own, numbered after the listed ones (a CSEL tree can test it as `!c`).
 """
 import re
 
@@ -25,26 +28,15 @@ class Alg:
         coll = op[0].upper() + op[1:]
         self.leaf = keys.get("func_name") or "MPIR_%s_intra_%s" % (coll, name)
 
-    def requires(self, bits):
-        """(bits that must be set, bits that must be clear)"""
-        pos = neg = 0
-        for r in self.restrictions:
-            name = r.lstrip("!")
-            if name in bits:
-                if r.startswith("!"):
-                    neg |= 1 << bits.index(name)
-                else:
-                    pos |= 1 << bits.index(name)
-        return pos, neg
-
     def mask(self, bits):
-        """the bits the algorithm's restrictions involve; 0: unrestricted"""
-        pos, neg = self.requires(bits)
-        return pos | neg
+        m = 0
+        for r in self.restrictions:
+            if r in bits:
+                m |= 1 << bits.index(r)
+        return m
 
     def allowed(self, bits, s):
-        pos, neg = self.requires(bits)
-        return pos & ~s == 0 and neg & s == 0
+        return self.mask(bits) & ~s == 0
 
     def __repr__(self):
         return "Alg(%s%s)" % (self.name, ", " + ",".join(self.restrictions) if self.restrictions else "")
@@ -92,13 +84,21 @@ class Catalog:
         return out
 
     def restriction_bits(self):
-        """The restrictive (non-threshold) conditions in file order: bit k = [k]."""
-        return [c for c, thresh in self.conditions.items() if not thresh]
+        """The restrictive (non-threshold) conditions in file order, then the
+        old-style negated restrictions in order of first use: bit k = [k]."""
+        bits = [c for c, thresh in self.conditions.items() if not thresh]
+        for sec in self.sections.values():
+            for _, keys in sec:
+                for r in keys.get("restrictions", "").split(","):
+                    r = r.strip()
+                    if r.startswith("!") and r[1:] in bits and r not in bits:
+                        bits.append(r)
+        return bits
 
     def check(self, op, kind="intra"):
-        """Every restriction of the op's algorithms is a listed restrictive condition."""
+        """Every restriction of the op's algorithms is a restrictive condition."""
         bits = self.restriction_bits()
         for a in self.algorithms(op, kind):
             for r in a.restrictions:
-                if r.lstrip("!") not in bits:
+                if r not in bits:
                     raise KeyError("%s: restriction %s is not a listed non-threshold condition" % (a.name, r))
