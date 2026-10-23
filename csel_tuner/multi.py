@@ -179,6 +179,11 @@ class Builder2:
         self.sparse = set()
         self.checks = []            # (layout, kind, geomean regret, p95 regret, wall_us, regrets)
         self.history = []           # (layout, wall_us, n_meas)
+        self.on_layout = None       # f(builder) after each layout: checkpoints
+        self.stop_check = None      # f() -> reason or None, before each layout: deadline, signals
+        self.stop = "running"
+        self.billed = n_max         # nodes the allocation bills; run(nodes_billed=) sets it
+        self.node_h = 0.0
 
     def add(self, lay, full=False, prior=None):
         n, ppn = lay
@@ -198,6 +203,8 @@ class Builder2:
                 self.curves[a][lay] = s.curve(a)
         self.history.append((lay, self.wall_us, self.n_meas))
         self.update_sparse()
+        if self.on_layout:
+            self.on_layout(self)
 
     def update_sparse(self):
         """Algorithms more than dom_margin slower than the envelope at every measured point."""
@@ -262,12 +269,15 @@ class Builder2:
         return None
 
     def run(self, budget_node_h=3.0, nodes_billed=None, max_layouts=None):
-        billed = nodes_billed or self.n_max
-        spent = lambda: (self.clock() if self.clock else self.wall_us * 1e-6) * billed / 3600
+        self.billed = nodes_billed or self.n_max
         for lay in initial_layouts(self.allowed, self.n_max, self.ppn_max):
+            if self.halt():
+                return self
             self.add(lay)
         self.stop = "budget"
-        while spent() < budget_node_h and (max_layouts is None or len(self.samplers) < max_layouts):
+        while self.spent() < budget_node_h and (max_layouts is None or len(self.samplers) < max_layouts):
+            if self.halt():
+                break
             why = self.stop_reason()
             if why:
                 self.stop = why
@@ -281,5 +291,17 @@ class Builder2:
                 self.check(free[self.rng.randint(len(free))], "random")
             else:
                 self.check(cand[0][1], "risk")
-        self.node_h = spent()
+        self.node_h = self.spent()
         return self
+
+    def spent(self):
+        """Node-hours so far: elapsed time (clock) or summed request wall time, times the billed nodes."""
+        return (self.clock() if self.clock else self.wall_us * 1e-6) * self.billed / 3600
+
+    def halt(self):
+        """Ask stop_check whether to stop before the next layout; record why."""
+        why = self.stop_check() if self.stop_check else None
+        if why:
+            self.stop = why
+            self.node_h = self.spent()
+        return bool(why)

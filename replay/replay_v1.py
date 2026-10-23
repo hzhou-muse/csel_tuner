@@ -29,22 +29,24 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import SHORT, load_gt, results_path  # noqa: E402
 from csel_tuner.single import Builder, LayoutModel  # noqa: E402
-from common import FIXED, NODES, load_sessions  # noqa: E402
+from common import FIXED, NODES, load_sessions, replay_one  # noqa: E402
 
 NOISE = 0.01
 
 
 class Replay:
+    """measure(n, ppn, [m, ...]) for one algorithm, from the recorded sessions."""
     def __init__(self, sessions, alg, seed):
-        self.g, self.alg = sessions, alg
-        self.rng = np.random.default_rng(seed)
+        self.g, self.alg, self.seed = sessions, alg, seed
+        self.count = {}
 
     def __call__(self, n, ppn, ms):
         out = []
         for m in ms:
-            rows = self.g[(self.alg, n, ppn, m)]
-            t, wall = rows[self.rng.integers(len(rows))]
-            out.append((t * np.exp(self.rng.normal(0, NOISE)), wall))
+            key = (n, ppn, m)
+            k = self.count.get(key, 0)
+            self.count[key] = k + 1
+            out.append(replay_one(self.g, self.seed, self.alg, n, ppn, m, k, NOISE))
         return out
 
 

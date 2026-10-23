@@ -16,6 +16,7 @@ recorded) is used only as a reference. The allocation's node count, which
 a measurement's cost is multiplied by, is the largest N in the data.
 """
 import os
+import zlib
 
 import numpy as np
 import pandas as pd
@@ -58,6 +59,18 @@ ALGS, NODES = _header()
 FIXED = [a for a in ALGS if a != "auto"]
 for _a in ALGS:
     SHORT.setdefault(_a, _a)
+
+
+def replay_one(sessions, seed, alg, n, ppn, m, k, noise=0.01):
+    """The k-th replayed measurement of (alg, n, ppn, m): a recorded session
+    and multiplicative noise exp(N(0, noise)), drawn from a generator seeded
+    by (seed, the request, k). It does not depend on what else was measured
+    or in which order, so a run cut and resumed replays the same values as
+    an uninterrupted one. Returns (t_us, wall_us)."""
+    rng = np.random.default_rng([seed, zlib.crc32(("%s %d %d %d" % (alg, n, ppn, m)).encode()), k])
+    rows = sessions[(alg, n, ppn, m)]
+    t, wall = rows[rng.integers(len(rows))]
+    return t * np.exp(rng.normal(0, noise)), wall
 
 
 def results_path(name):

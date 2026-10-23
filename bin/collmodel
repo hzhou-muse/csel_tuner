@@ -9,7 +9,7 @@ Live, through the benchmark server, one launch of the whole allocation
 (launch/config.sh with the site file launch/sites/<site>.sh):
 
     bin/collmodel --algs binomial,scatter_ring_allgather,circ_graph --out bcast.json \\
-        --site aurora --nodes 32 --ppn 96
+        --site aurora --nodes 32 --ppn 96 --log bcast.log [--deadline 3300]
 
 or with any launcher (mpisrv and its max-m argument are appended):
 
@@ -23,16 +23,33 @@ The starting state is blank: the allocation (nodes, ranks per node) and the
 largest size come from the server's info reply. Allowed layouts are N and
 ppn in {1, 2, 3, 4, 6, 8, 12, 16, 24, ...} up to the allocation, plus the
 allocation's own N and ppn; sizes are 4 per octave from 1 B to max_m. The
-builder samples until its online check converges or the node-hour budget is
-spent, then writes the model file (format collmodel/1).
+builder samples until its estimate meets the target or the node-hour budget
+is spent, then writes the model file (collmodel/1, or collmodel/2 for v2).
+
+Interruptions:
+- --log FILE keeps a journal: one JSON line per measurement, flushed after
+  each batch, and one per job. With --resume, a new job reads it back: the
+  builder makes the same decisions from the same values (seeded), requests
+  already answered come from the journal, and measuring continues where the
+  earlier job stopped; its time counts against the budget. A kill loses at
+  most the batch in flight.
+- The model file is rewritten after a layout at most every
+  --checkpoint-every seconds, and at the end, so a killed job leaves a
+  usable partial model ("complete": false in its meta).
+- --deadline SEC: do not start a layout that might not finish SEC seconds
+  after the start (estimated from the slowest layout so far).
+- SIGTERM (a batch system's walltime warning): stop measuring and write the
+  model from the finished layouts.
 """
 import argparse
 import datetime
 import json
 import os
 import shlex
+import signal
 import sys
 import time
+from collections import deque
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -40,20 +57,98 @@ sys.path.insert(0, REPO)
 
 import numpy as np  # noqa: E402
 
-from csel_tuner.multi import Builder2  # noqa: E402
 from csel_tuner.layouts import axis_values, size_grid  # noqa: E402
+from csel_tuner.multi import Builder2  # noqa: E402
 from csel_tuner.single import Builder  # noqa: E402
 
-VERSION = "collmodel 0.1"
+VERSION = "collmodel 0.2"
 OPS = {"bcast": "MPIR_CVAR_BCAST_INTRA_ALGORITHM"}
+# settings that change which requests the builder makes: a resumed job must keep them
+SAME_ON_RESUME = ["mode", "op", "algs", "seed", "batches", "sync", "prune", "nodes", "ppn_max", "max_m"]
+
+
+class Terminated(Exception):
+    pass
+
+
+def req_key(req):
+    return json.dumps({k: v for k, v in req.items() if k != "tag"}, sort_keys=True)
+
+
+class Journal:
+    """The run's measurement log, for --resume. JSON lines:
+        {"time": t, "job": {...}}                  one per job: start, settings, allocation
+        {"time": t, "req": {...}, "rep": {...}}    one per measurement reply
+    Replies are flushed after each batch. Reading back stops at a line cut by
+    a kill, and the file is truncated there before new records are added."""
+
+    def __init__(self, path, resume):
+        self.path, self.cache, self.jobs, self.n_cached = path, {}, [], 0
+        self.replayed = 0.0     # run seconds (all jobs) at the latest reply taken from the journal
+        self.live = False       # a request missed the journal: measuring live from here on
+        if resume:
+            if not path or not os.path.exists(path):
+                sys.exit(f"--resume: no journal {path} (give the --log of the earlier job)")
+            good = 0
+            with open(path, "rb") as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        break
+                    good += len(line)
+                    if "job" in r:
+                        self.jobs.append(dict(r["job"], end=r["time"]))
+                    elif "req" in r and self.jobs:
+                        j = self.jobs[-1]
+                        j["end"] = r["time"]
+                        # run seconds when this reply came: earlier jobs whole, this one so far
+                        at = sum(x["end"] - x["start"] for x in self.jobs[:-1]) + r["time"] - j["start"]
+                        self.cache.setdefault(req_key(r["req"]), deque()).append((at, r["rep"]))
+            with open(path, "rb+") as f:
+                f.truncate(good)
+            if not self.jobs:
+                sys.exit(f"--resume: {path} has no job record")
+        self.f = open(path, "a" if resume else "w") if path else None
+
+    def take(self, req):
+        q = None if self.live else self.cache.get(req_key(req))
+        if q:
+            self.n_cached += 1
+            at, rep = q.popleft()
+            self.replayed = max(self.replayed, at)
+            return rep
+        self.live = True
+        return None
+
+    def write(self, rec):
+        if self.f:
+            self.f.write(json.dumps(dict(time=round(time.time(), 3), **rec)) + "\n")
+
+    def flush(self):
+        if self.f:
+            self.f.flush()
+
+    def earlier_seconds(self):
+        return sum(j["end"] - j["start"] for j in self.jobs)
+
+    def clock(self, t_start):
+        """Run seconds for the budget: while replaying the journal, the time at
+        which the original run had reached the same point (so a resumed run
+        stops where an uninterrupted one would); once live, every earlier job
+        plus this one so far."""
+        if not self.live:
+            return self.replayed
+        return self.earlier_seconds() + time.time() - t_start
 
 
 def live(a):
+    """(send, make_req, layouts, sizes, nodes, ppn_max, max_m, meta, server)"""
     from csel_tuner.server import Server
     env = dict(kv.split("=", 1) for kv in a.env)
     if a.switch != "request" and len(a.algs) == 1:
         env[OPS[a.op]] = a.algs[0]  # the launch's algorithm
-    srv = Server(launcher=shlex.split(a.launcher), env=env, max_m=a.max_m, timeout=a.timeout, log=a.log,
+    srv = Server(launcher=shlex.split(a.launcher), env=env, max_m=a.max_m, timeout=a.timeout,
                  warmup=(a.op,), server=a.server)
     info = srv.world
     by_request = a.switch == "request" or len(a.algs) > 1 or (a.switch == "auto" and info.get("cvar_switch") == 1)
@@ -65,25 +160,25 @@ def live(a):
     nodes, ppn_max = info["nodes"], info["min_ppn"]
     layouts = [(n, p) for n in axis_values(nodes) for p in axis_values(ppn_max) if n * p > 1]
     sizes = size_grid(info["max_m"])
-
     rewarm_m = min(1 << 20, info["max_m"])
 
-    def measure(n, ppn, alg, ms):
-        # After a driver pause the network path is slow for a while (set
-        # mid-size messages after a pause of a few hundred ms): re-warm first.
+    def make_req(n, ppn, alg, m):
+        return dict(op=a.op, m=m, p=n * ppn, ppn=ppn, batches=a.batches, sync=a.sync, **sel(alg))
+
+    def send(reqs, occurrences):
+        # After a driver pause, mid-size messages measure slow for a while
+        # (a pause of a few hundred ms is enough): re-warm first.
         if time.time() - srv.last > a.rewarm_gap:
-            srv.measure(op=a.op, m=rewarm_m, p=n * ppn, ppn=ppn, batches=1, target_us=20000, tag="rewarm",
-                        **sel(alg))
-        reps = srv.measure_many([dict(op=a.op, m=m, p=n * ppn, ppn=ppn, batches=a.batches, sync=a.sync,
-                                      **sel(alg)) for m in ms])
-        return [(float(np.median(r["t_us"])), r["wall_us"]) for r in reps]
+            srv.measure(**dict(reqs[0], m=rewarm_m, batches=1, target_us=20000, tag="rewarm"))
+        return [{"status": "ok", "t_us": rep["t_us"], "wall_us": rep["wall_us"]} for rep in srv.measure_many(reqs)]
     meta = {"launch": {"cmd": srv.cmd, "env": env}, "algorithm_by": "request" if by_request else "launch",
             "library": info.get("library"), "hosts": info.get("hosts"),
             "topology_warnings": info.get("topology_warnings")}
-    return srv, measure, layouts, sizes, nodes, ppn_max, meta
+    return send, make_req, layouts, sizes, nodes, ppn_max, info["max_m"], meta, srv
 
 
 def replay(a):
+    """The same as live(), answered from the recorded data in replay/data."""
     sys.path.insert(0, os.path.join(REPO, "replay"))
     from common import NODES, NoData, load_gt, load_sessions
     from replay_v2 import Replay2
@@ -94,34 +189,148 @@ def replay(a):
     layouts = sorted({(n, p) for n, p in zip(gt.N, gt.ppn)})
     sizes = sorted(int(m) for m in gt.m.unique())
     rep = Replay2(load_sessions(), a.seed)
+
+    def make_req(n, ppn, alg, m):
+        return dict(op=a.op, alg=alg, m=m, p=n * ppn, ppn=ppn)
+
+    def send(reqs, occurrences):
+        out = []
+        for r, k in zip(reqs, occurrences):
+            t, wall = rep.one(r["alg"], r["p"] // r["ppn"], r["ppn"], r["m"], k)
+            out.append({"status": "ok", "t_us": [float(t)], "wall_us": float(wall)})
+        return out
     meta = {"replay": {"data": "replay/data", "seed": a.seed}}
-    return None, rep, layouts, sizes, NODES, max(p for _, p in layouts), meta
+    return send, make_req, layouts, sizes, NODES, max(p for _, p in layouts), max(sizes), meta, None
 
 
-def main(argv=None):
+def make_measure(journal, send, make_req):
+    """measure(n, ppn, alg, [m, ...]) -> [(t_us, wall_us), ...]: answers from
+    the journal where it has them, the rest measured as one batch and
+    journaled. send() also gets each request's occurrence count (how often it
+    was asked before), for an order-independent replay."""
+    counts = {}
+
+    def measure(n, ppn, alg, ms):
+        reqs = [make_req(n, ppn, alg, m) for m in ms]
+        out, todo = [None] * len(reqs), []
+        for i, r in enumerate(reqs):
+            k = req_key(r)
+            occ = counts.get(k, 0)
+            counts[k] = occ + 1
+            rep = journal.take(r)
+            if rep is None:
+                todo.append((i, occ))
+            else:
+                out[i] = rep
+        if todo:
+            reps = send([reqs[i] for i, _ in todo], [o for _, o in todo])
+            for (i, _), rep in zip(todo, reps):
+                out[i] = rep
+                journal.write({"req": reqs[i], "rep": rep})
+            journal.flush()
+        return [(float(np.median(r["t_us"])), float(r["wall_us"])) for r in out]
+    return measure
+
+
+def rnd(x, nd=4):
+    """round, with NaN (no value) as JSON null"""
+    return None if x != x else round(x, nd)
+
+
+def model_v2(algs, b, sizes):
+    """collmodel/2: one collmodel/1 model per algorithm, plus the selection
+    (the predicted fastest algorithm) at every measured layout and size, and
+    the crossovers located there."""
+    m = b.model()
+    models = {alg: m.models[alg].to_json(sizes)["model"] for alg in algs}
+    sel = []
+    for lay in sorted(b.samplers):
+        w, t = m.select(*lay)
+        sel.append({"N": lay[0], "ppn": lay[1], "alg": [algs[k] for k in w],
+                    "t_us": [round(float(2 ** v), 4) for v in t]})
+    return {"format": "collmodel/2", "inputs": ["N", "ppn", "m"], "output": "t_us", "algs": algs,
+            "sizes": [int(x) for x in sizes], "models": models, "selection": sel,
+            "crossovers": [{"N": l[0], "ppn": l[1], "lo": lo, "hi": hi, "from": x, "to": y}
+                           for l, s in sorted(b.samplers.items()) for lo, hi, x, y in s.crossovers]}
+
+
+def model_file(a, b, sizes, nodes, ppn_max, meta, jobs, complete, cost):
+    if len(a.algs) > 1:
+        d = model_v2(a.algs, b, sizes)
+    else:
+        d = b.model().to_json(sizes)
+        d["alg"] = a.algs[0]
+        d["jumps"] = [{"N": n, "ppn": p, "lo": lo, "hi": hi, "ratio": round(float(r), 3)}
+                      for (n, p), g in sorted(b.samplers.items()) for lo, hi, r in g.jumps]
+    d["what"] = f"{a.op}-latency"
+    d["domain"] = {"N": [1, nodes], "ppn": [1, ppn_max], "m": [int(sizes[0]), int(sizes[-1])]}
+    d["meta"] = {"created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                 "tool": VERSION, **meta, "complete": complete, "n_measurements": b.n_meas,
+                 "n_layouts": len(b.samplers), "node_h": round(cost(), 4), "nodes_billed": nodes,
+                 "stop": b.stop, "jobs": jobs}
+    if len(a.algs) > 1:
+        d["meta"].update({"tau_gm": a.tau_gm, "tau_p95": a.tau_p95, "prune": a.prune,
+                          "measurements_per_alg": b.n_meas_alg,
+                          "estimate": dict(zip(["regret_geomean", "regret_p95"], b.estimate() or [None, None])),
+                          "checks": [{"N": l[0], "ppn": l[1], "kind": k, "regret_geomean": rnd(gm),
+                                      "regret_p95": rnd(p9)} for l, k, gm, p9, _, _ in b.checks]})
+    else:
+        d["meta"].update({"tau_med": a.tau_med, "tau_p90": a.tau_p90,
+                          "estimate": dict(zip(["med", "p90"], b.estimate() or [None, None])),
+                          "checks": [{"N": l[0], "ppn": l[1], "kind": k, "med": rnd(md), "p90": rnd(p9)}
+                                     for l, k, md, p9, _, _ in b.checks]})
+    return d
+
+
+def drop_unfinished(b):
+    """After SIGTERM: keep only layouts whose recording finished (the history
+    entry is written last), in case the signal landed in the middle of one."""
+    done = {h[0] for h in b.history}
+    b.samplers = {l: s for l, s in b.samplers.items() if l in done}
+    if isinstance(b.curves, dict) and b.curves and isinstance(next(iter(b.curves.values())), dict):
+        b.curves = {alg: {l: c for l, c in cs.items() if l in done} for alg, cs in b.curves.items()}
+    else:
+        b.curves = {l: c for l, c in b.curves.items() if l in done}
+
+
+def write_atomic(path, d):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=1)
+    os.replace(tmp, path)
+
+
+def parse_args(argv):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--op", default="bcast", choices=sorted(OPS))
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--alg", help="one algorithm (builder v1): a value of the op's algorithm CVAR")
     g.add_argument("--algs", help="several algorithms, comma-separated (builder v2: selection)")
     ap.add_argument("--out", required=True, help="model file to write (JSON)")
-    ap.add_argument("--budget-node-h", type=float, default=2.0)
-    ap.add_argument("--tau-med", type=float, default=0.05, help="stop when the estimated median error is below this")
-    ap.add_argument("--tau-p90", type=float, default=0.20, help="... and the estimated p90 error is below this")
+    ap.add_argument("--budget-node-h", type=float, default=2.0, help="stop after this many node-hours, all jobs")
+    ap.add_argument("--tau-med", type=float, default=0.05, help="v1: stop when the estimated median error is below this")
+    ap.add_argument("--tau-p90", type=float, default=0.20, help="v1: ... and the estimated p90 error is below this")
     ap.add_argument("--tau-gm", type=float, default=1.02, help="v2: stop when the estimated geomean regret is below this")
     ap.add_argument("--tau-p95", type=float, default=1.10, help="v2: ... and the estimated p95 regret is below this")
     ap.add_argument("--prune", type=float, default=2.0, help="v2: skip sizes predicted this much slower than the "
                     "best (0: off)")
+    ap.add_argument("--seed", type=int, default=0, help="random checks (and replay noise)")
+    g = ap.add_argument_group("interruptions")
+    g.add_argument("--log", help="journal of every measurement (needed for --resume)")
+    g.add_argument("--resume", action="store_true", help="continue the run journaled in --log")
+    g.add_argument("--deadline", type=float, help="seconds after the start by which the job must be done")
+    g.add_argument("--checkpoint-every", type=float, default=60,
+                   help="rewrite the model file after a layout at most this often (seconds; 0 = only at the end)")
     g = ap.add_argument_group("live")
     g.add_argument("--launcher", help="command prefix that starts the server; mpisrv and max-m are appended")
-    g.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
-    g.add_argument("--switch", default="auto", choices=["auto", "request", "launch"],
-                   help="select the algorithm per request (cvar.*, needs the runtime CVAR switch) or for the "
-                        "launch (environment); auto: per request when the server supports it")
     g.add_argument("--site", help="launch through launch/config.sh with launch/sites/SITE.sh "
                    "(needs --nodes and --ppn)")
     g.add_argument("--nodes", type=int, help="with --site: nodes of the launch")
     g.add_argument("--ppn", type=int, help="with --site: ranks per node of the launch")
+    g.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
+    g.add_argument("--switch", default="auto", choices=["auto", "request", "launch"],
+                   help="select the algorithm per request (cvar.*, needs the runtime CVAR switch) or for the "
+                        "launch (environment); auto: per request when the server supports it")
     g.add_argument("--server", default=os.path.join(REPO, "server", "mpisrv"), help="mpisrv binary")
     g.add_argument("--max-m", type=int, default=1 << 26)
     g.add_argument("--batches", type=int, default=5)
@@ -129,10 +338,8 @@ def main(argv=None):
     g.add_argument("--timeout", type=float, default=300)
     g.add_argument("--rewarm-gap", type=float, default=0.05,
                    help="seconds of driver idle time after which a batch starts with a re-warm request")
-    g.add_argument("--log", help="append server requests/replies to this JSONL file")
     g = ap.add_argument_group("replay")
     g.add_argument("--replay", action="store_true", help="replay recorded data in replay/data (see replay/README.md)")
-    g.add_argument("--seed", type=int, default=0)
     a = ap.parse_args(argv)
     a.algs = a.algs.split(",") if a.algs else [a.alg]
     if a.site:
@@ -143,75 +350,98 @@ def main(argv=None):
         a.launcher = "bash -c 'source %s && launch %d %d \"$0\" \"$@\"'" % (cfg, a.nodes, a.ppn)
     if not a.replay and not a.launcher:
         ap.error("--site/--nodes/--ppn or --launcher is required unless --replay")
+    if a.resume and not a.log:
+        ap.error("--resume needs --log (the earlier job's journal)")
+    return a
+
+
+def on_sigterm(signum, frame):
+    # a batch system may signal every process of the job, and some send it
+    # more than once: only the first one counts, so the model can be written
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise Terminated()
+
+
+def main(argv=None):
+    a = parse_args(argv)
     t_start = time.time()
-    srv, measure, layouts, sizes, nodes, ppn_max, meta = (replay if a.replay else live)(a)
-    v2 = len(a.algs) > 1
+    signal.signal(signal.SIGTERM, on_sigterm)
+    journal = Journal(a.log, a.resume)
+    srv = b = None
     try:
-        # live: bill real elapsed time (launch, driver, fitting); replay: the recorded wall time
-        clock = None if a.replay else (lambda: time.time() - t_start)
-        if v2:
-            b = Builder2(measure, a.algs, layouts, sizes, n_max=nodes, ppn_max=ppn_max, tau_gm=a.tau_gm,
-                         tau_p95=a.tau_p95, prune=a.prune or None, clock=clock)
+        send, make_req, layouts, sizes, nodes, ppn_max, max_m, meta, srv = (replay if a.replay else live)(a)
+        job = {"start": round(t_start, 3), "mode": "replay" if a.replay else "live", "op": a.op, "algs": a.algs,
+               "seed": a.seed, "batches": a.batches, "sync": a.sync, "prune": a.prune, "nodes": nodes,
+               "ppn_max": ppn_max, "max_m": max_m, "hosts": meta.get("hosts"), "tool": VERSION}
+        if journal.jobs:
+            first = journal.jobs[0]
+            diff = [k for k in SAME_ON_RESUME if first.get(k) != job.get(k)]
+            if diff:
+                sys.exit("--resume: the journal's run differs in " + ", ".join(
+                    f"{k} ({first.get(k)} -> {job.get(k)})" for k in diff))
+            if first.get("hosts") != job.get("hosts"):
+                print("note: this job runs on other nodes than the first one", file=sys.stderr)
+        journal.write({"job": job})
+        journal.flush()
+        jobs = [{k: j.get(k) for k in ("start", "end", "hosts")} for j in journal.jobs] + \
+               [{"start": job["start"], "end": None, "hosts": job["hosts"]}]
+        # live: bill the real elapsed time of all jobs (launch, driver, fitting); replay: the recorded wall time
+        clock = None if a.replay else (lambda: journal.clock(t_start))
+        # what the run has cost so far, for the model file (the budget clock above may lag while replaying)
+        cost = (lambda: b.spent()) if a.replay else \
+            (lambda: (journal.earlier_seconds() + time.time() - t_start) * nodes / 3600)
+        kw = dict(n_max=nodes, ppn_max=ppn_max, seed=a.seed, clock=clock)
+        measure = make_measure(journal, send, make_req)
+        if len(a.algs) > 1:
+            b = Builder2(measure, a.algs, layouts, sizes, tau_gm=a.tau_gm, tau_p95=a.tau_p95,
+                         prune=a.prune or None, **kw)
         else:
-            b = Builder(lambda n, ppn, ms: measure(n, ppn, a.algs[0], ms), layouts, sizes, n_max=nodes,
-                        ppn_max=ppn_max, tau_med=a.tau_med, tau_p90=a.tau_p90, clock=clock)
-        b.run(budget_node_h=a.budget_node_h, nodes_billed=nodes)
+            b = Builder(lambda n, ppn, ms: measure(n, ppn, a.algs[0], ms), layouts, sizes, tau_med=a.tau_med,
+                        tau_p90=a.tau_p90, **kw)
+        state = {"ckpt": time.time(), "layout": time.time(), "slowest": 0.0}
+
+        def on_layout(bb):
+            now = time.time()
+            state["slowest"] = max(state["slowest"], now - state["layout"])
+            state["layout"] = now
+            if a.checkpoint_every and now - state["ckpt"] >= a.checkpoint_every:
+                try:
+                    write_atomic(a.out, model_file(a, bb, sizes, nodes, ppn_max, meta, jobs, False, cost))
+                    state["ckpt"] = now
+                except Terminated:
+                    raise
+                except Exception as e:   # e.g. too few layouts for a model yet
+                    print(f"checkpoint skipped: {e}", file=sys.stderr)
+
+        def stop_check():
+            if a.deadline and t_start + a.deadline - time.time() < 1.5 * state["slowest"] + 10:
+                return "deadline"
+            return None
+        b.on_layout, b.stop_check = on_layout, stop_check
+        try:
+            b.run(budget_node_h=a.budget_node_h, nodes_billed=nodes)
+        except Terminated:
+            b.stop = "terminated"
+            drop_unfinished(b)
+            print("SIGTERM: writing the model from the finished layouts", file=sys.stderr)
+    except Terminated:
+        sys.exit("terminated before the builder started; the journal keeps what was measured")
     finally:
         if srv:
-            srv.close()
-    created = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    domain = {"N": [1, nodes], "ppn": [1, ppn_max], "m": [int(sizes[0]), int(sizes[-1])]}
-    if v2:
-        d = model_v2(a, b, sizes)
-    else:
-        d = b.model().to_json(sizes)
-        d["alg"] = a.algs[0]
-        d["jumps"] = [{"N": n, "ppn": p, "lo": lo, "hi": hi, "ratio": round(float(r), 3)}
-                      for (n, p), g in sorted(b.samplers.items()) for lo, hi, r in g.jumps]
-    d["what"] = f"{a.op}-latency"
-    d["domain"] = domain
-    d["meta"] = {"created": created, "tool": VERSION, **meta, "n_measurements": b.n_meas,
-                 "n_layouts": len(b.samplers), "node_h": round(b.node_h, 4), "nodes_billed": nodes,
-                 "stop": b.stop}
-    if v2:
-        d["meta"].update({"tau_gm": a.tau_gm, "tau_p95": a.tau_p95, "prune": a.prune,
-                          "measurements_per_alg": b.n_meas_alg,
-                          "estimate": dict(zip(["regret_geomean", "regret_p95"], b.estimate() or [None, None])),
-                          "checks": [{"N": l[0], "ppn": l[1], "kind": k, "regret_geomean": rnd(gm),
-                                      "regret_p95": rnd(p9)} for l, k, gm, p9, _, _ in b.checks]})
-    else:
-        d["meta"].update({"tau_med": a.tau_med, "tau_p90": a.tau_p90,
-                          "estimate": dict(zip(["med", "p90"], b.estimate() or [None, None])),
-                          "checks": [{"N": l[0], "ppn": l[1], "kind": k, "med": round(md, 4), "p90": round(p9, 4)}
-                                     for l, k, md, p9, _, _ in b.checks]})
-    with open(a.out, "w") as f:
-        json.dump(d, f, indent=1)
-    print(f"{a.out}: {len(b.samplers)} layouts, {b.n_meas} measurements, {b.node_h:.3f} node-h, stop: {b.stop}")
-
-
-def rnd(x, nd=4):
-    """round, with NaN (no value) as JSON null"""
-    return None if x != x else round(x, nd)
-
-
-def model_v2(a, b, sizes):
-    """collmodel/2: one collmodel/1 model per algorithm, plus the selection
-    (the predicted fastest algorithm) at every measured layout and size, and
-    the crossovers located there."""
-    m = b.model()
-    models = {}
-    for alg in a.algs:
-        j = m.models[alg].to_json(sizes)
-        models[alg] = j["model"]
-    sel = []
-    for lay in sorted(b.samplers):
-        w, t = m.select(*lay)
-        sel.append({"N": lay[0], "ppn": lay[1], "alg": [a.algs[k] for k in w],
-                    "t_us": [round(float(2 ** v), 4) for v in t]})
-    return {"format": "collmodel/2", "inputs": ["N", "ppn", "m"], "output": "t_us", "algs": a.algs,
-            "sizes": [int(x) for x in sizes], "models": models, "selection": sel,
-            "crossovers": [{"N": l[0], "ppn": l[1], "lo": lo, "hi": hi, "from": x, "to": y}
-                           for l, s in sorted(b.samplers.items()) for lo, hi, x, y in s.crossovers]}
+            if b is not None and b.stop != "terminated":
+                srv.close()
+            else:
+                srv.kill()
+    jobs[-1]["end"] = round(time.time(), 3)
+    complete = b.stop not in ("terminated", "deadline")
+    if not b.samplers:
+        sys.exit(f"stop: {b.stop} before the first layout was measured; no model written")
+    try:
+        write_atomic(a.out, model_file(a, b, sizes, nodes, ppn_max, meta, jobs, complete, cost))
+    except Exception as e:
+        sys.exit(f"no model written ({type(e).__name__}: {e}); the journal {a.log} keeps the measurements for --resume")
+    print(f"{a.out}: {len(b.samplers)} layouts, {b.n_meas} measurements ({journal.n_cached} from the journal), "
+          f"{cost():.3f} node-h, stop: {b.stop}")
 
 
 if __name__ == "__main__":

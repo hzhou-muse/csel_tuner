@@ -158,6 +158,17 @@ together; with stdio buffering a batch of requests hung the server.
   large ones were not.
 - **Cost.** Node-hours = elapsed time x nodes of the allocation, including
   launch, driver overhead and fitting (on replay: the recorded wall time).
+- **Journal and resume.** Every reply is journaled (flushed per batch). The
+  builders are deterministic given the measured values and their seed, so a
+  new job replays the journal as a cache keyed by request (repeats in
+  order) and continues live at the first miss; a line cut by a kill is
+  dropped. Replay measurements are drawn from (seed, request, occurrence),
+  not from call order, so a cut-and-resumed replay equals an uninterrupted
+  one exactly (`tests/test_resume.py`).
+- **Stopping safely.** The model file is checkpointed after layouts; a
+  deadline stops before a layout that might not fit; SIGTERM stops
+  measuring and writes the model from the layouts whose recording finished
+  (later SIGTERMs are ignored so the write completes).
 - **Environment.** numpy only (`csel_tuner/interp.py` replaces scipy's PCHIP
   and Delaunay interpolation; checked against scipy) and Python ≥ 3.6, the
   system Python on some clusters' compute nodes.

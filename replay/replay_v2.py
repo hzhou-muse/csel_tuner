@@ -34,23 +34,29 @@ from common import SHORT, load_gt, results_path  # noqa: E402
 from csel_tuner.single import Builder, LayoutModel  # noqa: E402
 from csel_tuner.multi import Builder2, OptimumModel  # noqa: E402
 from common import FIXED, profiles, score, table  # noqa: E402
-from common import NODES, load_sessions  # noqa: E402
+from common import NODES, load_sessions, replay_one  # noqa: E402
 
 NOISE = 0.01
 
 
 class Replay2:
+    """measure(n, ppn, alg, [m, ...]) from the recorded sessions."""
     def __init__(self, sessions, seed):
-        self.g = sessions
-        self.rng = np.random.default_rng(seed)
+        self.g, self.seed = sessions, seed
+        self.count = {}
 
     def __call__(self, n, ppn, alg, ms):
         out = []
         for m in ms:
-            rows = self.g[(alg, n, ppn, m)]
-            t, wall = rows[self.rng.integers(len(rows))]
-            out.append((t * np.exp(self.rng.normal(0, NOISE)), wall))
+            key = (alg, n, ppn, m)
+            k = self.count.get(key, 0)
+            self.count[key] = k + 1
+            out.append(self.one(alg, n, ppn, m, k))
         return out
+
+    def one(self, alg, n, ppn, m, k):
+        """The k-th measurement of (alg, n, ppn, m), whatever came before."""
+        return replay_one(self.g, self.seed, alg, n, ppn, m, k, NOISE)
 
 
 def selection(predict, layouts, sizes):

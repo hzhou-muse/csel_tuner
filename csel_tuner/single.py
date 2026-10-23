@@ -399,6 +399,11 @@ class Builder:
         self.n_meas = 0
         self.checks = []        # (layout, kind 'risk'/'random', median err, p90 err, wall_us, errors)
         self.history = []       # (layout, cumulative wall_us, n_meas): model snapshots
+        self.on_layout = None       # f(builder) after each layout: checkpoints
+        self.stop_check = None      # f() -> reason or None, before each layout: deadline, signals
+        self.stop = "running"
+        self.billed = n_max         # nodes the allocation bills; run(nodes_billed=) sets it
+        self.node_h = 0.0
 
     def add(self, lay, prior=None):
         n, ppn = lay
@@ -413,6 +418,8 @@ class Builder:
         self.samplers[lay] = g
         self.curves[lay] = g.curve()
         self.history.append((lay, self.wall_us, self.n_meas))
+        if self.on_layout:
+            self.on_layout(self)
 
     def model(self, penalty=None):
         return LayoutModel(self.curves, self.penalty if penalty is None else penalty)
@@ -454,12 +461,15 @@ class Builder:
         then one layout drawn uniformly from the unmeasured allowed ones (the
         random checks are the error estimate). Stop at the target, at a
         plateau, at the budget, or when nothing is left."""
-        billed = nodes_billed or self.n_max
-        spent = lambda: (self.clock() if self.clock else self.wall_us * 1e-6) * billed / 3600
+        self.billed = nodes_billed or self.n_max
         for lay in initial_layouts(self.allowed, self.n_max, self.ppn_max):
+            if self.halt():
+                return self
             self.add(lay)
         self.stop = "budget"
-        while spent() < budget_node_h and (max_layouts is None or len(self.curves) < max_layouts):
+        while self.spent() < budget_node_h and (max_layouts is None or len(self.curves) < max_layouts):
+            if self.halt():
+                break
             why = self.stop_reason()
             if why:
                 self.stop = why
@@ -474,5 +484,17 @@ class Builder:
                 self.check(free[self.rng.randint(len(free))], "random")
             else:
                 self.check(cand[0][1], "risk")
-        self.node_h = spent()
+        self.node_h = self.spent()
         return self
+
+    def spent(self):
+        """Node-hours so far: elapsed time (clock) or summed request wall time, times the billed nodes."""
+        return (self.clock() if self.clock else self.wall_us * 1e-6) * self.billed / 3600
+
+    def halt(self):
+        """Ask stop_check whether to stop before the next layout; record why."""
+        why = self.stop_check() if self.stop_check else None
+        if why:
+            self.stop = why
+            self.node_h = self.spent()
+        return bool(why)

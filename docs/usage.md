@@ -97,9 +97,11 @@ bin/collmodel --op bcast \
   (node-hours = elapsed time x nodes) is spent.
 - Needs the per-request algorithm switch; the server must report
   `cvar_switch=1` (`MPISRV_CVAR_SWITCH=1` in the site file).
-- `--log` keeps every request and reply (JSONL).
+- `--log` keeps a journal of every measurement, which lets a later job
+  continue the run (§6.4). Always give one on a cluster.
 
-A PBS job on Aurora, for example:
+A PBS job on Aurora that stops cleanly before its walltime and continues a
+run an earlier job did not finish:
 
 ```sh
 #!/bin/bash
@@ -109,12 +111,14 @@ A PBS job on Aurora, for example:
 #PBS -q debug-scaling
 #PBS -A <project>
 cd "$PBS_O_WORKDIR"
+resume=""; [ -s bcast.log ] && resume=--resume
 bin/collmodel --algs binomial,scatter_recursive_doubling_allgather,scatter_ring_allgather,circ_graph,tree,pipelined_tree \
-    --site aurora --nodes 8 --ppn 96 --budget-node-h 4 --out bcast.json --log bcast.jsonl
+    --site aurora --nodes 8 --ppn 96 --budget-node-h 6 \
+    --log bcast.log $resume --deadline 3300 --out bcast.json
 ```
 
-Leave a margin between `--budget-node-h` and the walltime; the budget is
-checked between layouts.
+The budget counts every job of the run; the deadline is this job's
+(walltime minus a margin for writing the model).
 
 ### 6.2 One algorithm (v1)
 
@@ -130,6 +134,10 @@ of that algorithm (design.md §8).
 
 ### 6.3 Options
 
+Also `--log`, `--resume`, `--deadline`, `--checkpoint-every` (§6.4) and
+`--seed` (random checks; a resumed run must keep it).
+
+
 | Option | Default | Meaning |
 |---|---|---|
 | `--op` | `bcast` | the collective |
@@ -141,6 +149,33 @@ of that algorithm (design.md §8).
 | `--timeout` | 300 | seconds to wait for a reply before killing the job |
 | `--rewarm-gap` | 0.05 | seconds of driver idle time after which a batch starts with a warm-up request |
 | `--env KEY=VALUE` | | extra environment for the launch |
+
+### 6.4 Long runs, deadlines and interruptions
+
+A run can span several jobs and survive a kill:
+
+- **Journal (`--log FILE`).** Every measurement reply is appended and
+  flushed after each batch, plus one record per job (start, allocation,
+  settings). A kill loses at most the batch in flight.
+- **Resume (`--resume`, same `--log`).** The builder makes the same
+  decisions from the same values, so requests the journal already answers
+  are taken from it and measuring continues where the earlier job stopped.
+  Earlier jobs' time counts against `--budget-node-h`. A resume is refused
+  if the algorithms, seed, batches, sync, pruning or the allocation's shape
+  (nodes, ranks per node, largest size) differ; other nodes of the same
+  shape are allowed and noted.
+- **Checkpoints.** The model file is rewritten after a layout at most every
+  `--checkpoint-every` seconds (60) and at the end; a partial file has
+  `"complete": false` and the stop reason in its `meta`.
+- **Deadline (`--deadline SEC`).** A layout is not started if it might not
+  finish SEC seconds after the job's start (judged by the slowest layout so
+  far); the model is written and the job ends.
+- **SIGTERM** (what a batch system sends at the walltime): measuring stops,
+  the model is written from the finished layouts, and the server is killed.
+
+To chain jobs under PBS, submit the job above again with a dependency, e.g.
+`qsub -W depend=afterany:<jobid> job.pbs`; a job that finds the run already
+finished replays the whole journal and writes the same model.
 
 ## 7. Make and load the tuning file (`bin/colltree`)
 
@@ -220,6 +255,7 @@ mode (`MODE[:IDLE_NS[:SPINUP_US]]`).
 python3 tests/test_interp.py     # numpy only
 python3 tests/test_tree.py       # numpy only
 python3 tests/test_replay.py     # replay end to end; needs pandas and replay data, else skipped
+python3 tests/test_resume.py     # a cut journal resumes to the same model; same needs
 ```
 
 They also run under pytest.
