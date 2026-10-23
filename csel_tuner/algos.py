@@ -6,9 +6,10 @@
     algs[0].mask(bits), algs[0].leaf      # e.g. 0, "MPIR_Bcast_intra_binomial"
 
 An algorithm's restrictions are conditions that must hold for it to run.
-The restrictive conditions are the non-threshold entries of the file's
-`conditions:` list, numbered in that order (one numbering for every
-collective; appending a condition keeps the others' numbers). An
+The restrictive conditions are the file's `restrictions:` section, each
+listed with its index ("11 - MPIDI_CH4_release_gather: ..."), one numbering
+for every collective; files before that section have them as the
+non-threshold entries of `conditions:`, numbered in file order. An
 algorithm's mask is the OR of its restrictions' bits (0: unrestricted), and
 it runs in a restriction set S (the mask of the conditions that are true)
 when its mask is a subset of S, so whatever runs in S also runs in any
@@ -45,13 +46,14 @@ class Alg:
 
 
 class Catalog:
-    def __init__(self, sections, conditions):
+    def __init__(self, sections, conditions, indexed=None):
         self.sections = sections        # "bcast-intra" -> [(name, {key: value})]
         self.conditions = conditions    # name -> takes a threshold
+        self.indexed = indexed          # {index: restriction} from a restrictions: section
 
     @classmethod
     def load(cls, path):
-        sections, conditions, cur, alg = {}, {}, None, None
+        sections, conditions, indexed, cur, alg = {}, {}, {}, None, None
         for raw in open(path):
             line = raw.rstrip("\n")
             s = line.strip()
@@ -62,6 +64,12 @@ class Catalog:
                 cur = s.rstrip(":")
                 sections.setdefault(cur, [])
                 alg = None
+            elif cur == "restrictions":
+                m = re.match(r"(\d+)\s+-\s+(\w+):", s)
+                if not m:
+                    raise ValueError("%s: restriction entry is not 'index - name: func': %s" % (path, s))
+                indexed[int(m.group(1))] = m.group(2)
+                conditions[m.group(2)] = False
             elif cur == "conditions":
                 name = s.split(":", 1)[0].strip()
                 m = re.match(r"(\w+)\((\w+)\)$", name)
@@ -72,7 +80,10 @@ class Catalog:
             elif alg is not None and ":" in s:
                 k, v = s.split(":", 1)
                 alg[1][k.strip()] = v.strip()
-        return cls(sections, conditions)
+        sections.pop("restrictions", None)
+        if indexed and sorted(indexed) != list(range(len(indexed))):
+            raise ValueError("%s: restriction indices are not 0..%d" % (path, len(indexed) - 1))
+        return cls(sections, conditions, indexed or None)
 
     def algorithms(self, op, kind="intra", nb=True):
         """The op's algorithms in file order; nb (MPIR_Coll_nb: the blocking call
@@ -88,7 +99,10 @@ class Catalog:
     def restriction_bits(self):
         """The restrictive (non-threshold) conditions in file order, then the
         old-style negated restrictions in order of first use: bit k = [k]."""
-        bits = [c for c, thresh in self.conditions.items() if not thresh]
+        if self.indexed:
+            bits = [self.indexed[k] for k in range(len(self.indexed))]
+        else:
+            bits = [c for c, thresh in self.conditions.items() if not thresh]
         for sec in self.sections.values():
             for _, keys in sec:
                 for r in keys.get("restrictions", "").split(","):

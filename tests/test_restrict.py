@@ -19,13 +19,16 @@ CATALOG = """/*
  * header comment
  */
 # ----
+restrictions:
+    0  - inplace:                  MPIR_Csel_sendbuf_inplace
+    1  - not_inplace:              MPIR_Csel_sendbuf_not_inplace
+    2  - pof2:                     MPIR_Csel_comm_size_is_pof2
+    3  - hierarchical:             MPIR_Csel_is_hierarchical
+    # conditional conditions
+    4  - MPIDI_CH4_release_gather: MPIDI_POSIX_check_release_gather #if defined(MPIDI_CH4_SHM_POSIX)
+
 conditions:
-    inplace:          MPIR_Csel_sendbuf_inplace
-    not_inplace:      MPIR_Csel_sendbuf_not_inplace
-    pof2:             MPIR_Csel_comm_size_is_pof2
-    hierarchical:     MPIR_Csel_is_hierarchical
     comm_size(thresh):      MPIR_Csel_comm_size
-    MPIDI_CH4_release_gather: MPIDI_POSIX_check_release_gather #if defined(MPIDI_CH4_SHM_POSIX)
 
 # ----
 bcast-intra:
@@ -73,11 +76,28 @@ def test_catalog():
     assert algs[2].extra_params == ["tree_type", "k", "is_non_blocking"]
     assert algs[1].inner == [("bcast-intra", "node_comm"), ("bcast-intra", "node_roots_comm")]
     assert cat.conditions["comm_size"] and not cat.conditions["inplace"]
+    # an index that is not the next one is an error
+    try:
+        catalog(CATALOG.replace("    3  - hierarchical", "    5  - hierarchical"))
+        assert False, "accepted a wrong index"
+    except ValueError:
+        pass
+
+
+OLD_CONDITIONS = """conditions:
+    inplace:          MPIR_Csel_sendbuf_inplace
+    pof2:             MPIR_Csel_comm_size_is_pof2
+    hierarchical:     MPIR_Csel_is_hierarchical
+    comm_size(thresh):      MPIR_Csel_comm_size
+    MPIDI_CH4_release_gather: MPIDI_POSIX_check_release_gather #if defined(MPIDI_CH4_SHM_POSIX)
+"""
 
 
 def test_old_style_negated_restriction():
-    """A file from before positive-only restrictions: !inplace is a condition of its own."""
-    cat = catalog(CATALOG.replace("    not_inplace:      MPIR_Csel_sendbuf_not_inplace\n", "")
+    """A file from before the restrictions section and positive-only restrictions: the
+    non-threshold conditions in file order, and !inplace a condition of its own."""
+    a, b = CATALOG.index("restrictions:\n    0"), CATALOG.index("# ----\nbcast-intra")
+    cat = catalog((CATALOG[:a] + OLD_CONDITIONS + "\n" + CATALOG[b:])
                   .replace("restrictions: not_inplace", "restrictions: !inplace"))
     bits = cat.restriction_bits()
     assert bits == ["inplace", "pof2", "hierarchical", "MPIDI_CH4_release_gather", "!inplace"]
