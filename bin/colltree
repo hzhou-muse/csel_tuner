@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Turn a v2 model file (collmodel/2, from tools/collmodel.py --algs) into an
+MPICH collective-selection JSON (builder v3, csel_tuner/tree.py).
+
+    bin/colltree bcast.json --out bcast_tuning.json [--tol 0.005] [--node-aware]
+
+Then run with MPIR_CVAR_COLL_SELECTION_JSON_FILE=bcast_tuning.json (and the
+collective's algorithm CVAR left at auto): the file defines the subtree
+"name=<op>-intra-auto", which replaces MPICH's built-in one.
+
+The tree is fitted on the model's predictions at every allowed layout (the
+model's N and ppn axes, as tools/collmodel.py enumerates them) and every
+size of its grid, and pruned to the smallest tree whose predicted geomean
+regret is within --tol of the full tree's. Without --node-aware it uses
+comm_size, avg_msg_size and pof2 (MPICH main today); --node-aware adds
+num_nodes and ppn, conditions MPICH does not have yet.
+"""
+import argparse
+import json
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+
+import numpy as np  # noqa: E402
+
+from csel_tuner.layouts import axis_values  # noqa: E402
+from csel_tuner.single import LayoutModel, is_pof2  # noqa: E402
+from csel_tuner.tree import fit_tree, json_tree, prune_to  # noqa: E402
+
+# extra parameters of algorithm leaves (coll_algorithms.txt extra_params), at
+# the CVAR defaults the measurements ran with; --param alg.key=value overrides
+PARAMS = {"bcast": {"tree": {"tree_type": "kary", "k": 2, "is_non_blocking": True},
+                    "pipelined_tree": {"tree_type": "kary", "k": 2, "is_non_blocking": True,
+                                       "chunk_size": 8192, "recv_pre_posted": False}}}
+
+
+def json_depth(o):
+    return 1 + max((json_depth(v) for v in o.values() if isinstance(v, dict)), default=0)
+
+
+def parse_value(v):
+    if v in ("true", "false"):
+        return v == "true"
+    try:
+        return int(v)
+    except ValueError:
+        return v
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("model", help="collmodel/2 file")
+    ap.add_argument("--out", required=True, help="selection JSON to write")
+    ap.add_argument("--tol", type=float, default=0.005, help="allowed predicted geomean regret over the full tree")
+    ap.add_argument("--node-aware", action="store_true", help="also split on num_nodes and ppn (future CSEL)")
+    ap.add_argument("--max-regret", type=float, default=1.5,
+                    help="pruning never lets a point's predicted regret rise above this")
+    ap.add_argument("--max-leaves", type=int, default=1024, help="size of the full tree before pruning")
+    ap.add_argument("--param", action="append", default=[], metavar="ALG.KEY=VALUE")
+    a = ap.parse_args(argv)
+    d = json.load(open(a.model))
+    if d.get("format") != "collmodel/2":
+        sys.exit(f"{a.model}: not a collmodel/2 file (from tools/collmodel.py --algs)")
+    op = d["what"].split("-")[0]
+    algs, sizes = d["algs"], np.array(d["sizes"])
+    models = {alg: LayoutModel.from_json({"model": d["models"][alg]}) for alg in algs}
+    (n_lo, n_hi), (p_lo, p_hi) = d["domain"]["N"], d["domain"]["ppn"]
+    layouts = [(n, q) for n in axis_values(n_hi) for q in axis_values(p_hi) if n * q > 1]
+    X = {k: [] for k in ("N", "ppn", "p", "m", "pof2")}
+    L = []
+    for n, q in layouts:
+        L.append(np.array([models[alg].predict(n, q) for alg in algs]).T)
+        for m in sizes:
+            for k, v in (("N", n), ("ppn", q), ("p", n * q), ("m", m), ("pof2", float(is_pof2(n * q)))):
+                X[k].append(v)
+    X = {k: np.array(v, float) for k, v in X.items()}
+    L = np.vstack(L)
+    feats = ["N", "ppn", "p", "m", "pof2"] if a.node_aware else ["p", "m", "pof2"]
+    t = fit_tree(X, L, feats, max_leaves=a.max_leaves)
+    t, path = prune_to(t, a.tol, a.max_regret)
+    params = {k: dict(v) for k, v in PARAMS.get(op, {}).items()}
+    for kv in a.param:
+        k, v = kv.split("=", 1)
+        alg, key = k.split(".", 1)
+        params.setdefault(alg, {})[key] = parse_value(v)
+    coll = op[0].upper() + op[1:]
+    leaf = lambda alg: (f"algorithm=MPIR_{coll}_intra_{alg}", params.get(alg, {}))
+    out = {f"name={op}-intra-auto": json_tree(t, algs, leaf)}
+    depth = json_depth(out)
+    if depth > 64:
+        sys.exit(f"tree nests {depth} levels; MPICH's parser allows 64 (try a larger --tol)")
+    with open(a.out, "w") as f:
+        json.dump(out, f, indent=2)
+        f.write("\n")
+    used = sorted({alg for alg in (algs[l.alg] for l in t.leaves())})
+    print(f"{a.out}: {len(t.leaves())} leaves over {len(layouts)} layouts x {len(sizes)} sizes; "
+          f"predicted geomean regret {path[0][1]:.4f} (full tree, {path[0][0]} leaves) -> {path[-1][1]:.4f}; "
+          f"features {','.join(feats)}; nesting {depth}; algorithms used: {', '.join(used)}")
+
+
+if __name__ == "__main__":
+    main()

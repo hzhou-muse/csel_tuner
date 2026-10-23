@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""Build models T(N, ppn, m) of a collective's algorithms.
+
+One algorithm (--alg, builder v1, csel_tuner/single.py) or several together,
+sampled for selection (--algs a,b,..., builder v2, csel_tuner/multi.py; needs
+the per-request algorithm switch, MPISRV_CVAR_SWITCH=1).
+
+Live, through the benchmark server, one launch of the whole allocation
+(launch/config.sh with the site file launch/sites/<site>.sh):
+
+    bin/collmodel --algs binomial,scatter_ring_allgather,circ_graph --out bcast.json \\
+        --site aurora --nodes 32 --ppn 96
+
+or with any launcher (mpisrv and its max-m argument are appended):
+
+    bin/collmodel --alg binomial --out bcast_binomial.json --launcher "mpiexec -n 64 -ppn 32"
+
+Replay on recorded data in replay/data (replay/README.md), for development:
+
+    bin/collmodel --algs binomial,tree --out m.json --replay [--seed 0]
+
+The starting state is blank: the allocation (nodes, ranks per node) and the
+largest size come from the server's info reply. Allowed layouts are N and
+ppn in {1, 2, 3, 4, 6, 8, 12, 16, 24, ...} up to the allocation, plus the
+allocation's own N and ppn; sizes are 4 per octave from 1 B to max_m. The
+builder samples until its online check converges or the node-hour budget is
+spent, then writes the model file (format collmodel/1).
+"""
+import argparse
+import datetime
+import json
+import os
+import shlex
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+sys.path.insert(0, REPO)
+
+import numpy as np  # noqa: E402
+
+from csel_tuner.multi import Builder2  # noqa: E402
+from csel_tuner.layouts import axis_values, size_grid  # noqa: E402
+from csel_tuner.single import Builder  # noqa: E402
+
+VERSION = "collmodel 0.1"
+OPS = {"bcast": "MPIR_CVAR_BCAST_INTRA_ALGORITHM"}
+
+
+def live(a):
+    from csel_tuner.server import Server
+    env = dict(kv.split("=", 1) for kv in a.env)
+    if a.switch != "request" and len(a.algs) == 1:
+        env[OPS[a.op]] = a.algs[0]  # the launch's algorithm
+    srv = Server(launcher=shlex.split(a.launcher), env=env, max_m=a.max_m, timeout=a.timeout, log=a.log,
+                 warmup=(a.op,), server=a.server)
+    info = srv.world
+    by_request = a.switch == "request" or len(a.algs) > 1 or (a.switch == "auto" and info.get("cvar_switch") == 1)
+    if by_request and info.get("cvar_switch") != 1:
+        srv.close()
+        sys.exit("per-request algorithms (--switch request or --algs): the server reports no runtime CVAR "
+                 "switch (MPISRV_CVAR_SWITCH)")
+    sel = lambda alg: {"cvar." + OPS[a.op]: alg} if by_request else {}
+    nodes, ppn_max = info["nodes"], info["min_ppn"]
+    layouts = [(n, p) for n in axis_values(nodes) for p in axis_values(ppn_max) if n * p > 1]
+    sizes = size_grid(info["max_m"])
+
+    rewarm_m = min(1 << 20, info["max_m"])
+
+    def measure(n, ppn, alg, ms):
+        # After a driver pause the network path is slow for a while (set
+        # mid-size messages after a pause of a few hundred ms): re-warm first.
+        if time.time() - srv.last > a.rewarm_gap:
+            srv.measure(op=a.op, m=rewarm_m, p=n * ppn, ppn=ppn, batches=1, target_us=20000, tag="rewarm",
+                        **sel(alg))
+        reps = srv.measure_many([dict(op=a.op, m=m, p=n * ppn, ppn=ppn, batches=a.batches, sync=a.sync,
+                                      **sel(alg)) for m in ms])
+        return [(float(np.median(r["t_us"])), r["wall_us"]) for r in reps]
+    meta = {"launch": {"cmd": srv.cmd, "env": env}, "algorithm_by": "request" if by_request else "launch",
+            "library": info.get("library"), "hosts": info.get("hosts"),
+            "topology_warnings": info.get("topology_warnings")}
+    return srv, measure, layouts, sizes, nodes, ppn_max, meta
+
+
+def replay(a):
+    sys.path.insert(0, os.path.join(REPO, "replay"))
+    from common import NODES, NoData, load_gt, load_sessions
+    from replay_v2 import Replay2
+    try:
+        gt = load_gt()
+    except NoData as e:
+        sys.exit(str(e))
+    layouts = sorted({(n, p) for n, p in zip(gt.N, gt.ppn)})
+    sizes = sorted(int(m) for m in gt.m.unique())
+    rep = Replay2(load_sessions(), a.seed)
+    meta = {"replay": {"data": "replay/data", "seed": a.seed}}
+    return None, rep, layouts, sizes, NODES, max(p for _, p in layouts), meta
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--op", default="bcast", choices=sorted(OPS))
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--alg", help="one algorithm (builder v1): a value of the op's algorithm CVAR")
+    g.add_argument("--algs", help="several algorithms, comma-separated (builder v2: selection)")
+    ap.add_argument("--out", required=True, help="model file to write (JSON)")
+    ap.add_argument("--budget-node-h", type=float, default=2.0)
+    ap.add_argument("--tau-med", type=float, default=0.05, help="stop when the estimated median error is below this")
+    ap.add_argument("--tau-p90", type=float, default=0.20, help="... and the estimated p90 error is below this")
+    ap.add_argument("--tau-gm", type=float, default=1.02, help="v2: stop when the estimated geomean regret is below this")
+    ap.add_argument("--tau-p95", type=float, default=1.10, help="v2: ... and the estimated p95 regret is below this")
+    ap.add_argument("--prune", type=float, default=2.0, help="v2: skip sizes predicted this much slower than the "
+                    "best (0: off)")
+    g = ap.add_argument_group("live")
+    g.add_argument("--launcher", help="command prefix that starts the server; mpisrv and max-m are appended")
+    g.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
+    g.add_argument("--switch", default="auto", choices=["auto", "request", "launch"],
+                   help="select the algorithm per request (cvar.*, needs the runtime CVAR switch) or for the "
+                        "launch (environment); auto: per request when the server supports it")
+    g.add_argument("--site", help="launch through launch/config.sh with launch/sites/SITE.sh "
+                   "(needs --nodes and --ppn)")
+    g.add_argument("--nodes", type=int, help="with --site: nodes of the launch")
+    g.add_argument("--ppn", type=int, help="with --site: ranks per node of the launch")
+    g.add_argument("--server", default=os.path.join(REPO, "server", "mpisrv"), help="mpisrv binary")
+    g.add_argument("--max-m", type=int, default=1 << 26)
+    g.add_argument("--batches", type=int, default=5)
+    g.add_argument("--sync", default="call", choices=["call", "batch"])
+    g.add_argument("--timeout", type=float, default=300)
+    g.add_argument("--rewarm-gap", type=float, default=0.05,
+                   help="seconds of driver idle time after which a batch starts with a re-warm request")
+    g.add_argument("--log", help="append server requests/replies to this JSONL file")
+    g = ap.add_argument_group("replay")
+    g.add_argument("--replay", action="store_true", help="replay recorded data in replay/data (see replay/README.md)")
+    g.add_argument("--seed", type=int, default=0)
+    a = ap.parse_args(argv)
+    a.algs = a.algs.split(",") if a.algs else [a.alg]
+    if a.site:
+        if not (a.nodes and a.ppn):
+            ap.error("--site needs --nodes and --ppn")
+        os.environ["SITE"] = a.site
+        cfg = os.path.join(REPO, "launch", "config.sh")
+        a.launcher = "bash -c 'source %s && launch %d %d \"$0\" \"$@\"'" % (cfg, a.nodes, a.ppn)
+    if not a.replay and not a.launcher:
+        ap.error("--site/--nodes/--ppn or --launcher is required unless --replay")
+    t_start = time.time()
+    srv, measure, layouts, sizes, nodes, ppn_max, meta = (replay if a.replay else live)(a)
+    v2 = len(a.algs) > 1
+    try:
+        # live: bill real elapsed time (launch, driver, fitting); replay: the recorded wall time
+        clock = None if a.replay else (lambda: time.time() - t_start)
+        if v2:
+            b = Builder2(measure, a.algs, layouts, sizes, n_max=nodes, ppn_max=ppn_max, tau_gm=a.tau_gm,
+                         tau_p95=a.tau_p95, prune=a.prune or None, clock=clock)
+        else:
+            b = Builder(lambda n, ppn, ms: measure(n, ppn, a.algs[0], ms), layouts, sizes, n_max=nodes,
+                        ppn_max=ppn_max, tau_med=a.tau_med, tau_p90=a.tau_p90, clock=clock)
+        b.run(budget_node_h=a.budget_node_h, nodes_billed=nodes)
+    finally:
+        if srv:
+            srv.close()
+    created = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    domain = {"N": [1, nodes], "ppn": [1, ppn_max], "m": [int(sizes[0]), int(sizes[-1])]}
+    if v2:
+        d = model_v2(a, b, sizes)
+    else:
+        d = b.model().to_json(sizes)
+        d["alg"] = a.algs[0]
+        d["jumps"] = [{"N": n, "ppn": p, "lo": lo, "hi": hi, "ratio": round(float(r), 3)}
+                      for (n, p), g in sorted(b.samplers.items()) for lo, hi, r in g.jumps]
+    d["what"] = f"{a.op}-latency"
+    d["domain"] = domain
+    d["meta"] = {"created": created, "tool": VERSION, **meta, "n_measurements": b.n_meas,
+                 "n_layouts": len(b.samplers), "node_h": round(b.node_h, 4), "nodes_billed": nodes,
+                 "stop": b.stop}
+    if v2:
+        d["meta"].update({"tau_gm": a.tau_gm, "tau_p95": a.tau_p95, "prune": a.prune,
+                          "measurements_per_alg": b.n_meas_alg,
+                          "estimate": dict(zip(["regret_geomean", "regret_p95"], b.estimate() or [None, None])),
+                          "checks": [{"N": l[0], "ppn": l[1], "kind": k, "regret_geomean": rnd(gm),
+                                      "regret_p95": rnd(p9)} for l, k, gm, p9, _, _ in b.checks]})
+    else:
+        d["meta"].update({"tau_med": a.tau_med, "tau_p90": a.tau_p90,
+                          "estimate": dict(zip(["med", "p90"], b.estimate() or [None, None])),
+                          "checks": [{"N": l[0], "ppn": l[1], "kind": k, "med": round(md, 4), "p90": round(p9, 4)}
+                                     for l, k, md, p9, _, _ in b.checks]})
+    with open(a.out, "w") as f:
+        json.dump(d, f, indent=1)
+    print(f"{a.out}: {len(b.samplers)} layouts, {b.n_meas} measurements, {b.node_h:.3f} node-h, stop: {b.stop}")
+
+
+def rnd(x, nd=4):
+    """round, with NaN (no value) as JSON null"""
+    return None if x != x else round(x, nd)
+
+
+def model_v2(a, b, sizes):
+    """collmodel/2: one collmodel/1 model per algorithm, plus the selection
+    (the predicted fastest algorithm) at every measured layout and size, and
+    the crossovers located there."""
+    m = b.model()
+    models = {}
+    for alg in a.algs:
+        j = m.models[alg].to_json(sizes)
+        models[alg] = j["model"]
+    sel = []
+    for lay in sorted(b.samplers):
+        w, t = m.select(*lay)
+        sel.append({"N": lay[0], "ppn": lay[1], "alg": [a.algs[k] for k in w],
+                    "t_us": [round(float(2 ** v), 4) for v in t]})
+    return {"format": "collmodel/2", "inputs": ["N", "ppn", "m"], "output": "t_us", "algs": a.algs,
+            "sizes": [int(x) for x in sizes], "models": models, "selection": sel,
+            "crossovers": [{"N": l[0], "ppn": l[1], "lo": lo, "hi": hi, "from": x, "to": y}
+                           for l, s in sorted(b.samplers.items()) for lo, hi, x, y in s.crossovers]}
+
+
+if __name__ == "__main__":
+    main()

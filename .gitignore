@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+server/mpisrv
+replay/results/
+.pytest_cache/
+replay/data/

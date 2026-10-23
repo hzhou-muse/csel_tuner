@@ -1,0 +1,124 @@
+"""Replay builder v3 (csel_tuner/tree.py) on recorded data: decision trees from v2 models.
+
+    python3 replay/replay_v3.py [--seeds 3]  -> replay/results/v3.md, replay/results/v3_runs.csv,
+                                                replay/results/v3_bcast_seed0_<features>.json
+
+Needs replay/data (README.md). Per seed: build the v2 model on replay
+(replay_v2, default settings), predict every algorithm at every recorded
+(layout, size) point, fit regret trees on two feature sets, prune to
+several tolerances, and score each tree's choices against the ground truth
+(regret = T(chosen) / T(fastest)). Feature sets: "csel" = comm_size,
+avg_msg_size, pof2 (today's CSEL); "node-aware" = also num_nodes and ppn
+(assumed future CSEL conditions). The model's own per-point selection is
+the reference a tree can at best match.
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from common import SHORT, load_gt, results_path  # noqa: E402
+from csel_tuner.single import is_pof2  # noqa: E402
+from csel_tuner.multi import Builder2  # noqa: E402
+from replay_v2 import Replay2  # noqa: E402
+from csel_tuner.tree import fit_tree, json_tree, prune_to, select  # noqa: E402
+from common import FIXED, profiles, score, table  # noqa: E402
+from common import NODES, load_sessions  # noqa: E402
+
+FEATURES = {"csel": ["p", "m", "pof2"], "node-aware": ["N", "ppn", "p", "m", "pof2"]}
+TOLS = [0.0, 0.002, 0.005, 0.01, 0.02]
+# extra parameters of the bcast algorithm leaves: the CVAR defaults the data was measured with
+PARAMS = {"tree": {"tree_type": "kary", "k": 2, "is_non_blocking": True},
+          "pipelined_tree": {"tree_type": "kary", "k": 2, "is_non_blocking": True, "chunk_size": 8192,
+                             "recv_pre_posted": False}}
+
+
+def leaf(alg):
+    return "algorithm=MPIR_Bcast_intra_" + alg, PARAMS.get(alg, {})
+
+
+def grid(model, layouts, sizes):
+    rows, L = [], []
+    for n, q in layouts:
+        L.append(model.predict(n, q).T)
+        rows += [(n, q, n * q, int(m), float(is_pof2(n * q))) for m in sizes]
+    X = pd.DataFrame(rows, columns=["N", "ppn", "p", "m", "pof2"])
+    return {c: X[c].to_numpy() for c in X}, np.vstack(L)
+
+
+def regret_of(choice, w):
+    """Ground-truth regret of per-point algorithm indices (grid order = w order)."""
+    t = w[FIXED].to_numpy()[np.arange(len(w)), choice]
+    return pd.Series(t / w[FIXED].min(axis=1).to_numpy(), index=w.index)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--seeds", type=int, default=3)
+    a = ap.parse_args()
+    gt = load_gt()
+    wp = table(gt)
+    sessions = load_sessions()
+    sizes = np.array(sorted(gt.m.unique()))
+    layouts = sorted({(n, p) for n, p in zip(gt.N, gt.ppn)})
+    w = wp.droplevel("p").reindex(pd.MultiIndex.from_tuples(
+        [(n, q, int(m)) for n, q in layouts for m in sizes], names=["N", "ppn", "m"]))
+    rows = []
+    for seed in range(a.seeds):
+        b = Builder2(Replay2(sessions, seed), FIXED, layouts, sizes, n_max=max(n for n, _ in layouts),
+                     ppn_max=max(p for _, p in layouts), seed=seed)
+        b.run(budget_node_h=4.0, nodes_billed=NODES)
+        X, L = grid(b.model(), layouts, sizes)
+        direct = regret_of(np.argmin(L, axis=1), w)
+        rows.append({"seed": seed, "features": "-", "tol": np.nan, "leaves": np.nan, "node_h": b.node_h,
+                     "pred geomean": 1.0, **{k: v for k, v in score(w, direct, "model").items() if k != "profile"}})
+        for fname, feats in FEATURES.items():
+            for tol in TOLS:
+                t = fit_tree(X, L, feats)
+                t, path = prune_to(t, tol)
+                pts = [{f: X[f][i] for f in X} for i in range(len(L))]
+                choice = np.array([select(t, x) for x in pts])
+                r = regret_of(choice, w)
+                pred = 2 ** float(np.mean(L[np.arange(len(L)), choice] - L.min(axis=1)))
+                rows.append({"seed": seed, "features": fname, "tol": tol, "leaves": len(t.leaves()),
+                             "node_h": b.node_h, "pred geomean": pred,
+                             **{k: v for k, v in score(w, r, "tree").items() if k != "profile"}})
+                if seed == 0 and tol == 0.005:
+                    j = {"name=bcast-intra-auto": json_tree(t, FIXED, leaf)}
+                    with open(results_path(f"v3_bcast_seed0_{fname}.json"), "w") as f:
+                        json.dump(j, f, indent=2)
+                print(rows[-1], flush=True)
+    df = pd.DataFrame(rows)
+    df.to_csv(results_path("v3_runs.csv"), index=False)
+    ref = pd.DataFrame([score(wp, r, n) for n, r in profiles(wp).items()]).set_index("profile")
+    g = df.groupby(["features", "tol"], dropna=False).mean(numeric_only=True).reset_index()
+    out = ["# Builder v3: decision trees from the v2 model, replay on recorded data", "",
+           "Generated by `replay/replay_v3.py`. Regret = T(chosen) / T(fastest) on all recorded ground-truth "
+           "points; mean over seeds. `pred geomean` is the tree's regret as the model predicts it (what pruning "
+           "controls). csel = comm_size, avg_msg_size, pof2 (today's MPICH); node-aware = also num_nodes, ppn "
+           "(assumed future conditions).", "",
+           "## References", "", "| profile | geomean | p95 | max | total / oracle |", "|---|---|---|---|---|"]
+    for name, r in ref.iterrows():
+        out.append(f"| {name} | {r['geomean']:.3f} | {r['p95']:.2f} | {r['max']:.2f} | {r['total / oracle']:.3f} |")
+    out += ["", "## Trees", "",
+            "| features | tol | leaves | pred geomean | geomean | p95 | max | total / oracle |",
+            "|---|---|---|---|---|---|---|---|"]
+    for _, r in g.iterrows():
+        name = "v2 model, per point" if r["features"] == "-" else r["features"]
+        tol = "" if np.isnan(r["tol"]) else f"{r['tol']:.3f}"
+        lv = "" if np.isnan(r["leaves"]) else f"{r['leaves']:.0f}"
+        out.append(f"| {name} | {tol} | {lv} | {r['pred geomean']:.3f} | {r['geomean']:.3f} | {r['p95']:.2f} | "
+                   f"{r['max']:.2f} | {r['total / oracle']:.3f} |")
+    out += ["", f"v2 cost: {df.node_h.mean():.2f} node-h. Trees for seed 0 at tol 0.005: "
+            "`replay/results/v3_bcast_seed0_csel.json`, `replay/results/v3_bcast_seed0_node-aware.json`.", ""]
+    open(results_path("v3.md"), "w").write("\n".join(out) + "\n")
+    print("\n".join(out))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,348 @@
+# csel_tuner: design
+
+csel_tuner measures a cluster's MPI collective algorithms within a
+node-hour budget and produces a tuning file for MPICH's collective
+selection (CSEL). This document describes how it works and why. For how to
+run it, see [usage.md](usage.md).
+
+Status (2026-10-22): the server, the three builders and the tree output are
+implemented and tested on replays of recorded measurements and in local
+functional runs; live validation is the next step. MPI_Bcast is the only
+collective wired through the builders so far.
+
+## 1. Goal
+
+A tuning file maps each call, keyed on communicator size, ranks per node
+and message size, to an algorithm. Its quality is the **regret** of what it
+selects: T(selected algorithm) / T(fastest algorithm), summarized over a
+grid of layouts and sizes by the geometric mean, the p95 and the maximum.
+The tool decides what to measure, how much, and when to stop, trading
+measurement cost (node-hours) against regret.
+
+§9 describes how the builders are evaluated.
+
+## 2. Architecture
+
+```
+bin/collmodel (driver, Python)                server/mpisrv (one MPI job of P ranks)
+  builder v1 / v2 (csel_tuner)                  rank 0 reads requests, broadcasts them,
+  csel_tuner.server.Server   -- batch of  -->   the requested sub-communicator measures,
+                             <-- replies ---    rank 0 writes one JSON reply per request
+        |
+        v  model file (collmodel/2)
+bin/colltree (builder v3)  -->  tuning JSON  -->  MPIR_CVAR_COLL_SELECTION_JSON_FILE
+```
+
+- One long-lived, warmed-up job serves every measurement. Launching a job
+  per point is too slow, and processes run slow for a while after start.
+- Any layout (N nodes x ppn ranks per node, p = N x ppn) up to the
+  allocation is measured on a sub-communicator of the job.
+- The driver talks to rank 0 through stdin/stdout (`mpiexec` forwards stdin
+  to rank 0; checked with Hydra and with PALS).
+- Batch mode (`--plan FILE --out FILE`) runs a fixed list of requests with
+  no driver, for dense ground-truth sets (`groundtruth/`).
+
+## 3. The benchmark server (`server/mpisrv.c`)
+
+### 3.1 Requests and replies
+
+A request is one line of `key=value` tokens; a reply is one JSON object per
+line.
+
+```
+op=bcast m=65536 p=256 ppn=8 batches=5 sync=call cvar.MPIR_CVAR_BCAST_INTRA_ALGORITHM=binomial
+{"status":"ok","seq":12,"op":"bcast","m":65536,"p":256,"ppn":8,"place":"nic",...,
+ "cvars":{"MPIR_CVAR_BCAST_INTRA_ALGORITHM":"binomial"},"k":32,"t_us":[41.2,40.9,...],"wall_us":5210}
+```
+
+| Key | Meaning | Default |
+|---|---|---|
+| `op` | `bcast`, `allreduce`, `pingpong`, `info`, `quit` | — |
+| `m` | message size in bytes | — |
+| `p`, `ppn` | sub-communicator size and ranks per node | the whole job |
+| `place` | which local ranks of a node: `nic` (§3.3), `spread`, `compact` | `nic` |
+| `nodes` | `OFF[:STRIDE]`: which nodes | `0:1` |
+| `batches`, `target_us` | timed batches; calibration target per batch | 3, 1000 |
+| `sync` | `batch`: calls back to back; `call`: a barrier before each call, each timed alone | `batch` |
+| `check` | `1`: broadcast a pattern and verify it on every rank | `0` |
+| `cvar.<NAME>` | MPI_T control variable for this request only (§3.5), up to 4 | — |
+| `root`, `cache`, `pair`, `tag` | root rank; hot/cold buffer; ping-pong ranks; free text echoed | |
+
+`op=info` returns the job: nodes, ranks per node, hosts, the MPICH version,
+the MPI-related environment, the topology checks and `cvar_switch`.
+
+### 3.2 Measurement
+
+For each request, on the sub-communicator: one untimed call (first-call
+effects such as connection setup), calibration of k calls per batch to
+reach `target_us`/2, one untimed warm-up batch, one barrier, then `batches`
+batches of k calls. A batch's value is the **synchronized latency**: from
+the common barrier exit to the last rank finishing, per call. With
+`sync=call` each call is timed on its own after a barrier, and the batch
+value is the slowest rank's mean call time: latency without pipelining
+between consecutive calls, which is what the builders use. `wall_us` is the
+request's full cost.
+
+### 3.3 Rank placement: `place=nic`
+
+A sub-communicator with ppn ranks per node must load the NICs as a real
+job with ppn ranks per node would. MPICH (ch4:ofi, one NIC per rank) gives
+local rank i the close NIC `i mod (NICs per socket)`. Evenly spaced ranks
+(`spread`) with a stride that is a multiple of that number put all of a
+socket's ranks on one NIC: with 4 NICs per socket and 96 ranks per node,
+ppn 24 puts 12 ranks on one NIC where a real 24-rank-per-node job puts 3,
+which slows large messages.
+`place=nic` moves each spread position within its group of M local ranks
+(M = NICs per socket) so that the j-th rank has local rank = j mod M. The
+NIC load then equals the real job's for every ppn.
+
+The site config gives sockets and NICs per socket (`launch/sites/*.sh`).
+mpisrv checks them at startup against MPICH's `MPI_INFO_ENV` keys
+`num_close_nics` / `num_nics_available` and the ranks' core binding, and
+reports mismatches in the info record (`topology_warnings`).
+
+### 3.4 Idle ranks
+
+Ranks outside the requested sub-communicator, and all ranks between
+requests, wait for the next request:
+
+- `spin` (default): check for it every 50 µs, with a pause-instruction loop
+  in between (no MPI progress, no memory traffic). Cores that sleep drop to
+  a low clock and need tens of ms of work to recover, so requests after an
+  idle gap run slow.
+- `sleep`, `busy` (blocking broadcast, drives MPI progress), `split` (the
+  last request's members spin, the others sleep, with a spin-up when a
+  member was asleep).
+
+Measuring inside a job that runs more ranks per node than the layout uses
+can still read slower than a real job, whatever the idle mode (§10);
+`busy` is the slowest mode.
+
+### 3.5 Per-request algorithms (`cvar.*`)
+
+MPICH main applies writes to its algorithm CVARs at run time since commit
+de0b8e6921 ("coll: read algorithm CVARs through a pointer table"); before,
+it copied them at init. mpisrv writes each `cvar.<NAME>=<value>` on every
+rank after the request's broadcast (the variables are all-equal scope) and
+restores the old value after the measurement. Rank 0 validates the name
+(MPI_T, no object binding, int or string type) and the value first; a bad
+one gets an error reply.
+
+Enum values go by name or number. Since f95b6ec93d MPICH registers an MPI_T
+enum per enum CVAR, with the value names as items; for older builds mpisrv
+reads the `name - text` lines of the CVAR's description, which is how
+MPICH's generator numbers them.
+
+A build's version string cannot tell whether it has the fix, so the site
+config asserts it with `MPISRV_CVAR_SWITCH=1`; without it, `cvar.*`
+requests are refused rather than silently measuring the default algorithm.
+
+### 3.6 Interactive input
+
+rank 0 reads stdin unbuffered, so `poll()` sees requests the driver sent
+together; with stdio buffering a batch of requests hung the server.
+
+## 4. The driver (`csel_tuner/server.py`, `bin/collmodel`)
+
+- **Batches.** The driver sends a batch of requests, then reads the replies
+  in order. A round trip through the launcher's stdin/stdout forwarding can
+  cost as much as a request itself, so the builders send each refinement
+  step as one batch: a handful of round trips per layout instead of one per
+  request.
+- **Own line reader** on the raw stdout descriptor, so replies that arrive
+  together are never stuck in a buffer `select()` cannot see; a timeout
+  kills the job.
+- **Re-warm.** After the driver has been idle > 50 ms (model fitting), the
+  next batch starts with an untimed 1 MB request: after a pause of a few
+  hundred ms, mid-size messages were measured slow, while small and very
+  large ones were not.
+- **Cost.** Node-hours = elapsed time x nodes of the allocation, including
+  launch, driver overhead and fitting (on replay: the recorded wall time).
+- **Environment.** numpy only (`csel_tuner/interp.py` replaces scipy's PCHIP
+  and Delaunay interpolation; checked against scipy) and Python ≥ 3.6, the
+  system Python on some clusters' compute nodes.
+
+## 5. Builder v1: one algorithm (`csel_tuner/single.py`)
+
+**Sizes at one layout (GridSampler).** Sizes come from a fixed grid, 4 per
+octave from 1 B to the largest size, so repeats hit the same sizes and a
+jump is bracketed to one grid step. A coarse pass every 2 octaves, then
+breadth-first over intervals: predict the grid midpoint with PCHIP
+(log-log) through the points so far, measure it. A miss ≤ 0.10 (log2) ends
+the interval; a miss > 0.15 that repeats is a jump and is bisected to
+adjacent grid sizes; any other miss splits the interval. One level of the
+breadth-first search is one batch.
+
+**Across layouts (LayoutModel).**
+
+```
+T(N, ppn, m) = S(log2 N, log2 ppn, m) x (1 + a(m) s(N ppn))
+s(p) = 2 - p / 2^floor(log2 p) for p not a power of two, else 0
+```
+
+S is interpolated linearly in (log2 N, log2 ppn) over the measured layouts
+(a Delaunay triangulation; nearest outside the hull); single-node layouts
+(shared memory only) are interpolated only among themselves. The penalty
+(1 + a s) is largest just above a power of two and vanishes at the next
+one, the form that fitted sweeps over non-power-of-two p best; a(m) is
+fitted by leave-one-out.
+
+**Layout loop.** Start from N in {2, mid, N_max} x ppn in {1, mid,
+ppn_max} plus single-node layouts. Every further layout is first predicted,
+then measured (a check). Risk checks take the allowed layout between two
+adjacent measured ones whose neighbours' curves differ most; every third
+check is a uniformly random unmeasured layout. The random checks' errors
+are the estimate; stop when its median ≤ 5% and p90 ≤ 20%, when it stops
+improving, or at the budget.
+
+The median estimate is the reliable one; the large errors tend to sit at
+a few layouts that a few random draws can miss, so the p90 estimate is
+noisy. How accurate the model can get is bounded by the layout model
+itself, which replay measures by leaving one layout out with all others
+known.
+
+## 6. Builder v2: all algorithms, for selection (`csel_tuner/multi.py`)
+
+The aim is the **optimum model**, the fastest algorithm and its time at
+every (N, ppn, m); each algorithm's model only needs to be good where it
+can win.
+
+- **One server**, the algorithm per request (§3.5).
+- **At a layout (MultiSampler):** a coarse pass of every algorithm; an
+  algorithm is refined only on size intervals where it comes within 1.3x of
+  the best one (a contender); where the best algorithm changes between two
+  sizes, both are measured at the midpoints until the crossover is one grid
+  step wide.
+- **Pruning:** at risk checks the model's prediction decides the coarse
+  pass: sizes where an algorithm is predicted > 2x slower than the
+  predicted best are skipped (its curve there is the prediction, corrected
+  by the measured residuals). Random checks measure everything.
+- **Model (OptimumModel):** one LayoutModel per algorithm; selection =
+  argmin of the predicted times.
+- **Layout loop** as v1, with the risk score = difference of the two
+  neighbours' best times plus the fraction of sizes whose winner differs.
+- **Estimate:** at each random check, the regret of the predicted selection
+  at the coarse sizes; stop at geomean ≤ 1.02 and p95 ≤ 1.10, a plateau, or
+  the budget. Replay checks this estimate against the true regret.
+
+## 7. Builder v3: the tree (`csel_tuner/tree.py`, `bin/colltree`)
+
+**Input:** the v2 model's predicted log2 T of every algorithm at every
+allowed layout x size. With R[i, a] = log2 T[i, a] - min_b log2 T[i, b] (the
+predicted regret of choosing a at point i):
+
+- **Growth:** a multi-output regression tree on the regret vectors (the
+  split with the largest reduction of their squared deviation), grown to
+  1,024 leaves. Splitting on regret directly is myopic: when the best
+  algorithm depends on size and comm_size jointly, no single split lowers
+  the regret much, and growth stopped at 4 leaves.
+- **Leaves** pick the algorithm with the least summed regret.
+- **Pruning:** weakest link first, to the smallest tree whose predicted
+  geomean regret is within `--tol` (0.5%) of the full tree's, never letting
+  a point's predicted regret exceed `--max-regret` (1.5x). Without the
+  second rule a geomean target lets a few expensive choices through, e.g.
+  an algorithm that wins at power-of-two p chosen for the nearby
+  non-power-of-two p, where it is much slower.
+- **Output:** a CSEL subtree `name=<op>-intra-auto`. A right-leaning chain
+  of splits becomes one object of ordered sibling conditions ending in
+  `any`; a numeric split on value v uses the canonical threshold form
+  `cond(t)` (v ≤ t); a leaf is `{"algorithm=MPIR_<Coll>_intra_<alg>":
+  {extra params}}` with the algorithm's extra parameters at the CVAR
+  defaults the measurements used.
+- **Features:** today's CSEL conditions `comm_size`, `avg_msg_size` and
+  `pof2`; with `--node-aware` also `num_nodes(t)` and `ppn(t)`, proposed
+  conditions that MPICH does not have yet (it rejects such a file with
+  "unknown condition").
+
+## 8. File formats
+
+**collmodel/1** (one algorithm):
+
+```json
+{"format": "collmodel/1", "inputs": ["N", "ppn", "m"], "output": "t_us", "what": "bcast-latency",
+ "alg": "binomial",
+ "model": {"type": "layout-grid-pof2", "sizes": [1, 2, 3, ...],
+           "layouts": [{"N": 2, "ppn": 1, "log2_t": [...]}, ...],
+           "penalty": {"form": "1 + a*s", "a_intra": [...], "a_inter": [...]}},
+ "domain": {"N": [1, 32], "ppn": [1, 96], "m": [1, 67108864]},
+ "jumps": [{"N": 2, "ppn": 1, "lo": ..., "hi": ..., "ratio": ...}, ...],
+ "meta": {"created": "...", "tool": "collmodel 0.1", "launch": {...}, "library": "...",
+          "n_measurements": ..., "n_layouts": ..., "node_h": ..., "stop": "plateau",
+          "estimate": {"med": ..., "p90": ...}, "checks": [...]}}
+```
+
+`log2_t` is the measured layout's curve on the size grid; prediction at
+other layouts follows §5 (`LayoutModel.from_json`).
+
+**collmodel/2** (several algorithms): `algs`, `sizes`, `models` (a
+collmodel/1 `model` per algorithm), `selection` (the predicted best
+algorithm and time at each measured layout and size), `crossovers`, and in
+`meta` the regret estimate and per-algorithm measurement counts.
+
+**Tuning JSON:** a CSEL subtree (`name=bcast-intra-auto`), loaded with
+`MPIR_CVAR_COLL_SELECTION_JSON_FILE`; it replaces MPICH's built-in subtree
+of that name.
+
+## 9. Evaluation by replay
+
+Replay (`replay/`) runs a builder against a recorded dense grid of one
+collective (every algorithm at every layout and size, from the batch-mode
+tools) instead of a cluster: a request returns a recorded value with a
+little noise and costs its recorded wall time times the allocation's
+nodes. Several seeds give the spread. The builders are scored against the
+whole recording:
+
+- v1: |T_pred / T - 1| at the layouts it did not measure (the real test)
+  and at those it did (the m axis alone), against node-hours.
+- v2 and v3: the regret of their selection at every recorded point
+  (geomean, p95, max, total time / the oracle's), split into measured and
+  unmeasured layouts, against node-hours; and the builder's own regret
+  estimate against the true regret.
+- References: MPICH's own selection (if recorded as `auto`), the best
+  single algorithm, the best selection keyed on (comm_size, message size)
+  and on (N, ppn, message size) with full knowledge, fixed sampling grids,
+  and one v1 model per algorithm.
+
+No recorded data is shipped; `replay/README.md` shows how to record and
+convert it.
+
+## 10. Lessons from measurements
+
+Observations on a large system (MPI_Bcast, ch4:ofi over Slingshot) that
+shaped the design:
+
+- **NIC placement** (§3.3): evenly spaced ranks can overload some NICs;
+  `place=nic` reproduces a real job's NIC load.
+- **Idle cores must spin** (§3.4): sleeping cores make the next requests
+  slow.
+- **Launch with the ranks per node you measure.** Layouts with fewer ranks
+  per node than the launch measured slower than the same layouts run as
+  their own job, at all sizes, whatever the idle ranks did; a launch with
+  fewer ranks per node matched. The cause was not found. The offset was
+  nearly uniform across algorithms, so it moves absolute times more than
+  the choice of algorithm; launching with no more ranks per node than the
+  layouts need avoids it.
+- **Driver pauses** slow the next mid-size requests (§4, re-warm).
+- **The launcher's stdin forwarding** works but costs a round trip per
+  batch (§4, batches).
+- **Compute nodes may lack scipy** (§4): the tools need numpy only.
+- **PCHIP, not random forests.** Along m, PCHIP reached a given median
+  error with far fewer sizes than a random forest, and with a linear
+  bandwidth tail it extrapolates past the largest measured size, which a
+  forest cannot (it repeats its last leaf). Across layouts, the PCHIP layout
+  model predicted unmeasured layouts better than a forest on (N, ppn, m),
+  also with power-of-two features. The model file is orders of magnitude
+  smaller, and its inference is a few dozen lines that port to C.
+
+## 11. Limitations and next steps
+
+- **Live validation**: a v2 run on a small allocation, the tree, then each
+  layout measured under the loaded tree against every algorithm.
+- **Node-aware CSEL conditions** (`num_nodes`, `ppn`) need MPICH support.
+- **Collectives:** only bcast is wired through the builders (`OPS` in
+  `bin/collmodel`, leaf parameters in `bin/colltree`); mpisrv also measures
+  allreduce and ping-pong.
+- **Extrapolation beyond the allocation** (N > N_max) is not modeled: the
+  tree's last branch covers it.
+- The v1 p90 error estimate is unreliable (few random checks); v2's regret
+  estimate is reliable on the replay.
