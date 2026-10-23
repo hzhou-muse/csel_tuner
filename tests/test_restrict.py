@@ -113,16 +113,16 @@ def test_dispatch_and_choice():
     colltree = SourceFileLoader("colltree", os.path.join(REPO, "bin", "colltree")).load_module()
     bits = ["inplace", "not_inplace", "pof2", "hierarchical", "MPIDI_CH4_release_gather"]
     d = colltree.dispatch("bcast", bits, [0, 16])
-    assert d == {"MPIDI_CH4_release_gather": "call=bcast-intra-r16", "any": "call=bcast-intra-r0"}
+    assert d == {"MPIDI_CH4_release_gather": "call=bcast-intra-10", "any": "call=bcast-intra-0"}
     # a set with no subtree falls back to its largest present subset (a tie: the lower mask)
     d = colltree.dispatch("bcast", bits, [0, 8, 16])
-    assert d == {"hierarchical": "call=bcast-intra-r8",
-                 "any": {"MPIDI_CH4_release_gather": "call=bcast-intra-r16", "any": "call=bcast-intra-r0"}}
+    assert d == {"hierarchical": "call=bcast-intra-8",
+                 "any": {"MPIDI_CH4_release_gather": "call=bcast-intra-10", "any": "call=bcast-intra-0"}}
     trees = {"bcast-intra-auto": colltree.dispatch("bcast", bits, [0, 16]),
-             "bcast-intra-r0": {"comm_size(4)": {"algorithm=MPIR_Bcast_intra_binomial": {}},
+             "bcast-intra-0": {"comm_size(4)": {"algorithm=MPIR_Bcast_intra_binomial": {}},
                                 "any": {"algorithm=MPIR_Bcast_intra_tree": {}}},
-             "bcast-intra-r16": {"avg_msg_size(1024)": {"algorithm=MPIDI_POSIX_mpi_bcast_release_gather": {}},
-                                "any": "call=bcast-intra-r0"}}
+             "bcast-intra-10": {"avg_msg_size(1024)": {"algorithm=MPIDI_POSIX_mpi_bcast_release_gather": {}},
+                                "any": "call=bcast-intra-0"}}
     x = lambda p, m, rg: {"p": p, "m": m, "N": 1, "ppn": p, "pof2": 1.0,
                           "cond": {"hierarchical": False, "MPIDI_CH4_release_gather": rg}}
     assert json_choice(trees["bcast-intra-auto"], x(4, 64, True), trees) == "MPIDI_POSIX_mpi_bcast_release_gather"
@@ -157,10 +157,10 @@ def test_two_set_replay():
         subprocess.run([sys.executable, os.path.join(REPO, "bin", "colltree"), model, "--out", tuning],
                        check=True, capture_output=True)
         t = json.load(open(tuning))
-        assert set(t) == {"name=bcast-intra-r0", "name=bcast-intra-r16", "name=bcast-intra-auto"}
-        assert t["name=bcast-intra-auto"] == {"MPIDI_CH4_release_gather": "call=bcast-intra-r16",
-                                              "any": "call=bcast-intra-r0"}
-        assert "MPIDI_POSIX_mpi_bcast_release_gather" in json.dumps(t["name=bcast-intra-r16"])
+        assert set(t) == {"name=bcast-intra-0", "name=bcast-intra-10", "name=bcast-intra-auto"}
+        assert t["name=bcast-intra-auto"] == {"MPIDI_CH4_release_gather": "call=bcast-intra-10",
+                                              "any": "call=bcast-intra-0"}
+        assert "MPIDI_POSIX_mpi_bcast_release_gather" in json.dumps(t["name=bcast-intra-10"])
 
 
 if __name__ == "__main__":

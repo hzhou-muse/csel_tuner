@@ -77,4 +77,5 @@ def plan_sets(algs, bits, masks):
 
 
 def set_name(op, mask):
-    return "%s-intra-r%d" % (op, mask)
+    """The set's CSEL subtree name: the mask of true conditions in hex, e.g. bcast-intra-800."""
+    return "%s-intra-%x" % (op, mask)

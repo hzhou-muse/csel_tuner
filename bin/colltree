@@ -18,10 +18,10 @@ num_nodes and ppn, conditions MPICH does not have yet.
 A collmodel/3 file (bin/collmodel --coll-algorithms) has a model per
 restriction set; the output then has one subtree per set
 (docs/design.md, section 11):
-- "name=<op>-intra-r0", the unrestricted algorithms, fitted on every layout;
+- "name=<op>-intra-0", the unrestricted algorithms, fitted on every layout;
 - "name=<op>-intra-r<S>", fitted on the layouts where exactly the conditions
   S hold, choosing among S's restricted algorithms and the leaf
-  "call=<op>-intra-r0" (timed as r0's choice at each point, from S's model);
+  "call=<op>-intra-0" (timed as r0's choice at each point, from S's model);
 - "name=<op>-intra-auto", the dispatch: nested restrictive conditions, each
   tested once, ending in "call=" the subtree of the conditions that hold
   (a set without a subtree: its largest subset that has one, at worst r0).

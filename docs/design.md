@@ -399,7 +399,8 @@ the two; the others are empty and skipped. The model file records the bit
 names. (Older MPICH files use `!inplace`; such a restriction is read as a
 condition of its own, numbered after the listed ones, and tested as
 `!inplace` in the tree.) The subtree `<op>-intra-r<mask>` serves calls whose
-true conditions are exactly `mask`, e.g. `bcast-intra-r2048` for
+true conditions are exactly `mask`, written in hex without a prefix
+(`<op>-intra-0` is set 0, written `r0` below), e.g. `bcast-intra-800` for
 single-node communicators:
 
 - `r0` holds the unrestricted algorithms and is fitted on **every** layout:
@@ -408,7 +409,7 @@ single-node communicators:
   under `MPI_THREAD_MULTIPLE`).
 - `r<S>`, S ≠ 0, is fitted on the layouts whose mask is S, and chooses
   among the restricted algorithms allowed in S, plus the leaf
-  `"call=<op>-intra-r0"`, whose time at a point is that of r0's choice
+  `"call=<op>-intra-0"`, whose time at a point is that of r0's choice
   there. With one restricted algorithm it is a short split on size.
 - A set with no layouts (mutually exclusive conditions) produces no subtree.
 - `<op>-intra-auto` is the dispatch: nested conditions over the bits in
