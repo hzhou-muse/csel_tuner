@@ -15,9 +15,8 @@ its splits where a wrong choice is expensive.
 
 1. Features. Today's CSEL conditions: comm_size(t) (p <= t),
    avg_msg_size(t) (m <= t; for bcast the message size) and pof2. With
-   `node_aware`, also num_nodes(t) and ppn(t): the conditions this tool
-   assumes CSEL will gain (proposed names; MPICH must add them before such a
-   file can be loaded).
+   `node_aware`, also num_nodes(t) and ppn(t) (ranks per node, averaged over
+   the nodes), conditions MPICH has since pmodels/mpich#8048.
 2. Growth: best-first, every candidate threshold of every feature (the
    distinct values on the grid, prefix sums per algorithm), choosing the
    split that most reduces the squared deviation of the regret vectors

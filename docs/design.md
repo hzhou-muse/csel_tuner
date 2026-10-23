@@ -261,9 +261,10 @@ predicted regret of choosing a at point i):
   {extra params}}` with the algorithm's extra parameters at the CVAR
   defaults the measurements used.
 - **Features:** today's CSEL conditions `comm_size`, `avg_msg_size` and
-  `pof2`; with `--node-aware` also `num_nodes(t)` and `ppn(t)`, proposed
-  conditions that MPICH does not have yet (it rejects such a file with
-  "unknown condition").
+  `pof2`; with `--node-aware` also `num_nodes(t)` and `ppn(t)` (ranks per
+  node, averaged over the nodes), conditions MPICH has since
+  pmodels/mpich#8048 (an older one rejects such a file with "unknown
+  condition").
 
 ## 8. File formats
 

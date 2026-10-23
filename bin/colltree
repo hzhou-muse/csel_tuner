@@ -12,8 +12,8 @@ The tree is fitted on the model's predictions at every allowed layout (the
 model's N and ppn axes, as tools/collmodel.py enumerates them) and every
 size of its grid, and pruned to the smallest tree whose predicted geomean
 regret is within --tol of the full tree's. Without --node-aware it uses
-comm_size, avg_msg_size and pof2 (MPICH main today); --node-aware adds
-num_nodes and ppn, conditions MPICH does not have yet.
+comm_size, avg_msg_size and pof2; --node-aware adds num_nodes and ppn,
+conditions MPICH has since pmodels/mpich#8048.
 
 A collmodel/3 file (bin/collmodel --coll-algorithms) has a model per
 restriction set; the output then has one subtree per set

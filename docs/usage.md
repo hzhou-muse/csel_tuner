@@ -219,7 +219,7 @@ It prints the tree size, the predicted regret and the algorithms used.
 |---|---|---|
 | `--tol` | 0.005 | allowed predicted geomean regret over the full tree; larger = smaller tree |
 | `--max-regret` | 1.5 | pruning never lets a point's predicted regret exceed this |
-| `--node-aware` | off | also split on `num_nodes` and `ppn` (needs CSEL support MPICH does not have yet) |
+| `--node-aware` | off | also split on `num_nodes` and `ppn` (MPICH with pmodels/mpich#8048) |
 | `--param ALG.KEY=VALUE` | | extra parameter of an algorithm leaf, e.g. `tree.k=4` |
 
 Use it with MPICH:
@@ -315,7 +315,7 @@ into single-node and multi-node layouts. `--model` takes a collmodel/2 or
 | `topology_warnings` in the info record | `SOCKETS` / `NICS_PER_SOCKET` / `NODE_CORES` do not match the binding or MPICH |
 | launches fail right after a killed one | stale `/dev/shm/mpich_shm_*` files filling shared memory; remove your own |
 | `tree nests N levels` | MPICH's parser allows 64; use a larger `--tol` |
-| `unknown condition` at `MPI_Init` | a `--node-aware` file on an MPICH without `num_nodes`/`ppn` conditions |
+| `unknown condition` at `MPI_Init` | a `--node-aware` file on an MPICH without `num_nodes`/`ppn` conditions (before pmodels/mpich#8048) |
 | `precheck: X fails at ... without restrictions` | an unrestricted algorithm errors on a layout; it is left out; the message is MPICH's |
 | `Algorithm selected is not supported` in an error reply | a forced algorithm whose restriction fails, with `MPIR_CVAR_COLLECTIVE_FALLBACK=error` |
 
