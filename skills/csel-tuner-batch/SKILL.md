@@ -16,7 +16,7 @@ repo for the tools themselves; this file assumes them.
 
 | Block | Command | In → out | Cost |
 |---|---|---|---|
-| **create** | `bin/collmodel --algs all --coll-algorithms CAT ...` | → model `M0.json` | the budget (`--budget-node-h`) or less; precheck: one probe per algorithm × layout |
+| **create** | `bin/collmodel --algs all --catalog CAT ...` | → model `M0.json` | the budget (`--budget-node-h`) or less; precheck: one probe per algorithm × layout |
 | **add** | `bin/collmodel --model Mi.json --algs X[,Y] ...` or `--layouts NxP,...` | `Mi` → `Mi+1` | only the new measurements, plus a few anchors |
 | **add compositional** | `... --model Mi.json --algs smp --inner-selection Ti.json` | `Mi` → `Mi+1` | as add; the launch loads `Ti` |
 | **tree** | `bin/colltree Mi.json --out Ti.json [--node-aware]` | `Mi` → tuning file `Ti` | seconds to a minute on the login or compute node; no measurement |
@@ -50,7 +50,7 @@ Rules the tools enforce or assume:
 - **MPICH requirements.** The build under test needs the per-request
   algorithm switch (`MPISRV_CVAR_SWITCH=1`; MPICH main ≥ de0b8e6921), the
   `restrictions:` section and side-effect-free release_gather condition
-  (pmodels/mpich#8048, merged) for `--coll-algorithms`, and `dispatch=` for
+  (pmodels/mpich#8048, merged) for `--catalog`, and `dispatch=` for
   the default tree output (else `--nested-dispatch`). `mpisrv` must be
   rebuilt against the MPICH under test.
 - **Validate live.** The same algorithm can run at different speeds

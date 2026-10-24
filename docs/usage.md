@@ -104,13 +104,13 @@ bin/collmodel --op bcast \
 
 ```sh
 bin/collmodel --op bcast --algs all \
-    --coll-algorithms $MPICH_SRC/src/mpi/coll/coll_algorithms.txt \
+    --catalog $MPICH_SRC/src/mpi/coll/coll_algorithms.txt \
     --site aurora --nodes 8 --ppn 96 --budget-node-h 2 --out bcast.json --log bcast.jsonl
 ```
 
-- `--coll-algorithms` is the `coll_algorithms.txt` of the MPICH build under
+- `--catalog` is the `coll_algorithms.txt` of the MPICH build under
   test. `--algs all` takes every algorithm of the op from it (plus `nb`);
-  `--algs a,b,...` with `--coll-algorithms` takes those.
+  `--algs a,b,...` with `--catalog` takes those.
 - The run starts with a precheck: one probe call (`--probe-m`, 1 KB) of each
   algorithm at each allowed layout. The server runs with
   `MPIR_CVAR_COLLECTIVE_FALLBACK=error`, so an algorithm whose restriction
@@ -163,10 +163,10 @@ the model the run started from).
 ```sh
 CAT=$MPICH_SRC/src/mpi/coll/coll_algorithms.txt
 # an algorithm the model lacks (all: every one of the catalog's it lacks)
-bin/collmodel --model bcast.json --algs pipelined_tree --coll-algorithms $CAT \
+bin/collmodel --model bcast.json --algs pipelined_tree --catalog $CAT \
     --site aurora --nodes 8 --ppn 96 --budget-node-h 1 --out bcast2.json --log add.jsonl
 # more layouts for the algorithms it has
-bin/collmodel --model bcast.json --layouts 4x24,16x8 --coll-algorithms $CAT ... --out bcast2.json
+bin/collmodel --model bcast.json --layouts 4x24,16x8 --catalog $CAT ... --out bcast2.json
 ```
 
 - A new algorithm is prechecked at every layout; a new restriction moves
@@ -187,7 +187,7 @@ tuning file of their inner calls loaded in the launch:
 
 ```sh
 bin/colltree bcast.json --out bcast_tuning.json
-bin/collmodel --model bcast.json --algs smp --inner-selection bcast_tuning.json --coll-algorithms $CAT \
+bin/collmodel --model bcast.json --algs smp --inner-selection bcast_tuning.json --catalog $CAT \
     --site aurora --nodes 8 --ppn 96 --budget-node-h 1 --out bcast2.json --log add.jsonl
 bin/colltree bcast2.json --out bcast_tuning2.json
 ```

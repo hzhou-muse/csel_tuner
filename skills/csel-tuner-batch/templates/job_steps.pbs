@@ -74,7 +74,7 @@ step() {
         echo "$(date +%T) job end; $name: no time left in this job: re-submit"; exit 4
     fi
     echo "$(date +%T) $name $resume, deadline ${left}s"
-    "$PY" "$REPO/bin/collmodel" $model "$@" --coll-algorithms "$CAT" --site "$SITE" --nodes "$NODES" \
+    "$PY" "$REPO/bin/collmodel" $model "$@" --catalog "$CAT" --site "$SITE" --nodes "$NODES" \
         --ppn "$PPN" --budget-node-h "$budget" --log "$log" $resume --deadline "$left" --out "$out" $EXTRA
     local rc=$? st
     st=$(status "$out")

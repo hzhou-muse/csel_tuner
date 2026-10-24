@@ -374,7 +374,7 @@ shaped the design:
 ## 11. Restricted algorithms and staged sampling
 
 Status: implemented (`csel_tuner/algos.py`, `csel_tuner/restrict.py`,
-`bin/collmodel --coll-algorithms`, mpisrv `probe=1` and error replies) for
+`bin/collmodel --catalog`, mpisrv `probe=1` and error replies) for
 restricted algorithms and for compositional ones whose inner calls are
 their own op (bcast smp), tested on the replay (with `--replay-alias`), in
 local functional runs and live. Compositional algorithms across ops
@@ -389,7 +389,7 @@ single-node communicator MPICH's default instead takes
 unrestricted algorithms then overrides. The plan:
 
 **Algorithms.** The candidates are all of the op's algorithms, from `--algs`
-or (`--algs all`) from the build's `coll_algorithms.txt` (`--coll-algorithms
+or (`--algs all`) from the build's `coll_algorithms.txt` (`--catalog
 PATH`), checked against the items of the server's MPI_T enum for
 `MPIR_CVAR_<OP>_INTRA_ALGORITHM`. The file also gives each algorithm's leaf
 name (`func_name`, e.g. `MPIDI_POSIX_mpi_bcast_release_gather`), its extra

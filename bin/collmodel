@@ -19,10 +19,10 @@ or with any launcher (mpisrv and its max-m argument are appended):
 All of the op's algorithms, restricted ones included (docs/design.md,
 section 11), from the build's coll_algorithms.txt:
 
-    bin/collmodel --algs all --coll-algorithms $MPICH_SRC/src/mpi/coll/coll_algorithms.txt \\
+    bin/collmodel --algs all --catalog $MPICH_SRC/src/mpi/coll/coll_algorithms.txt \\
         --out bcast.json --site aurora --nodes 8 --ppn 96 --log bcast.log
 
-With --coll-algorithms the run starts with a precheck: one probe call of
+With --catalog the run starts with a precheck: one probe call of
 every algorithm at every allowed layout (the server runs with
 MPIR_CVAR_COLLECTIVE_FALLBACK=error, so an algorithm whose restriction
 fails returns an error). From it each layout gets the set of restrictive
@@ -35,8 +35,8 @@ calls go through the selection being built, so they are added afterwards.
 Add to a model (docs/design.md, section 12): algorithms, or layouts for the
 algorithms it has, at the cost of the new measurements only:
 
-    bin/collmodel --model bcast.json --algs pipelined_tree --coll-algorithms ... --out bcast2.json ...
-    bin/collmodel --model bcast.json --layouts 4x24,16x8 --coll-algorithms ... --out bcast2.json ...
+    bin/collmodel --model bcast.json --algs pipelined_tree --catalog ... --out bcast2.json ...
+    bin/collmodel --model bcast.json --layouts 4x24,16x8 --catalog ... --out bcast2.json ...
 
 A new algorithm is prechecked at every layout (a new restriction may move
 layouts to a new set) and sampled at the layouts the model has measured
@@ -53,7 +53,7 @@ loaded in the launch (MPIR_CVAR_COLL_SELECTION_JSON_FILE), after a check
 that those inner calls cannot run a compositional algorithm themselves:
 
     bin/colltree bcast.json --out bcast_tuning.json
-    bin/collmodel --model bcast.json --algs smp --inner-selection bcast_tuning.json --coll-algorithms ... \\
+    bin/collmodel --model bcast.json --algs smp --inner-selection bcast_tuning.json --catalog ... \\
         --out bcast2.json ...
 
 Its measurements record the file (by hash, the content kept in the model);
@@ -212,7 +212,7 @@ def live(a):
     if a.inner_selection:
         env["MPIR_CVAR_COLL_SELECTION_JSON_FILE"] = os.path.abspath(a.inner_selection)
     env.update(kv.split("=", 1) for kv in a.env)
-    several = len(a.algs) > 1 or bool(a.coll_algorithms) or bool(a.model)
+    several = len(a.algs) > 1 or bool(a.catalog) or bool(a.model)
     if a.switch != "request" and not several:
         env[OPS[a.op]] = a.algs[0]  # the launch's algorithm
     srv = Server(launcher=shlex.split(a.launcher), env=env, max_m=a.max_m, timeout=a.timeout,
@@ -421,10 +421,10 @@ def store_curves(model, built):
 
 
 def catalog_algs(a):
-    """(catalog Alg objects of the op, restriction bit names) from --coll-algorithms, or (None, [])."""
-    if not a.coll_algorithms:
+    """(catalog Alg objects of the op, restriction bit names) from --catalog, or (None, [])."""
+    if not a.catalog:
         return None, []
-    cat = Catalog.load(a.coll_algorithms)
+    cat = Catalog.load(a.catalog)
     cat.check(a.op)
     return cat.algorithms(a.op), cat.restriction_bits()
 
@@ -449,7 +449,7 @@ def restriction_sets(a, model, algs, probe):
         known = {x.name for x in algs}
         bad = [x for x in a.algs if x not in known]
         if bad:
-            sys.exit(f"--algs: not {a.op} algorithms in {a.coll_algorithms}: {', '.join(bad)}")
+            sys.exit(f"--algs: not {a.op} algorithms in {a.catalog}: {', '.join(bad)}")
         algs = [x for x in algs if x.name in a.algs]
     comp = compositional_names(a, algs)
     algs1 = [x for x in algs if x.name not in comp]
@@ -598,14 +598,14 @@ def extend(a, model, measure, probe, inner_hash, clock, nodes, on_layout, stop_c
     algs, bits = catalog_algs(a)
     if algs is not None:
         if bits[:len(m.conditions)] != m.conditions:
-            sys.exit(f"--coll-algorithms: its restrictions {bits} do not extend the model's {m.conditions}")
+            sys.exit(f"--catalog: its restrictions {bits} do not extend the model's {m.conditions}")
         m.conditions = bits
         by_name = {x.name: x for x in algs}
         for name in m.algorithms:
             if name in by_name:
                 m.algorithms[name] = alg_info(by_name[name], bits)
     elif m.conditions:
-        sys.exit("the model has restriction sets: give --coll-algorithms to add to it")
+        sys.exit("the model has restriction sets: give --catalog to add to it")
     else:
         by_name = {}
     if a.algs == ["all"]:       # the catalog's algorithms the model lacks (compositional ones need their file)
@@ -615,7 +615,7 @@ def extend(a, model, measure, probe, inner_hash, clock, nodes, on_layout, stop_c
         want = list(a.algs)
     for name in want:
         if algs is not None and name not in by_name:
-            sys.exit(f"--algs: {name} is not a {a.op} algorithm in {a.coll_algorithms}")
+            sys.exit(f"--algs: {name} is not a {a.op} algorithm in {a.catalog}")
     comp = [x for x in want if by_name.get(x) is not None and by_name[x].inner]
     if comp and not a.inner_selection and not a.replay:
         sys.exit(f"--algs: {', '.join(comp)} compositional: give --inner-selection (the tuning file of its "
@@ -799,7 +799,7 @@ def parse_args(argv):
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--alg", help="one algorithm (builder v1): a value of the op's algorithm CVAR")
     g.add_argument("--algs", help="several algorithms, comma-separated (builder v2: selection); all: every "
-                   "algorithm in --coll-algorithms")
+                   "algorithm in --catalog")
     ap.add_argument("--out", required=True, help="model file to write (JSON)")
     ap.add_argument("--model", metavar="MODEL", help="add to this model file (collmodel/4): the algorithms of "
                     "--algs that it does not have, and the layouts of --layouts")
@@ -810,7 +810,7 @@ def parse_args(argv):
     ap.add_argument("--drift-tol", type=float, default=1.10, help="warn when an anchor moved more than this")
     ap.add_argument("--import", dest="import_", action="append", default=[], metavar="MODEL3[:JOURNAL]",
                     help="convert collmodel/3 files (stage 1, then stage 2) with their journals into --out")
-    ap.add_argument("--coll-algorithms", metavar="PATH", help="the build's src/mpi/coll/coll_algorithms.txt: "
+    ap.add_argument("--catalog", metavar="PATH", help="the build's src/mpi/coll/coll_algorithms.txt: "
                     "restriction sets, with a precheck")
     ap.add_argument("--compositional", help="when creating a model: algorithms to leave for later, "
                     "comma-separated (default: those with an inner key in coll_algorithms.txt)")
@@ -867,8 +867,8 @@ def parse_args(argv):
             ap.error("--out must not be the --model file (a resumed run needs the model it started from)")
     elif a.layouts:
         ap.error("--layouts needs --model")
-    if a.algs == ["all"] and not a.coll_algorithms:
-        ap.error("--algs all needs --coll-algorithms")
+    if a.algs == ["all"] and not a.catalog:
+        ap.error("--algs all needs --catalog")
     if a.site:
         if not (a.nodes and a.ppn):
             ap.error("--site needs --nodes and --ppn")
@@ -901,7 +901,7 @@ def main(argv=None):
     inner_hash = file_hash(inner_text) if inner_text else None
     journal = Journal(a.log, a.resume)
     srv = None
-    v1 = not a.model and len(a.algs) == 1 and not a.coll_algorithms
+    v1 = not a.model and len(a.algs) == 1 and not a.catalog
     built = []      # [(mask, layouts, algorithm names, builder)], in build order (creating a model)
     model, run = None, None
     try:
@@ -993,7 +993,7 @@ def main(argv=None):
         if base is not None:
             run = extend(a, model, measure, prober, inner_hash, clock, nodes, on_layout, stop_check, cost)
         else:
-            if a.coll_algorithms:
+            if a.catalog:
                 sets = restriction_sets(a, model, catalog_algs(a)[0], prober)
             else:
                 sets = [(0, layouts, a.algs)]

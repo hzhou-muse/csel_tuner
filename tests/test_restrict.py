@@ -206,7 +206,7 @@ def test_two_set_replay():
             f.write(CATALOG)
         model, tuning = os.path.join(tmp, "m.json"), os.path.join(tmp, "t.json")
         subprocess.run([sys.executable, os.path.join(REPO, "bin", "collmodel"), "--replay", "--algs", "all",
-                        "--coll-algorithms", cat, "--replay-alias", "release_gather=auto@single",
+                        "--catalog", cat, "--replay-alias", "release_gather=auto@single",
                         "--budget-node-h", "0.5", "--out", model], check=True, capture_output=True)
         from csel_tuner.model import Model
         d = Model.load(model)
@@ -241,10 +241,10 @@ def test_compositional_add_replay():
         m1, t1, m2, t2 = (os.path.join(tmp, x) for x in ("m1.json", "t1.json", "m2.json", "t2.json"))
         run = lambda *args: subprocess.run([sys.executable, *args], check=True, capture_output=True, text=True)
         alias = ["--replay-alias", "release_gather=auto@single", "--replay-alias", "smp=scatter_ring_allgather@hier"]
-        run(os.path.join(REPO, "bin", "collmodel"), "--replay", "--algs", "all", "--coll-algorithms", cat,
+        run(os.path.join(REPO, "bin", "collmodel"), "--replay", "--algs", "all", "--catalog", cat,
             *alias, "--budget-node-h", "0.3", "--out", m1)
         run(os.path.join(REPO, "bin", "colltree"), m1, "--out", t1)
-        run(os.path.join(REPO, "bin", "collmodel"), "--replay", "--model", m1, "--algs", "smp", "--coll-algorithms",
+        run(os.path.join(REPO, "bin", "collmodel"), "--replay", "--model", m1, "--algs", "smp", "--catalog",
             cat, *alias, "--inner-selection", t1, "--out", m2)
         d = Model.load(m2)
         assert sorted(d.sets()) == [0, 8, 16] and all(n > 1 and q > 1 for n, q in d.sets()[8])
@@ -260,7 +260,7 @@ def test_compositional_add_replay():
         # a compositional algorithm needs the file of its inner calls when live; a second run with
         # another file replaces its curves
         r = run(os.path.join(REPO, "bin", "collmodel"), "--replay", "--model", m2, "--algs", "smp",
-                "--coll-algorithms", cat, *alias, "--inner-selection", t2, "--anchors", "0",
+                "--catalog", cat, *alias, "--inner-selection", t2, "--anchors", "0",
                 "--out", os.path.join(tmp, "m3.json"))
         assert "its curves are replaced" in r.stderr
         d3 = Model.load(os.path.join(tmp, "m3.json"))
