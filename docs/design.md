@@ -5,10 +5,12 @@ node-hour budget and produces a tuning file for MPICH's collective
 selection (CSEL). This document describes how it works and why. For how to
 run it, see [usage.md](usage.md).
 
-Status (2026-10-22): the server, the three builders and the tree output are
-implemented and tested on replays of recorded measurements and in local
-functional runs; live validation is the next step. MPI_Bcast is the only
-collective wired through the builders so far.
+Status (2026-10-24): the server, the three builders, the tree output and
+the restricted / compositional algorithms of §11 are implemented, tested on
+replays and in local functional runs, and validated live on a large system
+(MPI_Bcast, the only collective wired through the builders so far). §12 is
+the target design for incremental models and batch strategies, not yet
+implemented.
 
 ## 1. Goal
 
@@ -345,6 +347,13 @@ shaped the design:
   model predicted unmeasured layouts better than a forest on (N, ppn, m),
   also with power-of-two features. The model file is orders of magnitude
   smaller, and its inference is a few dozen lines that port to C.
+- **The selection path can change an algorithm's time.** On a single-node
+  communicator, small bcasts with `release_gather` were consistently faster
+  under MPICH's built-in selection with no file loaded than forced by its
+  CVAR, and slower still when a tuning file selected it, well beyond the
+  repetitions' spread; the launches differed only in the file. On a smaller
+  communicator the three agreed. The cause was not found. Validation
+  therefore times the tuned launch itself, not only the chosen algorithm.
 
 ## 11. Restricted algorithms and staged sampling
 
@@ -502,12 +511,151 @@ MPICH's default, per restriction set (e.g. single-node / multi-node).
   every layout; with #8048 calls on internal sub-communicators fall back
   silently.
 
-## 12. Limitations and next steps
+## 12. Incremental models and batch strategies
 
-- **Restricted and compositional algorithms** (§11): not implemented yet.
-  Until then a file overrides MPICH's `release_gather` on single-node
-  communicators.
-- **Node-aware CSEL conditions** (`num_nodes`, `ppn`) need MPICH support.
+Status (2026-10-24): target design, not implemented. It replaces the
+stages of §11 as a property of the tools; §11's restriction sets, dispatch
+and two-stage check stay.
+
+**Principle.** Two tools around one model file, and the plan of what to
+measure when outside both:
+
+- `collmodel` measures algorithms into a model. It reads the existing
+  model to decide where and how densely to sample, so an algorithm can be
+  added, or an existing one refined on more layouts, at the cost of the new
+  measurements only.
+- `colltree` turns a model into a tuning file. It measures nothing and runs
+  in seconds, so it can be
+  rerun with other settings at will.
+- A **batch strategy** (which algorithms, collectives and layouts, in which
+  jobs, within which node-hours) is a sequence of calls to the two tools
+  and a validation. Stage 1 + stage 2 of §11 is one such strategy.
+
+### 12.1 The model file: data and fit
+
+One file (collmodel/4) with two sections:
+
+- **`data`**, the source of truth: every measurement as a record (op,
+  algorithm, N, ppn, m, the repetitions `t_us`, `wall_us`, the job, the
+  inner selection it ran under, an anchor flag), indexed by (algorithm,
+  layout, size); a job table (hosts, start and end, MPICH version and
+  commit, the MPI environment, tool version); the precheck results per
+  (algorithm, layout) with the job and the error message; the catalog's
+  restriction bit names by index; and each inner selection file by content
+  hash, with its content (tens of kB).
+- **`fit`**, derived: the per-algorithm layout models (§5) per restriction
+  set, the selection and the regret estimate, with the fitting code's
+  version. `collmodel --refit` recomputes it from `data`; any tool that
+  finds an older fit version refits.
+
+*Alternative, not adopted for now:* store only `data` and fit on load. The
+fit is a function of the data and the fitter version (per-layout PCHIP and
+the penalty a(m): seconds, less than building
+the tree), and fitting from measured points would free
+it from the 4-per-octave grid, which now fixes the size resolution of
+crossovers and thresholds at one grid step (about 19%); off-grid sizes
+could bracket a jump to a few bytes. The costs: rules the stored curve now
+hides (the value at sizes pruned at a layout, merging repeated measurements
+of a point across jobs) and a refit in every tool that reads the model.
+
+The **journal** stays a per-job crash log for `--resume` (§4) and audit.
+At the end of a job its measurements are merged into `data`
+(`collmodel --merge JOURNAL` does the same for a job killed before that);
+nothing reads a journal for sampling decisions. A journal is unsuited for
+that, not because of size (ten thousand measurements are a few MB and
+parse in under a second) but because of its semantics: it is one job's requests in
+order, keyed by the exact request, with probes and error replies mixed in,
+and replays only in order up to the first miss. A merged, deduplicated
+table with provenance is what sampling and fitting need, and one file is
+also what moves between clusters and kits. Existing collmodel/3 models
+import from their journals.
+
+### 12.2 collmodel: measure into a model
+
+`bin/collmodel --model M.json [--algs A,B] [--layouts ...]
+[--inner-selection F.json] [budget, stop]` creates M or adds to it.
+
+- **Sampling from the whole model.** Pruning (§6) compares a candidate's
+  predicted time with the predicted best of every algorithm already in the
+  model and allowed at the layout; refinement covers crossovers with old
+  algorithms too. Adding an algorithm cannot make old pruning wrong: the
+  best only gets faster, so a size skipped as > 2x slower stays so, and an
+  old winner is already sampled densely where the new algorithm would have
+  to beat it. A new algorithm is therefore cheap where it clearly loses.
+- **Same layouts.** A new algorithm is sampled on the model's measured
+  layouts (a coarse pass, then refinement where it contends), so every
+  comparison is between measured curves; it may stop early on layouts
+  where it is nowhere near the best.
+- **Refining existing algorithms.** New layouts (`--layouts`, or the
+  layout loop of §5 continuing) get every allowed algorithm, pruned against
+  the prediction; their measurements merge into `data` and the fit is
+  redone.
+- **Incremental precheck.** Only (algorithm, layout) pairs without a
+  precheck record are probed. Restriction bits are matched by name: a
+  catalog that appends conditions is compatible (old masks keep their
+  meaning, §11), a renamed or removed one is an error. An algorithm with a
+  new restriction moves the layouts where it runs to a new mask; that set
+  holds the old algorithms' data for those layouts plus the new one.
+- **Anchors.** Each job remeasures a few points of the predicted best at
+  layouts measured by earlier jobs and stores them as anchors. Their ratio
+  to the stored values is the drift between jobs (other nodes, other days),
+  reported and kept, not corrected; a large one asks for remeasuring rather
+  than mixing.
+- **Compositional algorithms** are measured with `--inner-selection`
+  loaded (§11), and their records carry that file's hash. No `auto`
+  candidate is needed: smp's curves compete directly with the other
+  algorithms'. The two-stage check of §11 still runs on the precheck.
+- **Stop** by the regret estimate of the whole model, the budget, a
+  deadline or SIGTERM, as now. `--resume` within a job is unchanged.
+
+### 12.3 colltree: one model, one file
+
+- **Sets** from the model's layout masks, as §11; subtrees built in order
+  of increasing mask, so every subset exists before its supersets; r0 is
+  always built (the run-time fallback of the dispatch).
+- **Candidates of set S:** each algorithm allowed in S as a leaf, and
+  `call=<op>-intra-<T>` for each built subtree T with mask a proper subset
+  of S whose leaves use at least `--min-fallback-algs` distinct algorithms.
+  A subtree with fewer is not worth the call; its algorithms enter S
+  directly. Every candidate is scored at S's own layouts: a `call=` leaf at
+  a point costs T's tree's choice evaluated there, not T's fit on its own
+  layouts. (Today every set falls back to r0, which is fitted on all
+  layouts and without node-aware conditions chooses by comm_size alone: the
+  single-node set can hand large messages to the algorithm that wins at
+  the same p across nodes.)
+- **Staleness check for compositional algorithms.** For every
+  compositional algorithm the output uses, colltree compares the output's
+  choices at its inner layouts (node_comm: (1, ppn), node_roots_comm:
+  (N, 1); other ops from their files) with those of the inner selection
+  its data were measured under, and lists the layouts where they differ as
+  "remeasure". With the two-stage check this converges in one remeasure.
+- The stage-specific paths of §11 (`MODEL1 MODEL2`, `auto` leaves) go.
+
+### 12.4 Batch strategies
+
+What a strategy weighs: node-hours and queue limits (job length, nodes per
+job), the collectives to cover and their inner dependencies (allreduce smp
+needs reduce and bcast files), how complete the algorithm set must be, the
+allocation sizes, and when to validate. Examples:
+
+- **All at once** (§11's stages): every non-compositional algorithm, tree,
+  compositional algorithms with that file loaded, tree, validation.
+- **Start small:** MPICH's default algorithms first, a file early, the
+  rest added in later jobs as node-hours allow.
+- **Several collectives:** ops in the order of their inner dependencies,
+  one model per op, compositional algorithms after their inner ops' files.
+- **Remeasure:** after a staleness report or a large anchor drift.
+
+For now strategies are a usage guide written for an AI to turn into a
+handoff kit (job scripts, plans, checkpoints, the expected outputs) or an
+execution plan; an orchestration tool may follow once they settle.
+Validation stays part of every strategy: the same algorithm can cost
+differently by how it is selected (§10), which no model of forced
+measurements predicts.
+
+## 13. Limitations and next steps
+
+- **Incremental models** (§12): not implemented.
 - **Collectives:** only bcast is wired through the builders (`OPS` in
   `bin/collmodel`, leaf parameters in `bin/colltree`); mpisrv also measures
   allreduce and ping-pong.
