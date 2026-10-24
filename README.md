@@ -52,6 +52,11 @@ JSON selection), Python ≥ 3.6 with numpy; pandas only for replay and tests.
 
 - [docs/usage.md](docs/usage.md): building, site configuration, running,
   options, loading the tuning file, replay, troubleshooting.
+- [skills/csel-tuner-batch](skills/csel-tuner-batch/SKILL.md): batch
+  strategies, a guide written as a Claude Code skill: which algorithms,
+  layouts and collectives to measure in which jobs, and how to package that
+  as a handoff kit (job script and operator plan templates). Copy or link
+  the directory into `~/.claude/skills/` to use it as a skill.
 - [docs/design.md](docs/design.md): the server and its measurement method,
   the three builders, file formats, evaluation by replay, and the lessons
   from measurements behind the design.
@@ -66,5 +71,6 @@ launch/       config.sh, sites/*.sh
 replay/       replay of recorded measurements: converter, scripts
 groundtruth/  batch-mode plans, runner, checks
 docs/         design.md, usage.md
+skills/       csel-tuner-batch: batch strategies and kit templates, as a Claude Code skill
 tests/        quick checks
 ```

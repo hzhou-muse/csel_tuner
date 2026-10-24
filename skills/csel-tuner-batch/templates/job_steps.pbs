@@ -1,0 +1,109 @@
+#!/bin/bash
+# <KIT NAME>, job 1: build the models and tuning files (csel_tuner create /
+# add / tree steps). Submit from the kit directory:  qsub job_steps.pbs
+# Re-submitting continues: a finished step is skipped, an unfinished one
+# resumes from its journal.
+#PBS -N <name>
+#PBS -A <project>
+#PBS -l select=<nodes>
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home
+#PBS -q <queue>
+#PBS -j oe
+set -u
+cd "${PBS_O_WORKDIR:-.}"
+# site settings (the operator may adjust these, and records it)
+REPO=${CSEL_TUNER:-$HOME/csel_tuner}
+PY=${PYTHON:-python3}
+MPICH_SRC=${MPICH_SRC:-<mpich source tree>}
+SITE=${SITE:-<site>}                     # launch/sites/<site>.sh
+NODES=${NODES:-<nodes>}
+PPN=${PPN:-<ranks per node>}
+WALL=${WALL:-3600}                       # this job's walltime in seconds
+EXTRA=${EXTRA:-}                         # e.g. "--max-m 65536" for a local dry run
+# --------------------------------------------------------------------------
+CAT=$MPICH_SRC/src/mpi/coll/coll_algorithms.txt
+[ -x "$REPO/bin/collmodel" ] || { echo "FATAL: no csel_tuner repository at $REPO (set CSEL_TUNER)"; exit 1; }
+grep -q '^restrictions:' "$CAT" 2>/dev/null || { echo "FATAL: $CAT has no restrictions: section (set MPICH_SRC)"; exit 1; }
+export SITE MPISRV_CVAR_SWITCH=1
+T0=$(date +%s)
+mkdir -p results
+echo "$(date +%T) job ${PBS_JOBID:-local} start"
+
+{   # the compute node's environment, the MPICH and catalog under test
+    date -Is; hostname; sort -u "${PBS_NODEFILE:-/dev/null}"
+    command -v "$PY"; "$PY" --version
+    "$PY" -c 'import numpy; print("numpy", numpy.__version__)'
+    git -C "$REPO" log -1 --format='csel_tuner %h %s'
+    git -C "$MPICH_SRC" log -1 --format='mpich %h %ci %s'
+    sha256sum "$CAT"
+} >> results/env_compute.txt 2>&1
+cp -n "$CAT" results/coll_algorithms.txt
+"$PY" -c 'import numpy' || { echo "FATAL: numpy does not import on the compute node"; exit 1; }
+
+# status MODEL: complete | budget (finished, stopped by its cap) | partial:<stop> | missing
+status() {
+    "$PY" - "$1" <<'EOF'
+import json, sys
+try:
+    r = json.load(open(sys.argv[1]))["runs"][-1]
+except Exception:
+    print("missing"); sys.exit()
+if r["mode"] == "create":
+    print("complete" if r.get("complete") else "partial:" + str(r.get("stop")))
+else:
+    print("complete" if r["stop"] == "done" else "budget" if r["stop"] == "budget" else "partial:" + str(r["stop"]))
+EOF
+}
+
+# step NAME MODEL_IN|- BUDGET_NODE_H RESERVE_S [collmodel arguments ...]
+#   create (MODEL_IN -) or add to MODEL_IN; writes results/NAME.json, journal results/NAME.jsonl.
+#   RESERVE_S: seconds of the walltime kept for the steps after this one.
+step() {
+    local name=$1 in=$2 budget=$3 reserve=$4
+    shift 4
+    local out=results/$name.json log=results/$name.jsonl
+    case $(status "$out") in
+        complete|budget) echo "$(date +%T) $name: done ($(status "$out"))"; return 0 ;;
+    esac
+    local resume="" model=""
+    [ -s "$log" ] && resume=--resume
+    [ "$in" != - ] && model="--model $in"
+    local left=$((WALL - ($(date +%s) - T0) - reserve - 300))
+    if [ "$left" -lt 300 ]; then
+        echo "$(date +%T) job end; $name: no time left in this job: re-submit"; exit 4
+    fi
+    echo "$(date +%T) $name $resume, deadline ${left}s"
+    "$PY" "$REPO/bin/collmodel" $model "$@" --coll-algorithms "$CAT" --site "$SITE" --nodes "$NODES" \
+        --ppn "$PPN" --budget-node-h "$budget" --log "$log" $resume --deadline "$left" --out "$out" $EXTRA
+    local rc=$? st
+    st=$(status "$out")
+    case $st in
+        complete|budget) ;;
+        missing) echo "$(date +%T) job end; $name failed (rc $rc, see above): report it"; exit 5 ;;
+        *) echo "$(date +%T) job end; $name $st: re-submit"; exit 4 ;;
+    esac
+}
+
+# tree MODEL OUT [colltree arguments ...]: the tuning file, its report in OUT.txt
+tree() {
+    local model=$1 out=$2
+    shift 2
+    "$PY" "$REPO/bin/colltree" "$model" --out "$out" "$@" | tee "${out%.json}.txt"
+}
+
+# ---- the strategy: edit this part ------------------------------------------
+# Example: all at once for bcast, then the compositional smp, then one remeasure if stale.
+step m0 - 3 1200 --algs all
+tree results/m0.json results/t0.json
+tree results/m0.json results/t0_node-aware.json --node-aware
+step m1 results/m0.json 1 300 --algs smp --inner-selection "$PWD/results/t0.json"
+tree results/m1.json results/t1.json
+tree results/m1.json results/t1_node-aware.json --node-aware
+if grep -q '^stale:' results/t1.txt; then
+    step m2 results/m1.json 1 0 --algs smp --inner-selection "$PWD/results/t1.json"
+    tree results/m2.json results/t2.json
+    tree results/m2.json results/t2_node-aware.json --node-aware
+fi
+# ------------------------------------------------------------------------------
+echo "$(date +%T) job end; all steps done"

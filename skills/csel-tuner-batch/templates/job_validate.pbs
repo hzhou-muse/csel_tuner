@@ -1,0 +1,42 @@
+#!/bin/bash
+# <KIT NAME>, job 2: validate the tuning file at random points the builder
+# did not choose. Needs the finished models and tuning files of job 1 and
+# the plans from gen_plans.py (operator plan, Step 2). Submit from the kit
+# directory:  qsub job_validate.pbs   Re-submitting continues.
+#PBS -N <name>_val
+#PBS -A <project>
+#PBS -l select=<nodes>
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home
+#PBS -q <queue>
+#PBS -j oe
+set -u
+cd "${PBS_O_WORKDIR:-.}"
+REPO=${CSEL_TUNER:-$HOME/csel_tuner}
+PY=${PYTHON:-python3}
+SITE=${SITE:-<site>}
+MODEL=${MODEL:-results/m1.json}              # the last model of job 1
+TUNING=${TUNING:-$PWD/results/t1.json}       # the file to validate (absolute path)
+TUNING_NA=${TUNING_NA:-$PWD/results/t1_node-aware.json}
+TRUTH_WITH_FILE=${TRUTH_WITH_FILE:-1}        # 1 when the model has a compositional algorithm
+[ -x "$REPO/bin/collmodel" ] || { echo "FATAL: no csel_tuner repository at $REPO (set CSEL_TUNER)"; exit 1; }
+export SITE MPISRV_CVAR_SWITCH=1
+echo "$(date +%T) job ${PBS_JOBID:-local} start"
+for f in "$MODEL" "$TUNING"; do
+    [ -s "$f" ] || { echo "$f is missing: finish job 1 first"; exit 3; }
+done
+[ -s plans/validate/truth/launches.txt ] || { echo "no plans/validate: run the plan's Step 2 first"; exit 3; }
+
+# every algorithm per request (the truth), MPICH's default, MPICH with the tuning file
+truth_env=""
+[ "$TRUTH_WITH_FILE" = 1 ] && truth_env="MPIR_CVAR_COLL_SELECTION_JSON_FILE=$TUNING"
+env $truth_env "$REPO/groundtruth/run_set.sh" plans/validate/truth results/validate/truth 2100
+"$REPO/groundtruth/run_set.sh" plans/validate/default results/validate/default 450
+MPIR_CVAR_COLL_SELECTION_JSON_FILE=$TUNING \
+    "$REPO/groundtruth/run_set.sh" plans/validate/tuned results/validate/tuned 450
+
+"$PY" "$REPO/groundtruth/score_live.py" validate --truth results/validate/truth \
+    --default results/validate/default --tuned results/validate/tuned --model "$MODEL" \
+    --tuning "$TUNING" --tuning-node-aware "$TUNING_NA" --json results/validate.json > results/validate_report.md
+cat results/validate_report.md
+echo "$(date +%T) job end"
