@@ -157,6 +157,7 @@ def summary(r):
 
 
 def validate(a):
+    from csel_tuner.restrict import GPU
     from csel_tuner.tree import json_choice
     model = load_model(a.model)
     measured = set(model.measured_layouts())
@@ -200,6 +201,7 @@ def validate(a):
         best = min(list(t.values()) + ([default[(None, n, q, m)]] if (None, n, q, m) in default else []))
         x = {"p": n * q, "m": m, "N": n, "ppn": q, "pof2": float((n * q) & (n * q - 1) == 0),
              "cond": {b: bool(mask >> k & 1) for k, b in enumerate(bits)}}
+        x["cond"][GPU] = model.mem == "device"     # a file of host and device models starts with gpu
         i = int(np.argmin(np.abs(np.log2(sizes) - np.log2(max(m, 1)))))
         alg = model_choice(mask, n, q, i)
         r = {"model, per point": t[alg] / best if alg in t else float("nan")}

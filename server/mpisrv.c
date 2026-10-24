@@ -1,7 +1,7 @@
 /* MPI benchmark server: a long-lived job that serves measurement requests.
  *
  * Usage: mpiexec -n P mpisrv [max-m] [--plan FILE --out FILE [--deadline SEC]
- *                                     [--resume]] [--cold]
+ *                                     [--resume]] [--cold] [--mem host|device]
  *
  * Interactive mode (default): rank 0 reads one request per line from stdin
  * and writes one JSON reply per line to stdout. Batch mode (--plan): rank 0
@@ -67,6 +67,14 @@
  * is {"status":"error","seq":..,"layout":..,"cvars":..,"msg":"<MPI error>"}.
  * See docs/design.md.
  *
+ * --mem device puts the send and receive buffers in GPU memory (gpu.c, built
+ * with make GPU=ze|cuda|fake), one device per rank: each rank must see exactly
+ * one, which the launch arranges (launch/gpu_bind.sh, which reports a rank it
+ * cannot bind in MPISRV_BIND_ERROR: every rank then fails); ranks of a node that
+ * share a device are listed in "topology_warnings". The buffers are allocated
+ * once, so caches keyed by buffer (IPC handles, NIC registrations) are warm
+ * after the first call; --cold and check=1 need host buffers.
+ *
  * Environment: MPISRV_IDLE selects how ranks wait for the next request:
  *   spin  (default) MPI_Test every MPISRV_IDLE_NS ns (default 50000), with a
  *         pause-instruction loop in between: no MPI progress, no syscalls,
@@ -92,6 +100,7 @@
 #include <time.h>
 #include <poll.h>
 #include <unistd.h>
+#include "gpu.h"
 
 #define MAX_BATCHES 1000
 #define MAX_COMMS 512
@@ -149,6 +158,7 @@ static const char *place_names[] = { "compact", "spread", "nic" };
 static int *node_of, *local_of; /* per world rank */
 static long max_m;
 static int cold_ok;
+static int mem_device;          /* --mem device: buffers in GPU memory */
 static long idle_ns = 50000;
 enum idle { IDLE_SPIN, IDLE_SLEEP, IDLE_BUSY, IDLE_SPLIT };
 static int idle_mode = IDLE_SPIN;
@@ -306,6 +316,86 @@ static void init_site(void)
                 nic_groups_ok = 0;
     if (world_rank == 0 && topo_warn[0])
         fprintf(stderr, "mpisrv: topology: %s\n", topo_warn);
+}
+
+/* ---- buffers ----------------------------------------------------------- */
+
+/* Ranks of one node that share a GPU, as a topology warning. */
+static void check_devices(void)
+{
+    unsigned char mine[GPU_UUID_LEN], *all = malloc((size_t) GPU_UUID_LEN * world_size);
+    gpu_uuid(mine);
+    MPI_Allgather(mine, GPU_UUID_LEN, MPI_BYTE, all, GPU_UUID_LEN, MPI_BYTE, MPI_COMM_WORLD);
+    for (int r = 0; r < world_size; r++)
+        for (int q = r + 1; q < world_size; q++)
+            if (node_of[q] == node_of[r] &&
+                !memcmp(all + (size_t) r * GPU_UUID_LEN, all + (size_t) q * GPU_UUID_LEN, GPU_UUID_LEN)) {
+                char msg[160];
+                snprintf(msg, sizeof(msg), "node %d: local ranks %d and %d share a GPU", node_of[r],
+                         local_of[r], local_of[q]);
+                warn(msg);
+                r = world_size;
+                break;
+            }
+    free(all);
+}
+
+static char *buf_alloc(long n, int byte)
+{
+    void *p = NULL;
+    if (mem_device) {
+        p = gpu_alloc(n);
+        if (p && gpu_fill(p, byte, n))
+            p = NULL;
+    } else if (!posix_memalign(&p, 4096, n)) {
+        memset(p, byte, n);
+    } else {
+        p = NULL;
+    }
+    return p;
+}
+
+/* sbuf and rbuf, in host or (--mem device) GPU memory. After init_site. */
+static void init_buffers(void)
+{
+    if (mem_device) {
+        char err[256] = "";
+        const char *bind_err = getenv("MPISRV_BIND_ERROR");    /* from launch/gpu_bind.sh */
+        int bad = 1, any;
+        if (bind_err)
+            snprintf(err, sizeof(err), "%s", bind_err);
+        else
+            bad = gpu_init(err, sizeof(err)) != 0;
+        MPI_Allreduce(&bad, &any, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        if (bad)
+            fprintf(stderr, "mpisrv: rank %d (node %d, local %d): %s\n", world_rank, my_node, my_local, err);
+        if (any)
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        size_t n = strlen(topo_warn);
+        check_devices();
+        if (world_rank == 0 && topo_warn[n])
+            fprintf(stderr, "mpisrv: topology: %s\n", topo_warn + n + (n ? 2 : 0));
+    }
+    long buflen = (cold_ok ? 2 : 1) * (max_m > 0 ? max_m : 1);
+    sbuf = buf_alloc(buflen, 1);
+    rbuf = buf_alloc(buflen, 0);
+    if (!sbuf || !rbuf) {
+        fprintf(stderr, "mpisrv: rank %d: cannot allocate %ld bytes of %s memory\n", world_rank, buflen,
+                mem_device ? "device" : "host");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+}
+
+static void free_buffers(void)
+{
+    if (mem_device) {
+        gpu_free(sbuf);
+        gpu_free(rbuf);
+        gpu_finalize();
+    } else {
+        free(sbuf);
+        free(rbuf);
+    }
 }
 
 /* Local rank of the j-th member on each node. For place=nic, ranks j < j'
@@ -621,6 +711,8 @@ static const char *parse(char *line, struct req *rq)
         return "batches must be in [1, 1000]";
     if (rq->target_us <= 0)
         return "target_us must be > 0";
+    if (rq->check && mem_device)
+        return "check=1 needs host buffers (the server runs with --mem device)";
     if (rq->cold && !cold_ok)
         return "cache=cold needs the server started with --cold";
     if (rq->op == OP_PINGPONG) {
@@ -867,8 +959,9 @@ static void reply_info(int seq)
         *nl = '\0';
     fprintf(out, "{\"status\":\"ok\",\"op\":\"info\",\"seq\":%d,\"world_size\":%d,\"nodes\":%d,"
             "\"min_ppn\":%d,\"nic_mod\":%d,\"num_close_nics\":%d,\"num_nics_available\":%d,"
-            "\"max_m\":%ld,\"cvar_switch\":%d,\"library\":\"", seq, world_size, num_nodes, min_ppn, nic_mod,
-            close_nics, nics_available, max_m, cvar_switch);
+            "\"max_m\":%ld,\"cvar_switch\":%d,\"mem\":\"%s\",\"gpu\":\"%s\",\"library\":\"", seq, world_size,
+            num_nodes, min_ppn, nic_mod, close_nics, nics_available, max_m, cvar_switch,
+            mem_device ? "device" : "host", mem_device ? gpu_runtime() : "");
     put_string(ver);
     fprintf(out, "\",\"hosts\":[");
     for (int n = 0, first = 1; n < num_nodes; n++)
@@ -1015,6 +1108,10 @@ int main(int argc, char **argv)
             resume = 1;
         else if (!strcmp(argv[i], "--cold"))
             cold_ok = 1;
+        else if (!strcmp(argv[i], "--mem") && i + 1 < argc && !strcmp(argv[i + 1], "host"))
+            mem_device = 0, i++;
+        else if (!strcmp(argv[i], "--mem") && i + 1 < argc && !strcmp(argv[i + 1], "device"))
+            mem_device = 1, i++;
         else if (argv[i][0] >= '0' && argv[i][0] <= '9')
             max_m = atol(argv[i]);
         else {
@@ -1022,6 +1119,11 @@ int main(int argc, char **argv)
                 fprintf(stderr, "mpisrv: unknown argument %s\n", argv[i]);
             MPI_Abort(MPI_COMM_WORLD, 2);
         }
+    }
+    if (mem_device && cold_ok) {
+        if (world_rank == 0)
+            fprintf(stderr, "mpisrv: --cold needs host buffers (not --mem device)\n");
+        MPI_Abort(MPI_COMM_WORLD, 2);
     }
     if (getenv("MPISRV_IDLE_NS"))
         idle_ns = atol(getenv("MPISRV_IDLE_NS"));
@@ -1034,11 +1136,7 @@ int main(int argc, char **argv)
     init_topology();
     init_site();
 
-    long buflen = (cold_ok ? 2 : 1) * (max_m > 0 ? max_m : 1);
-    if (posix_memalign((void **) &sbuf, 4096, buflen) || posix_memalign((void **) &rbuf, 4096, buflen))
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    memset(sbuf, 1, buflen);
-    memset(rbuf, 0, buflen);
+    init_buffers();
 
     char *done = NULL;
     int ndone = 0;
@@ -1131,8 +1229,7 @@ int main(int argc, char **argv)
         fclose(out);
     }
     free(done);
-    free(sbuf);
-    free(rbuf);
+    free_buffers();
     free(node_of);
     free(local_of);
     free(socket_of);

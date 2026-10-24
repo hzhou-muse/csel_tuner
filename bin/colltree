@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Turn a model file (collmodel/4, from bin/collmodel) into an MPICH
+"""Turn model files (collmodel/4, from bin/collmodel) into an MPICH
 collective-selection JSON (builder v3, csel_tuner/tree.py).
 
-    bin/colltree bcast.json --out bcast_tuning.json [--tol 0.005] [--node-aware]
+    bin/colltree bcast.json [bcast_gpu.json] --out bcast_tuning.json [--tol 0.005] [--node-aware]
 
 Then run with MPIR_CVAR_COLL_SELECTION_JSON_FILE=bcast_tuning.json (and the
 collective's algorithm CVAR left at auto). Older model files convert with
@@ -32,6 +32,18 @@ supersets':
   worst set 0); with --nested-dispatch, for an MPICH without it, nested
   restrictive conditions ending in "call=" those subtrees.
 
+Several models, one per memory kind of the buffers (a model's "mem": host,
+or device from bin/collmodel --mem device), go into one file with
+subtrees of their own: the host model's as above, the device model's as
+"name=<op>-intra-gpu-<S in hex>" with its own dispatch,
+"dispatch=<op>-intra-gpu(<bits>)", whose fallback is
+"<op>-intra-gpu-0", never a host subtree. In the device model the gpu
+restriction always holds, so it is left out of S and of the algorithms'
+restrictions (an algorithm restricted to gpu alone, e.g. buffer_swap, is
+unrestricted there). "name=<op>-intra-auto" then starts with the gpu
+condition: {"gpu": <device dispatch>, "any": <host dispatch>}. A host model
+is required; each memory kind at most once.
+
 A compositional algorithm (e.g. smp) was measured with a tuning file
 selecting its inner calls. Where the output chooses it, colltree compares
 the output's choices for those inner calls (on the node communicator and
@@ -52,7 +64,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 import numpy as np  # noqa: E402
 
 from csel_tuner.model import Model  # noqa: E402
-from csel_tuner.restrict import role_layout, set_name  # noqa: E402
+from csel_tuner.restrict import GPU, role_layout, set_name, set_prefix  # noqa: E402
 from csel_tuner.single import is_pof2  # noqa: E402
 from csel_tuner.tree import fit_tree, json_choice, json_tree, prune_to, select  # noqa: E402
 
@@ -91,16 +103,17 @@ def fit(X, L, feats, a):
     return prune_to(t, a.tol, a.max_regret)
 
 
-def dispatch(op, bits, present):
-    """The <op>-intra-auto subtree: nested conditions over the bits that some
-    present set uses, ending in call= the set of the conditions that hold, or
-    its largest present subset (restrictions are positive, so whatever a
-    subset allows is allowed there too; at worst set 0)."""
+def dispatch(op, bits, present, mem="host"):
+    """The <op>-intra-auto subtree (of a model of `mem` buffers): nested
+    conditions over the bits that some present set uses, ending in call= the
+    set of the conditions that hold, or its largest present subset
+    (restrictions are positive, so whatever a subset allows is allowed there
+    too; at worst set 0)."""
     used = [k for k in range(len(bits)) if any(s >> k & 1 for s in present)]
 
     def target(s):
         best = max((x for x in present if x & ~s == 0), key=lambda x: (bin(x).count("1"), -x))
-        return "call=" + set_name(op, best)
+        return "call=" + set_name(op, best, mem)
 
     def node(i, s):
         if i == len(used):
@@ -166,13 +179,21 @@ class Sets:
         opts = list(algs) + [("call", s) for s in calls]
         t, path = fit(X, np.column_stack(cols), self.feats, self.a)
         self.trees[mask] = (t, opts)
-        used = sorted({opts[l.alg] if not isinstance(opts[l.alg], tuple) else "call=" + set_name(m.op, opts[l.alg][1])
-                       for l in t.leaves()})
-        self.lines.append(f"{set_name(m.op, mask)}: {len(t.leaves())} leaves over {len(lays)} layouts x "
+        used = sorted({opts[l.alg] if not isinstance(opts[l.alg], tuple) else
+                       "call=" + set_name(m.op, opts[l.alg][1], m.mem) for l in t.leaves()})
+        self.lines.append(f"{set_name(m.op, mask, m.mem)}: {len(t.leaves())} leaves over {len(lays)} layouts x "
                           f"{len(self.sizes)} sizes; predicted geomean regret {path[0][1]:.4f} (full tree, "
                           f"{path[0][0]} leaves) -> {path[-1][1]:.4f}; candidates {len(opts)}; used: "
                           f"{', '.join(used)}")
         return True
+
+
+def drop_bit(model, bit):
+    """Leave a condition that holds everywhere in the model (gpu in a model of
+    device buffers) out of its layout masks and its algorithms' restrictions."""
+    model.masks = {lay: mk & ~bit for lay, mk in model.masks.items()}
+    for info in model.algorithms.values():
+        info["mask"] = info.get("mask", 0) & ~bit
 
 
 def stale(model, S, out, x_of, tol):
@@ -204,6 +225,9 @@ def stale(model, S, out, x_of, tol):
             if sec != op + "-intra":
                 notes.append(f"{c}: inner {inner} is another op; not checked")
                 continue
+            if comm not in ("node_comm", "node_roots_comm"):
+                notes.append(f"{c}: inner {inner}: not checked (only node_comm and node_roots_comm are)")
+                continue
             at = {}             # inner layout -> sizes at which some outer call uses c
             for lay, sizes in uses.items():
                 r = role_layout(lay, comm)
@@ -231,7 +255,8 @@ def stale(model, S, out, x_of, tol):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("model", help="model file (collmodel/4)")
+    ap.add_argument("model", nargs="+", help="model files (collmodel/4): one of host buffers, optionally one "
+                    "of device buffers")
     ap.add_argument("--out", required=True, help="selection JSON to write")
     ap.add_argument("--tol", type=float, default=0.005, help="allowed predicted geomean regret over the full tree")
     ap.add_argument("--node-aware", action="store_true", help="also split on num_nodes and ppn (MPICH with "
@@ -247,61 +272,93 @@ def main(argv=None):
     ap.add_argument("--nested-dispatch", action="store_true", help="dispatch on restrictions with nested "
                     "conditions (for an MPICH without dispatch=, pmodels/mpich#8048)")
     a = ap.parse_args(argv)
-    try:
-        m = Model.load(a.model)
-    except ValueError as e:
-        sys.exit(str(e))
-    op = m.op
+    models = []
+    for path in a.model:
+        try:
+            models.append(Model.load(path))
+        except ValueError as e:
+            sys.exit(str(e))
+    by_mem = {}
+    for path, m in zip(a.model, models):
+        if m.mem in by_mem:
+            sys.exit(f"{path}: a second model of {m.mem} buffers ({by_mem[m.mem][0]})")
+        by_mem[m.mem] = (path, m)
+    if "host" not in by_mem:
+        sys.exit("no model of host buffers (the run-time fallback)")
+    op = models[0].op
+    for path, m in zip(a.model, models):
+        if m.op != op:
+            sys.exit(f"{path}: a model of {m.op}, not {op}")
+    if "device" in by_mem:
+        path, m = by_mem["device"]
+        if GPU not in m.conditions:
+            sys.exit(f"{path}: a model of device buffers, but its catalog has no {GPU} restriction "
+                     "(MPICH cannot tell device buffers apart)")
+        drop_bit(m, 1 << m.conditions.index(GPU))
     feats = ["N", "ppn", "p", "m", "pof2"] if a.node_aware else ["p", "m", "pof2"]
     params = {k: dict(v) for k, v in PARAMS.get(op, {}).items()}
     for kv in a.param:
         k, v = kv.split("=", 1)
         alg, key = k.split(".", 1)
         params.setdefault(alg, {})[key] = parse_value(v)
-    S = Sets(m, a, feats)
-    sets = m.sets()
-    for mask in sorted(sets, key=lambda s: (bin(s).count("1"), s)):
-        S.build(mask, sets[mask])
-    if 0 not in S.trees:
-        sys.exit(f"{a.model}: no unrestricted algorithm with a model")
 
-    def sub(o):
-        if isinstance(o, tuple):
-            return "call=" + set_name(op, o[1])
-        return ("algorithm=" + m.leaf(o), params.get(o, {}))
-    out = {f"name={set_name(op, mask)}": json_tree(t, opts, sub) for mask, (t, opts) in sorted(S.trees.items())}
-    present = sorted(S.trees)
-    if a.nested_dispatch:
-        out[f"name={op}-intra-auto"] = dispatch(op, m.conditions, present)
-    else:
-        bits = 0
-        for s in present:
-            bits |= s
-        out[f"name={op}-intra-auto"] = "dispatch=%s-intra(0x%x)" % (op, bits) if bits else "call=" + set_name(op, 0)
+    out, disp, built = {}, {}, []
+    for mem in ("host", "device"):
+        if mem not in by_mem:
+            continue
+        path, m = by_mem[mem]
+        S = Sets(m, a, feats)
+        sets = m.sets()
+        for mask in sorted(sets, key=lambda s: (bin(s).count("1"), s)):
+            S.build(mask, sets[mask])
+        if 0 not in S.trees:
+            sys.exit(f"{path}: no unrestricted algorithm with a model")
+
+        def sub(o, m=m):
+            if isinstance(o, tuple):
+                return "call=" + set_name(op, o[1], m.mem)
+            return ("algorithm=" + m.leaf(o), params.get(o, {}))
+        out.update({f"name={set_name(op, mask, mem)}": json_tree(t, opts, sub)
+                    for mask, (t, opts) in sorted(S.trees.items())})
+        present = sorted(S.trees)
+        if a.nested_dispatch:
+            disp[mem] = dispatch(op, m.conditions, present, mem)
+        else:
+            bits = 0
+            for s in present:
+                bits |= s
+            disp[mem] = "dispatch=%s(0x%x)" % (set_prefix(op, mem), bits) if bits else \
+                "call=" + set_name(op, 0, mem)
+        built.append((path, m, S))
+    out[f"name={op}-intra-auto"] = {GPU: disp["device"], "any": disp["host"]} if "device" in disp else \
+        disp["host"]
     depth = json_depth(out)
     if depth > 64:
         sys.exit(f"tree nests {depth} levels; MPICH's parser allows 64 (try a larger --tol)")
     with open(a.out, "w") as f:
         json.dump(out, f, indent=2)
         f.write("\n")
-    for line in S.lines:
-        print(line)
+    for path, m, S in built:
+        for line in S.lines:
+            print(line)
     print(f"{a.out}: features {','.join(feats)}; nesting {depth}")
 
-    def x_of(lay, size):
-        n, q = lay
-        mk = m.masks.get(lay, 0)
-        return {"p": n * q, "m": size, "N": n, "ppn": q, "pof2": float(is_pof2(n * q)),
-                "cond": {b: bool(mk >> k & 1) for k, b in enumerate(m.conditions)}}
-    found, notes = stale(m, S, out, x_of, a.stale_tol)
-    for n in notes:
-        print("staleness check: " + n)
-    for c, inner, r, ss, new, was, ratio in found:
-        print(f"stale: {c}'s inner {inner} at N={r[0]} ppn={r[1]}, {len(ss)} sizes ({ss[0]}..{ss[-1]}): the output "
-              f"selects {new}, {c} was measured with {was} (predicted {ratio:.2f}x)")
-    if found:
-        print(f"remeasure: bin/collmodel --model {a.model} --algs "
-              f"{','.join(sorted({c for c, *_ in found}))} --inner-selection {a.out} ...")
+    for path, m, S in built:
+        def x_of(lay, size, m=m):
+            n, q = lay
+            mk = m.masks.get(lay, 0)
+            cond = {b: bool(mk >> k & 1) for k, b in enumerate(m.conditions)}
+            cond[GPU] = m.mem == "device"   # left out of a device model's masks (drop_bit)
+            return {"p": n * q, "m": size, "N": n, "ppn": q, "pof2": float(is_pof2(n * q)), "cond": cond}
+        found, notes = stale(m, S, out, x_of, a.stale_tol)
+        for n in notes:
+            print("staleness check: " + n)
+        for c, inner, r, ss, new, was, ratio in found:
+            print(f"stale: {c}'s inner {inner} at N={r[0]} ppn={r[1]}, {len(ss)} sizes ({ss[0]}..{ss[-1]}): the "
+                  f"output selects {new}, {c} was measured with {was} (predicted {ratio:.2f}x)")
+        if found:
+            print(f"remeasure: bin/collmodel --model {path} --algs "
+                  f"{','.join(sorted({c for c, *_ in found}))} --inner-selection {a.out} ...")
 
 
 if __name__ == "__main__":

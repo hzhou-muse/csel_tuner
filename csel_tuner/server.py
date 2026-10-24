@@ -36,13 +36,13 @@ def warmup_sizes(max_m, step=4):
 
 class Server:
     def __init__(self, nprocs=2, env=None, bind=("-bind-to", "core"), launcher=None,
-                 max_m=1 << 24, timeout=120, log=None, warmup=("pingpong",), server=SERVER):
+                 max_m=1 << 24, timeout=120, log=None, warmup=("pingpong",), server=SERVER, args=()):
         """launcher: full command prefix (e.g. ["srun", "--input=0", ...]);
         default is the local mpiexec with -n nprocs and `bind`. server: the
-        mpisrv binary.
+        mpisrv binary; args: its options after max-m (e.g. ["--mem", "device"]).
         warmup: ops to sweep over a coarse size grid right after start."""
         self.cmd = (list(launcher) if launcher else [MPIEXEC, "-n", str(nprocs), *bind]) + \
-            [server, str(max_m)]
+            [server, str(max_m), *args]
         self.env = dict(os.environ, **(env or {}))
         self.max_m = max_m
         self.timeout = timeout

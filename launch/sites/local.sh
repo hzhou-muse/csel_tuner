@@ -4,4 +4,6 @@
 NODE_CORES=0-7; SOCKETS=${SOCKETS:-1}; NICS_PER_SOCKET=${NICS_PER_SOCKET:-4}
 MPICH_PREFIX=${MPICH_PREFIX:?set MPICH_PREFIX to the MPICH install}; MAX_M=2097152
 export MPIR_CVAR_NUM_CLIQUES=2 FI_PROVIDER=tcp
-launch() { local nodes=$1 ppn=$2; shift 2; mpiexec -n $((nodes * ppn)) -bind-to core "$@"; }
+# MEM=device needs mpisrv built with make GPU=fake (no GPU here).
+GPU_RUNTIME=${GPU_RUNTIME:-fake}; GPU_DEVICES=${GPU_DEVICES:-8}
+launch() { local nodes=$1 ppn=$2; shift 2; mpiexec -n $((nodes * ppn)) -bind-to core $GPU_WRAPPER "$@"; }

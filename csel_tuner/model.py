@@ -22,7 +22,7 @@ import os
 
 import numpy as np
 
-from .restrict import infer_mask
+from .restrict import infer_mask, mem_known
 from .single import LayoutModel
 
 FORMAT = "collmodel/4"
@@ -38,10 +38,12 @@ def lay_key(lay):
 
 
 class Model:
-    def __init__(self, op, sizes, layouts, domain, conditions=(), algorithms=None):
+    def __init__(self, op, sizes, layouts, domain, conditions=(), algorithms=None, mem="host"):
         """layouts: every allowed (N, ppn); algorithms: {name: {"leaf", "restrictions",
-        "mask", "inner"}} (a catalog's view; leaf None: MPIR_<Coll>_intra_<name>)."""
+        "mask", "inner"}} (a catalog's view; leaf None: MPIR_<Coll>_intra_<name>);
+        mem: the buffers' memory kind, "host" or "device" (a model has one)."""
         self.op = op
+        self.mem = mem
         self.sizes = [int(x) for x in sizes]
         self.layouts = sorted(tuple(l) for l in layouts)
         self.domain = domain
@@ -67,7 +69,8 @@ class Model:
         if d.get("format") != FORMAT:
             raise ValueError("%s: not a %s file (format %s; convert with bin/collmodel --import)"
                              % (path, FORMAT, d.get("format")))
-        self = cls(d["op"], d["sizes"], d["layouts"], d["domain"], d["conditions"], d["algorithms"])
+        self = cls(d["op"], d["sizes"], d["layouts"], d["domain"], d["conditions"], d["algorithms"],
+                   d.get("mem", "host"))
         self.masks = {(n, q): m for n, q, m in d["layout_masks"]}
         self.left_out = d.get("left_out", [])
         self.notes = d.get("notes", [])
@@ -85,7 +88,7 @@ class Model:
     def to_dict(self):
         r = lambda v: [round(float(x), 6) for x in v]
         return {
-            "format": FORMAT, "op": self.op, "what": "%s-latency" % self.op,
+            "format": FORMAT, "op": self.op, "what": "%s-latency" % self.op, "mem": self.mem,
             "created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "sizes": self.sizes, "domain": self.domain, "layouts": [list(l) for l in self.layouts],
             "conditions": self.conditions, "algorithms": self.algorithms,
@@ -176,9 +179,11 @@ class Model:
         """Masks from the precheck: the conditions true at each layout, inferred
         from which of the algorithms (catalog Alg objects) ran. Returns notes."""
         feas, notes = self.feasible(), []
+        on, off = mem_known(self.conditions, self.mem)
         for lay in self.layouts:
             m, undecided = infer_mask(feas.get(lay, set()), algs, self.conditions)
-            self.masks[lay] = m
+            undecided &= ~(on | off)
+            self.masks[lay] = (m | on) & ~off
             if undecided:
                 notes.append("N=%d ppn=%d: conditions %s not decided by the algorithms, taken as false" % (
                     lay[0], lay[1], ",".join(self.conditions[k] for k in range(len(self.conditions))

@@ -65,6 +65,16 @@ its run (a stage-2 file needs the stage-1 tuning file it ran with):
     bin/collmodel --import bcast_s1.json:s1.log --import bcast_s2.json:s2.log --inner-selection F1.json \\
         --out bcast.json
 
+Device buffers (--mem device; mpisrv built with make GPU=..., one GPU per
+rank, launched with MEM=device through launch/config.sh) make a model of
+their own: its file records "mem": "device", and bin/colltree merges it with
+the host model into one tuning file. The memory kind decides the gpu and
+gpu_coll restrictions (on device buffers gpu holds, on host buffers neither
+does) instead of the precheck:
+
+    bin/collmodel --mem device --algs all --catalog ... --out bcast_gpu.json \\
+        --site aurora --nodes 8 --ppn 12 --log bcast_gpu.log
+
 Replay on recorded data in replay/data (replay/README.md), for development:
 
     bin/collmodel --algs binomial,tree --out m.json --replay [--seed 0]
@@ -113,14 +123,15 @@ from csel_tuner.algos import Catalog  # noqa: E402
 from csel_tuner.layouts import axis_values, size_grid  # noqa: E402
 from csel_tuner.model import Model, file_hash  # noqa: E402
 from csel_tuner.multi import Builder2, MultiSampler, known_sampler  # noqa: E402
-from csel_tuner.restrict import fixed_point, plan_sets, precheck, set_name  # noqa: E402
+from csel_tuner.restrict import fixed_point, mem_known, plan_sets, precheck, set_name  # noqa: E402
 from csel_tuner.single import Builder, initial_layouts  # noqa: E402
 
 VERSION = "collmodel 0.4"
 OPS = {"bcast": "MPIR_CVAR_BCAST_INTRA_ALGORITHM"}
 # settings that change which requests the builder makes: a resumed job must keep them
 SAME_ON_RESUME = ["mode", "op", "algs", "seed", "batches", "sync", "prune", "nodes", "ppn_max", "max_m",
-                  "compositional", "probe_m", "base", "inner", "layouts", "anchors"]
+                  "compositional", "probe_m", "base", "inner", "layouts", "anchors", "mem"]
+RESUME_DEFAULTS = {"mem": "host"}       # for journals written before the setting existed
 
 
 class Terminated(Exception):
@@ -216,8 +227,11 @@ def live(a):
     if a.switch != "request" and not several:
         env[OPS[a.op]] = a.algs[0]  # the launch's algorithm
     srv = Server(launcher=shlex.split(a.launcher), env=env, max_m=a.max_m, timeout=a.timeout,
-                 warmup=(a.op,), server=a.server)
+                 warmup=(a.op,), server=a.server, args=["--mem", a.mem] if a.mem != "host" else [])
     info = srv.world
+    if info.get("mem", "host") != a.mem:
+        srv.close()
+        sys.exit(f"--mem {a.mem}: the server reports {info.get('mem', 'host')} buffers")
     by_request = a.switch == "request" or several or (a.switch == "auto" and info.get("cvar_switch") == 1)
     if by_request and info.get("cvar_switch") != 1:
         srv.close()
@@ -457,7 +471,7 @@ def restriction_sets(a, model, algs, probe):
         print(f"compositional (add them later with --model ... --inner-selection): {', '.join(comp)}",
               file=sys.stderr)
     bits = model.conditions
-    feas, masks, notes = precheck(probe, model.layouts, algs1, bits)
+    feas, masks, notes = precheck(probe, model.layouts, algs1, bits, mem_known(bits, model.mem))
     for n in notes:
         print("precheck: " + n, file=sys.stderr)
     # an unrestricted algorithm that fails somewhere is left out everywhere
@@ -842,6 +856,9 @@ def parse_args(argv):
                    help="select the algorithm per request (cvar.*, needs the runtime CVAR switch) or for the "
                         "launch (environment); auto: per request when the server supports it")
     g.add_argument("--server", default=os.path.join(REPO, "server", "mpisrv"), help="mpisrv binary")
+    g.add_argument("--mem", default="host", choices=["host", "device"], help="the buffers' memory: device "
+                   "runs mpisrv --mem device (built with GPU=...), one GPU per rank; with --site, MEM=device "
+                   "(launch/config.sh). A model has one memory kind")
     g.add_argument("--max-m", type=int, default=1 << 26)
     g.add_argument("--batches", type=int, default=5)
     g.add_argument("--sync", default="call", choices=["call", "batch"])
@@ -873,8 +890,11 @@ def parse_args(argv):
         if not (a.nodes and a.ppn):
             ap.error("--site needs --nodes and --ppn")
         os.environ["SITE"] = a.site
+        os.environ["MEM"] = a.mem
         cfg = os.path.join(REPO, "launch", "config.sh")
         a.launcher = "bash -c 'source %s && launch %d %d \"$0\" \"$@\"'" % (cfg, a.nodes, a.ppn)
+    if a.replay and a.mem != "host":
+        ap.error("--replay: the recorded data is of host buffers")
     if not a.replay and not a.launcher:
         ap.error("--site/--nodes/--ppn or --launcher is required unless --replay")
     if a.resume and not a.log:
@@ -911,10 +931,10 @@ def main(argv=None):
                "seed": a.seed, "batches": a.batches, "sync": a.sync, "prune": a.prune, "nodes": nodes,
                "ppn_max": ppn_max, "max_m": max_m, "hosts": meta.get("hosts"), "tool": VERSION,
                "compositional": a.compositional, "probe_m": a.probe_m, "base": base_hash, "inner": inner_hash,
-               "layouts": a.layouts, "anchors": a.anchors if a.model else None}
+               "layouts": a.layouts, "anchors": a.anchors if a.model else None, "mem": a.mem}
         if journal.jobs:
             first = journal.jobs[0]
-            diff = [k for k in SAME_ON_RESUME if first.get(k) != job.get(k)]
+            diff = [k for k in SAME_ON_RESUME if first.get(k, RESUME_DEFAULTS.get(k)) != job.get(k)]
             if diff:
                 sys.exit("--resume: the journal's run differs in " + ", ".join(
                     f"{k} ({first.get(k)} -> {job.get(k)})" for k in diff))
@@ -929,13 +949,15 @@ def main(argv=None):
                 model = base
                 if model.op != a.op:
                     sys.exit(f"--model {a.model}: a model of {model.op}, not {a.op}")
+                if model.mem != a.mem:
+                    sys.exit(f"--model {a.model}: a model of {model.mem} buffers, not {a.mem} (--mem)")
                 if model.sizes != [int(x) for x in sizes][:len(model.sizes)] or set(layouts) != set(model.layouts):
                     sys.exit(f"--model {a.model}: its layouts or sizes differ from this allocation's (add to a "
                              "model on an allocation of the same size)")
             else:
                 cat, bits = catalog_algs(a)
                 model = Model(a.op, sizes, layouts, {"N": [1, nodes], "ppn": [1, ppn_max],
-                                                     "m": [int(sizes[0]), int(sizes[-1])]}, bits)
+                                                     "m": [int(sizes[0]), int(sizes[-1])]}, bits, mem=a.mem)
             # this run's jobs in the model: the journal's earlier ones, then this one
             a._jobs_before = len(model.jobs)
             for j in journal.jobs:

@@ -11,7 +11,9 @@ a failed restriction is an error, not a silent fallback). A layout's mask is
 the set of conditions true there: the bits of every algorithm that ran; an
 algorithm that failed with all but one of its bits known true makes that
 one false. Bits the algorithms do not decide are taken as false and
-reported.
+reported. The bits the buffers' memory kind decides (mem_known: `gpu` on
+device buffers; `gpu` and `gpu_coll` off on host buffers) are set as known
+instead.
 
 Set 0 holds the unrestricted algorithms and is built on every layout: it is
 the fallback whenever no other set applies at run time, also where one
@@ -21,6 +23,17 @@ exactly S, over the restricted algorithms allowed in S (mask a subset of S)
 plus the unrestricted ones (for the "call=r0" choice). See docs/design.md,
 section 11.
 """
+
+GPU, GPU_COLL = "gpu", "gpu_coll"       # MPICH's restrictions for device buffers (gpu_coll implies gpu)
+
+
+def mem_known(bits, mem):
+    """(mask known true, mask known false) of the conditions the buffers'
+    memory kind ("host" or "device") decides."""
+    bit = lambda name: 1 << bits.index(name) if name in bits else 0
+    if mem == "device":
+        return bit(GPU), 0
+    return 0, bit(GPU) | bit(GPU_COLL)
 
 
 def infer_mask(ok, algs, bits):
@@ -37,7 +50,7 @@ def infer_mask(ok, algs, bits):
     return true, used & ~(true | false)
 
 
-def precheck(probe, layouts, algs, bits):
+def precheck(probe, layouts, algs, bits, known=(0, 0)):
     feas, notes = {}, []
     for lay in layouts:
         ok = set()
@@ -51,6 +64,8 @@ def precheck(probe, layouts, algs, bits):
     masks = {}
     for lay, ok in feas.items():
         m, undecided = infer_mask(ok, algs, bits)
+        m = (m | known[0]) & ~known[1]
+        undecided &= ~(known[0] | known[1])
         masks[lay] = m
         if undecided:
             notes.append("N=%d ppn=%d: conditions %s not decided by the algorithms, taken as false" % (
@@ -76,9 +91,15 @@ def plan_sets(algs, bits, masks):
     return out
 
 
-def set_name(op, mask):
-    """The set's CSEL subtree name: the mask of true conditions in hex, e.g. bcast-intra-800."""
-    return "%s-intra-%x" % (op, mask)
+def set_prefix(op, mem="host"):
+    """The prefix of a model's subtree names: <op>-intra, <op>-intra-gpu for device buffers."""
+    return "%s-intra%s" % (op, "-gpu" if mem == "device" else "")
+
+
+def set_name(op, mask, mem="host"):
+    """The set's CSEL subtree name: the mask of true conditions in hex, e.g. bcast-intra-800
+    (bcast-intra-gpu-800 in a model of device buffers)."""
+    return "%s-%x" % (set_prefix(op, mem), mask)
 
 
 def role_layout(lay, comm):

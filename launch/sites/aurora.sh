@@ -21,6 +21,19 @@ MAX_M=${MAX_M:-67108864}                # 64 MB
 MPISRV_CVAR_SWITCH=${MPISRV_CVAR_SWITCH:-0}
 
 # Environment for every launch (recorded by mpisrv in its info record).
-export MPIR_CVAR_ENABLE_GPU=${MPIR_CVAR_ENABLE_GPU:-0}   # host buffers only
+export MPIR_CVAR_ENABLE_GPU=${MPIR_CVAR_ENABLE_GPU:-0}   # host buffers (config.sh sets 1 for MEM=device)
+
+# Device buffers (MEM=device, mpisrv built with make GPU=ze): 6 GPUs x 2
+# tiles per node, one rank per tile, so launches have at most 12 ranks per
+# node; launch() spreads them over NODE_CORES, 6 per socket, and local rank
+# i gets tile i (GPUs 0-2 are close to socket 0). Groups of 4 local ranks
+# would straddle the sockets, so place=nic uses groups of 2. ZE_AFFINITY_MASK
+# is set by gpu_bind.sh for FLAT, the hierarchy assumed by default.
+GPU_RUNTIME=${GPU_RUNTIME:-ze}
+GPU_DEVICES=${GPU_DEVICES:-12}
+GPU_TILES_PER_GPU=${GPU_TILES_PER_GPU:-2}
+if [ "${MEM:-host}" = device ]; then
+    NICS_PER_SOCKET=${GPU_NICS_PER_SOCKET:-2}
+fi
 
 # The PBS project and queue go in the job script (docs/usage.md, §6.1).

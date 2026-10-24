@@ -37,6 +37,24 @@ make MPICC=/path/to/mpich/bin/mpicc
 
 This builds `server/mpisrv`, the default `--server` of `bin/collmodel`.
 
+To measure on GPU buffers (`collmodel --mem device`, §6.6), build with a
+device backend, `GPU=`:
+
+| `GPU=` | For | Needs |
+|---|---|---|
+| `none` (default) | host buffers only | — |
+| `ze` | Intel GPUs (Level Zero) | `level_zero/ze_api.h`, `libze_loader`; `ZE_PREFIX=` if not in the system paths |
+| `cuda` | NVIDIA GPUs | `cuda_runtime.h`, `libcudart`; `CUDA_HOME=` (default `/usr/local/cuda`) |
+| `fake` | functional runs without a GPU | — (host memory standing in for a device) |
+
+```sh
+make -B -C server MPICC=$MPICH_PREFIX/bin/mpicc GPU=ze
+```
+
+`-B` rebuilds when only `GPU` changed. The MPICH under test needs the same
+GPU support (e.g. `--with-ze`); a `GPU=ze` server still measures host
+buffers without `--mem device`. All device code is in `server/gpu.c`.
+
 ## 4. Describe the site
 
 A site file, `launch/sites/<site>.sh`, holds everything specific to a
@@ -51,6 +69,17 @@ system; `launch/config.sh` sources it (`SITE=<site>`, default `aurora`).
 | `MAX_M` | largest message size to measure, bytes |
 | `MPISRV_CVAR_SWITCH` | `1` only if this MPICH applies algorithm CVAR writes at run time (§1) |
 | `launch()` | optional: how to start `NODES x PPN` ranks; the default uses `mpiexec -n --ppn --cpu-bind list:` |
+| `GPU_RUNTIME` | `ze`, `cuda` or `fake`: how `launch/gpu_bind.sh` binds a rank to its GPU |
+| `GPU_DEVICES` | GPU devices (tiles, under Level Zero's FLAT hierarchy) per node: at most one rank each |
+| `GPU_TILES_PER_GPU` | for `ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE`: `ZE_AFFINITY_MASK=GPU.TILE` |
+
+With `MEM=device` (set by `collmodel --mem device --site ...`),
+`config.sh` exports `MPIR_CVAR_ENABLE_GPU=1` and runs mpisrv under
+`launch/gpu_bind.sh`, which makes only the local rank's GPU visible
+(`ZE_AFFINITY_MASK`, `CUDA_VISIBLE_DEVICES`); core binding stays with
+`launch()`. The site file can set other values for `MEM=device` (Aurora:
+`NICS_PER_SOCKET=2` for 12 ranks per node). A site file that defines its
+own `launch()` puts `$GPU_WRAPPER` in front of the command.
 
 `launch/sites/aurora.sh` is a complete example (ALCF Aurora, PALS
 `mpiexec`). `launch/sites/local.sh` runs on one machine with MPICH's fake
@@ -265,10 +294,41 @@ To chain jobs under PBS, submit the job above again with a dependency, e.g.
 `qsub -W depend=afterany:<jobid> job.pbs`; a job that finds the run already
 finished replays the whole journal and writes the same model.
 
+### 6.6 GPU buffers
+
+A model is of one memory kind. Device buffers get a model of their own,
+measured on a launch with one GPU per rank:
+
+```sh
+make -B -C server MPICC=$MPICH_PREFIX/bin/mpicc GPU=ze        # §3
+bin/collmodel --mem device --algs all --catalog $MPICH_SRC/src/mpi/coll/coll_algorithms.txt \
+    --out bcast_gpu.json --site aurora --nodes 8 --ppn 12 --log bcast_gpu.log
+```
+
+- mpisrv runs with `--mem device`. It allocates its buffers on the rank's
+  GPU once, so caches keyed by buffer (IPC handles, NIC registrations) are
+  warm after the first call. This matches applications that reuse their
+  buffers.
+- Each rank must see exactly one GPU, and no two ranks of a node may
+  share one. `--ppn` is at most the site's `GPU_DEVICES`. mpisrv stops on
+  every rank if the binding failed, and lists shared GPUs in
+  `topology_warnings`.
+- The memory kind decides the `gpu` and `gpu_coll` restrictions, if the
+  catalog has them. `gpu` holds on device buffers, and neither holds on
+  host buffers. The precheck reports algorithms that ran or failed against
+  that.
+- The `gpu_coll` restriction also needs `MPIR_CVAR_ENABLE_GPU_COLL=1` in
+  the launch (`--env`).
+- Not with device buffers: `--cold` and `check=1`. Mixed host and device
+  buffers aren't measured.
+
+Then build one tuning file from both models (§7).
+
 ## 7. Make and load the tuning file (`bin/colltree`)
 
 ```sh
 bin/colltree bcast.json --out bcast_tuning.json
+bin/colltree bcast.json bcast_gpu.json --out bcast_tuning.json   # host and device buffers (§6.6)
 ```
 
 It prints the tree size, the predicted regret and the algorithms used.
@@ -308,6 +368,14 @@ subset's subtree that uses at least `--min-fallback-algs` algorithms, each
 scored at the set's own layouts. To see which algorithms ran, set
 `MPIR_CVAR_DUMP_COLL_ALGO_COUNTERS=0` (rank 0 prints its counts at
 finalize).
+
+With a model of device buffers too, the file also has that model's
+subtrees, named `bcast-intra-gpu-<mask>`. In them the `gpu` restriction is
+left out of the mask, because it holds everywhere in that model. The file
+also has a dispatch of its own, and `name=bcast-intra-auto` becomes
+`{"gpu": "dispatch=bcast-intra-gpu(...)", "any": <the host dispatch>}`. A
+call on device buffers falls back to `bcast-intra-gpu-0`, never to a host
+subtree. The device model's catalog must have the `gpu` restriction.
 
 With a compositional algorithm in the model, `colltree` compares its
 output's choices for that algorithm's inner calls with those of the file
@@ -402,6 +470,7 @@ python3 tests/test_replay.py     # replay end to end; needs pandas and replay da
 python3 tests/test_resume.py     # a cut journal resumes to the same model; same needs
 python3 tests/test_restrict.py   # catalog, precheck, sets, dispatch; the builds with sets need replay data
 python3 tests/test_extend.py     # adding an algorithm and layouts to a model, resume; needs replay data
+python3 tests/test_gpu.py        # memory-kind restrictions; colltree merging host and device models
 ```
 
 They also run under pytest.

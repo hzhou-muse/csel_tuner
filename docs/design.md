@@ -71,7 +71,25 @@ op=bcast m=65536 p=256 ppn=8 batches=5 sync=call cvar.MPIR_CVAR_BCAST_INTRA_ALGO
 | `root`, `cache`, `pair`, `tag` | root rank; hot/cold buffer; ping-pong ranks; free text echoed | |
 
 `op=info` returns the job: nodes, ranks per node, hosts, the MPICH version,
-the MPI-related environment, the topology checks and `cvar_switch`.
+the MPI-related environment, the topology checks, `cvar_switch`, and `mem`
+and `gpu` (the buffers' memory and the GPU runtime).
+
+**Device buffers.** With `mpisrv --mem device`, `sbuf` and `rbuf` are
+allocated once on the rank's GPU. The runtime is chosen at build time and
+lives in `server/gpu.c`, behind init, alloc/free and fill; the measurement
+code doesn't change. The memory kind is a property of the launch, not of a
+request: a device run has its own ranks per node (one per GPU), its own
+MPICH settings (`MPIR_CVAR_ENABLE_GPU=1`) and its own model.
+
+- **Binding.** A wrapper (`launch/gpu_bind.sh`) makes one GPU visible to
+  each rank, chosen by local rank. The server checks that it sees exactly
+  one, and compares device UUIDs within each node. A rank the wrapper
+  can't bind still starts, with the reason in `MPISRV_BIND_ERROR`, so every
+  rank stops together instead of the rest waiting in `MPI_Init`.
+- **Caches.** Fixed buffers keep MPICH's buffer-keyed caches (IPC handle
+  mappings, NIC memory registrations) warm after the untimed first call.
+  This is the target application's pattern. Cold or fresh buffers would
+  measure something else and aren't offered.
 
 ### 3.2 Measurement
 
@@ -303,6 +321,9 @@ other layouts follows §5 (`LayoutModel.from_json`).
          "curves": {"binomial": [{"N": 2, "ppn": 4, "log2_t": [...]}, ...], ...}},
  "runs": [{"mode": "create" | "add" | "import", "jobs": [...], "stop": ..., "node_h": ..., ...}]}
 ```
+
+`"mem"` is the buffers' memory kind, `host` (also when the field is
+absent) or `device`.
 
 A measurement of a compositional algorithm also has `"inner": "<hash>"`,
 an anchor `"anchor": true`. An algorithm's model across layouts is a
@@ -630,7 +651,7 @@ import from their journals.
 - **Stop** by the regret estimate of the whole model, the budget, a
   deadline or SIGTERM, as now. `--resume` within a job is unchanged.
 
-### 12.3 colltree: one model, one file
+### 12.3 colltree: models to one file
 
 - **Sets** from the model's layout masks, as §11; subtrees built in order
   of increasing mask, so every subset exists before its supersets; r0 is
@@ -652,6 +673,21 @@ import from their journals.
   its data were measured under, and lists the layouts where they differ as
   "remeasure". With the two-stage check this converges in one remeasure.
 - The stage-specific paths of §11 (`MODEL1 MODEL2`, `auto` leaves) are gone.
+- **Several memory kinds, one file.** Host and device buffers have their
+  own model each, because an algorithm's cost on device buffers says
+  little about its cost on host buffers. A device call must therefore
+  never fall back to a host subtree. colltree builds each model's sets on
+  their own.
+  - The device model's subtrees have the prefix `<op>-intra-gpu`. Its
+    `gpu` bit holds everywhere, so it is dropped from the masks. An
+    algorithm restricted to `gpu` alone (`buffer_swap`) is unrestricted
+    there, and `<op>-intra-gpu-0` is that model's fallback.
+  - `<op>-intra-auto` tests `gpu` first:
+    `{"gpu": "dispatch=<op>-intra-gpu(<bits>)", "any": <host dispatch>}`.
+  - MPICH's `dispatch=` only looks up `<prefix>-<hex>` names, so the
+    prefixes keep the two kinds' subtrees apart, including their subset
+    fallbacks. For example, without `MPIR_CVAR_ENABLE_GPU_COLL`, a set
+    that needs `gpu_coll` falls back to its device subset.
 
 ### 12.4 Batch strategies
 
@@ -686,6 +722,12 @@ measurements predicts.
 - **Collectives:** only bcast is wired through the builders (`OPS` in
   `bin/collmodel`, leaf parameters in `bin/colltree`); mpisrv also measures
   allreduce and ping-pong.
+- **GPU buffers**: one rank per GPU (or tile) only, warm buffers only, no
+  mixed host/device buffers. `check=1` and a check of reductions on device
+  buffers are not there yet. Placement keeps the host `place` modes, and
+  whether tile/GPU placement needs one of its own is open. The inner call
+  of `buffer_swap` (the host selection, on the same communicator) isn't
+  covered by the staleness check.
 - **Extrapolation beyond the allocation** (N > N_max) is not modeled: the
   tree's last branch covers it.
 - The v1 p90 error estimate is unreliable (few random checks); v2's regret
