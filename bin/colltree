@@ -1,39 +1,45 @@
 #!/usr/bin/env python3
-"""Turn a v2 model file (collmodel/2, from tools/collmodel.py --algs) into an
-MPICH collective-selection JSON (builder v3, csel_tuner/tree.py).
+"""Turn a model file (collmodel/4, from bin/collmodel) into an MPICH
+collective-selection JSON (builder v3, csel_tuner/tree.py).
 
     bin/colltree bcast.json --out bcast_tuning.json [--tol 0.005] [--node-aware]
 
 Then run with MPIR_CVAR_COLL_SELECTION_JSON_FILE=bcast_tuning.json (and the
-collective's algorithm CVAR left at auto): the file defines the subtree
-"name=<op>-intra-auto", which replaces MPICH's built-in one.
+collective's algorithm CVAR left at auto). Older model files convert with
+bin/collmodel --import.
 
-The tree is fitted on the model's predictions at every allowed layout (the
-model's N and ppn axes, as tools/collmodel.py enumerates them) and every
-size of its grid, and pruned to the smallest tree whose predicted geomean
-regret is within --tol of the full tree's. Without --node-aware it uses
-comm_size, avg_msg_size and pof2; --node-aware adds num_nodes and ppn,
-conditions MPICH has since pmodels/mpich#8048.
+Each algorithm's model is fitted across layouts from all its curves; a
+tree is fitted on the predictions at every point of its layouts x the size
+grid, and pruned to the smallest tree whose predicted geomean regret is
+within --tol of the full tree's. Without --node-aware it uses comm_size,
+avg_msg_size and pof2; --node-aware adds num_nodes and ppn, conditions
+MPICH has since pmodels/mpich#8048.
 
-A collmodel/3 file (bin/collmodel --coll-algorithms) has a model per
-restriction set; the output then has one subtree per set
-(docs/design.md, section 11):
-- "name=<op>-intra-0", the unrestricted algorithms, fitted on every layout;
-- "name=<op>-intra-<S in hex>", fitted on the layouts where exactly the
-  conditions S hold, choosing among S's restricted algorithms and the leaf
-  "call=<op>-intra-0" (timed as r0's choice at each point, from S's model);
+One subtree per restriction set (docs/design.md, sections 11 and 12), in
+order of increasing mask, so every subset's subtree exists before its
+supersets':
+- "name=<op>-intra-0", the unrestricted algorithms, on every layout (the
+  run-time fallback);
+- "name=<op>-intra-<S in hex>", on the layouts where exactly the conditions
+  S hold. Its candidates are every algorithm allowed in S as a leaf, and
+  "call=" each built subtree of a proper subset of S that uses at least
+  --min-fallback-algs algorithms (a smaller one is not worth the call: its
+  algorithms are candidates directly). A call is scored at S's own layouts:
+  at each point, the predicted time of what that subtree chooses there;
 - "name=<op>-intra-auto", the dispatch: "dispatch=<op>-intra(<bits>)", the
   restriction-mask node of pmodels/mpich#8048 (MPICH continues in the subtree
   of the restrictions that hold, or of its largest subset that has one, at
-  worst r0); with --nested-dispatch, for an MPICH without it, nested
+  worst set 0); with --nested-dispatch, for an MPICH without it, nested
   restrictive conditions ending in "call=" those subtrees.
 
-With a stage-2 file (bin/collmodel --stage1) as the second argument, its
-sets are added: each chooses between the compositional algorithms and
-"call=" the stage-1 set its layouts had (the "auto" candidate, measured with
-the stage-1 file loaded), and the dispatch covers the sets of both stages:
-
-    bin/colltree bcast.json bcast2.json --out bcast_tuning2.json
+A compositional algorithm (e.g. smp) was measured with a tuning file
+selecting its inner calls. Where the output chooses it, colltree compares
+the output's choices for those inner calls (on the node communicator and
+the node leaders' communicator, same op) with that file's, and lists where
+they differ by more than --stale-tol in predicted time: there the
+measurements are stale, and the algorithm should be
+measured again with the output loaded (bin/collmodel --model ... --algs smp
+--inner-selection <output>).
 """
 import argparse
 import json
@@ -45,10 +51,10 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 import numpy as np  # noqa: E402
 
-from csel_tuner.layouts import axis_values  # noqa: E402
-from csel_tuner.restrict import set_name  # noqa: E402
-from csel_tuner.single import LayoutModel, is_pof2  # noqa: E402
-from csel_tuner.tree import fit_tree, json_tree, prune_to, select  # noqa: E402
+from csel_tuner.model import Model  # noqa: E402
+from csel_tuner.restrict import role_layout, set_name  # noqa: E402
+from csel_tuner.single import is_pof2  # noqa: E402
+from csel_tuner.tree import fit_tree, json_choice, json_tree, prune_to, select  # noqa: E402
 
 # extra parameters of algorithm leaves (coll_algorithms.txt extra_params), at
 # the CVAR defaults the measurements ran with; --param alg.key=value overrides
@@ -80,12 +86,6 @@ def points(layouts, sizes):
     return {k: np.array(v, float) for k, v in X.items()}
 
 
-def predictions(d, algs, layouts):
-    """log2 T of each algorithm (columns) at every point of points(layouts, sizes)."""
-    models = {alg: LayoutModel.from_json({"model": d["models"][alg]}) for alg in algs}
-    return np.vstack([np.array([models[alg].predict(n, q) for alg in algs]).T for n, q in layouts])
-
-
 def fit(X, L, feats, a):
     t = fit_tree(X, L, feats, max_leaves=a.max_leaves)
     return prune_to(t, a.tol, a.max_regret)
@@ -110,10 +110,128 @@ def dispatch(op, bits, present):
     return node(0, 0)
 
 
+class Sets:
+    """The subtrees of one model, built in order of increasing mask."""
+
+    def __init__(self, model, a, feats):
+        self.m, self.a, self.feats = model, a, feats
+        self.sizes = np.array(model.sizes)
+        self.pred = {}              # (alg, layout) -> log2 T on the grid
+        self.trees = {}             # mask -> (tree, [options]); an option is an algorithm or ("call", mask)
+        self.lines = []
+
+    def p(self, alg, lay):
+        if (alg, lay) not in self.pred:
+            self.pred[(alg, lay)] = self.m.predict(alg, *lay)
+        return self.pred[(alg, lay)]
+
+    def effective(self, mask):
+        """The subtree MPICH's dispatch uses for a layout of this mask: its largest built subset."""
+        return max((s for s in self.trees if s & ~mask == 0), key=lambda s: (bin(s).count("1"), -s))
+
+    def choose(self, mask, x):
+        """The algorithm subtree `mask` chooses at point x (calls followed)."""
+        t, opts = self.trees[mask]
+        o = opts[select(t, x)]
+        return self.choose(o[1], x) if isinstance(o, tuple) else o
+
+    def algs_used(self, mask):
+        t, opts = self.trees[mask]
+        out = set()
+        for leaf in t.leaves():
+            o = opts[leaf.alg]
+            out |= self.algs_used(o[1]) if isinstance(o, tuple) else {o}
+        return out
+
+    def build(self, mask, lays):
+        m = self.m
+        algs = m.set_algs(mask)
+        if mask == 0:
+            algs = [x for x in algs if m.mask_of(x) == 0]
+        if not algs:
+            return False
+        if mask and not any(m.mask_of(x) for x in algs):
+            return False            # nothing restricted runs here: the dispatch uses a subset's subtree
+        calls = [s for s in sorted(self.trees) if s != mask and s & ~mask == 0
+                 and len(self.algs_used(s)) >= self.a.min_fallback_algs]
+        X = points(lays, self.sizes)
+        cols = [np.concatenate([self.p(x, lay) for lay in lays]) for x in algs]
+        for s in calls:
+            col = np.empty(len(X["p"]))
+            for i in range(len(col)):
+                x = {k: v[i] for k, v in X.items()}
+                lay = (int(x["N"]), int(x["ppn"]))
+                col[i] = self.p(self.choose(s, x), lay)[i % len(self.sizes)]
+            cols.append(col)
+        opts = list(algs) + [("call", s) for s in calls]
+        t, path = fit(X, np.column_stack(cols), self.feats, self.a)
+        self.trees[mask] = (t, opts)
+        used = sorted({opts[l.alg] if not isinstance(opts[l.alg], tuple) else "call=" + set_name(m.op, opts[l.alg][1])
+                       for l in t.leaves()})
+        self.lines.append(f"{set_name(m.op, mask)}: {len(t.leaves())} leaves over {len(lays)} layouts x "
+                          f"{len(self.sizes)} sizes; predicted geomean regret {path[0][1]:.4f} (full tree, "
+                          f"{path[0][0]} leaves) -> {path[-1][1]:.4f}; candidates {len(opts)}; used: "
+                          f"{', '.join(used)}")
+        return True
+
+
+def stale(model, S, out, x_of, tol):
+    """Where the output chooses a compositional algorithm, the inner calls it
+    makes (same op) that the output selects differently from the file the
+    algorithm was measured under, and where the model predicts the two inner
+    choices more than `tol` apart: [(alg, inner, inner layout, [sizes], new, old, ratio)]."""
+    m, op = model, model.op
+    trees = {k[len("name="):]: v for k, v in out.items()}
+    by_leaf = {m.leaf(x): x for x in m.algorithms}
+    idx = {size: i for i, size in enumerate(m.sizes)}
+    found, notes = [], []
+    for c in [x for x in m.algorithms if m.is_compositional(x) and x in m.curves]:
+        uses = {}
+        for lay in m.layouts:
+            mask = S.effective(m.masks.get(lay, 0))
+            for size in m.sizes:
+                if S.choose(mask, x_of(lay, size)) == c:
+                    uses.setdefault(lay, set()).add(size)
+        if not uses:
+            continue
+        h = m.fit_inner.get(c)
+        if not h or h not in m.inner_files:
+            notes.append(f"{c}: no inner selection recorded; not checked")
+            continue
+        old = {k[len("name="):]: v for k, v in json.loads(m.inner_files[h]).items()}
+        for inner in m.algorithms[c]["inner"]:
+            sec, comm = inner.split("@", 1)
+            if sec != op + "-intra":
+                notes.append(f"{c}: inner {inner} is another op; not checked")
+                continue
+            at = {}             # inner layout -> sizes at which some outer call uses c
+            for lay, sizes in uses.items():
+                r = role_layout(lay, comm)
+                if r[0] * r[1] > 1:
+                    at.setdefault(r, set()).update(sizes)
+            for r, sizes in sorted(at.items()):
+                diff = {}
+                for size in sorted(sizes):
+                    x = x_of(r, size)
+                    new = by_leaf.get(json_choice(trees[f"{op}-intra-auto"], x, trees, m.conditions))
+                    was = by_leaf.get(json_choice(old[f"{op}-intra-auto"], x, old, m.conditions)) \
+                        if f"{op}-intra-auto" in old else None
+                    if new == was or new is None or was is None or was not in m.curves:
+                        continue
+                    i = idx[size]
+                    ratio = 2 ** (S.p(new, r)[i] - S.p(was, r)[i])
+                    if abs(np.log(ratio)) > np.log(tol):
+                        diff.setdefault((new, was), []).append((size, ratio))
+                for (new, was), v in diff.items():
+                    rs = [q for _, q in v]
+                    found.append((c, inner, r, [size for size, _ in v], new, was,
+                                  float(np.exp(np.mean(np.log(rs))))))
+    return found, notes
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("model", help="collmodel/2 or collmodel/3 file (stage 1)")
-    ap.add_argument("stage2", nargs="?", help="stage-2 collmodel/3 file (bin/collmodel --stage1): adds its sets")
+    ap.add_argument("model", help="model file (collmodel/4)")
     ap.add_argument("--out", required=True, help="selection JSON to write")
     ap.add_argument("--tol", type=float, default=0.005, help="allowed predicted geomean regret over the full tree")
     ap.add_argument("--node-aware", action="store_true", help="also split on num_nodes and ppn (MPICH with "
@@ -121,104 +239,69 @@ def main(argv=None):
     ap.add_argument("--max-regret", type=float, default=1.5,
                     help="pruning never lets a point's predicted regret rise above this")
     ap.add_argument("--max-leaves", type=int, default=1024, help="size of the full tree before pruning")
+    ap.add_argument("--min-fallback-algs", type=int, default=3, help="a set may call a subset's subtree that "
+                    "uses at least this many algorithms; a smaller one's algorithms are candidates directly")
+    ap.add_argument("--stale-tol", type=float, default=1.05, help="report a changed inner choice of a "
+                    "compositional algorithm when the model predicts the two more than this apart")
     ap.add_argument("--param", action="append", default=[], metavar="ALG.KEY=VALUE")
     ap.add_argument("--nested-dispatch", action="store_true", help="dispatch on restrictions with nested "
                     "conditions (for an MPICH without dispatch=, pmodels/mpich#8048)")
     a = ap.parse_args(argv)
-    d = json.load(open(a.model))
-    if d.get("format") not in ("collmodel/2", "collmodel/3") or d.get("stage", 1) != 1:
-        sys.exit(f"{a.model}: not a stage-1 collmodel/2 or /3 file (from bin/collmodel --algs)")
-    d2 = json.load(open(a.stage2)) if a.stage2 else None
-    if d2 is not None and (d2.get("format") != "collmodel/3" or d2.get("stage") != 2 or
-                           d.get("format") != "collmodel/3" or d2["conditions"] != d["conditions"] or
-                           d2["what"] != d["what"]):
-        sys.exit(f"{a.stage2}: not a stage-2 file for {a.model} (same op and coll_algorithms.txt)")
-    op = d["what"].split("-")[0]
-    sizes = np.array(d["sizes"])
-    (n_lo, n_hi), (p_lo, p_hi) = d["domain"]["N"], d["domain"]["ppn"]
-    layouts = [(n, q) for n in axis_values(n_hi) for q in axis_values(p_hi) if n * q > 1]
+    try:
+        m = Model.load(a.model)
+    except ValueError as e:
+        sys.exit(str(e))
+    op = m.op
     feats = ["N", "ppn", "p", "m", "pof2"] if a.node_aware else ["p", "m", "pof2"]
     params = {k: dict(v) for k, v in PARAMS.get(op, {}).items()}
     for kv in a.param:
         k, v = kv.split("=", 1)
         alg, key = k.split(".", 1)
         params.setdefault(alg, {})[key] = parse_value(v)
-    coll = op[0].upper() + op[1:]
-    names = {alg: x["leaf"] for alg, x in d.get("algorithms", {}).items()}
-    if d2 is not None:
-        names.update({alg: x["leaf"] for alg, x in d2["algorithms"].items() if x["leaf"]})
-    leaf = lambda alg: ("algorithm=" + names.get(alg, f"MPIR_{coll}_intra_{alg}"), params.get(alg, {}))
-    X = points(layouts, sizes)
-    lines = []
+    S = Sets(m, a, feats)
+    sets = m.sets()
+    for mask in sorted(sets, key=lambda s: (bin(s).count("1"), s)):
+        S.build(mask, sets[mask])
+    if 0 not in S.trees:
+        sys.exit(f"{a.model}: no unrestricted algorithm with a model")
 
-    def report(name, t, path, algs, n_lay):
-        used = sorted({algs[l.alg] for l in t.leaves()})
-        lines.append(f"{name}: {len(t.leaves())} leaves over {n_lay} layouts x {len(sizes)} sizes; predicted "
-                     f"geomean regret {path[0][1]:.4f} (full tree, {path[0][0]} leaves) -> {path[-1][1]:.4f}; "
-                     f"algorithms used: {', '.join(used)}")
-
-    if d["format"] == "collmodel/2":
-        algs = d["algs"]
-        t, path = fit(X, predictions(d, algs, layouts), feats, a)
-        out = {f"name={op}-intra-auto": json_tree(t, algs, leaf)}
-        report(a.out, t, path, algs, len(layouts))
+    def sub(o):
+        if isinstance(o, tuple):
+            return "call=" + set_name(op, o[1])
+        return ("algorithm=" + m.leaf(o), params.get(o, {}))
+    out = {f"name={set_name(op, mask)}": json_tree(t, opts, sub) for mask, (t, opts) in sorted(S.trees.items())}
+    present = sorted(S.trees)
+    if a.nested_dispatch:
+        out[f"name={op}-intra-auto"] = dispatch(op, m.conditions, present)
     else:
-        sets = {x["mask"]: x for x in d["sets"]}
-        if 0 not in sets:
-            sys.exit(f"{a.model}: no set 0 (unrestricted algorithms)")
-        r0 = sets[0]
-        t0, path = fit(X, predictions(r0["model"], r0["algs"], layouts), feats, a)
-        out = {f"name={set_name(op, 0)}": json_tree(t0, r0["algs"], leaf)}
-        report(set_name(op, 0), t0, path, r0["algs"], len(layouts))
-        for mask in sorted(sets):
-            if mask == 0:
-                continue
-            x = sets[mask]
-            lays = [tuple(l) for l in x["layouts"]]
-            Xs = points(lays, sizes)
-            Ls = predictions(x["model"], x["algs"], lays)
-            # the r0 option: S's model's time of what r0 chooses at each point
-            col = {alg: j for j, alg in enumerate(x["algs"])}
-            pick = [col[r0["algs"][select(t0, {k: v[i] for k, v in Xs.items()})]] for i in range(len(Xs["p"]))]
-            own = [alg for alg in x["algs"] if d["algorithms"][alg]["mask"]]
-            opts = own + ["r0"]
-            L = np.column_stack([Ls[:, col[alg]] for alg in own] + [Ls[np.arange(len(pick)), pick]])
-            t, path = fit(Xs, L, feats, a)
-            sub = lambda alg: "call=" + set_name(op, 0) if alg == "r0" else leaf(alg)
-            out[f"name={set_name(op, mask)}"] = json_tree(t, opts, sub)
-            report(set_name(op, mask), t, path, opts, len(lays))
-        masks = set(sets)
-        for x in (d2["sets"] if d2 is not None else []):
-            # stage 2: the compositional algorithms or "auto", MPICH with the stage-1 file, which here
-            # is the stage-1 set the layouts had before (fallback)
-            mask, fb = x["mask"], x["fallback"]
-            if fb not in sets and fb not in masks:
-                sys.exit(f"{a.stage2}: set {set_name(op, mask)} falls back to {set_name(op, fb)}, which "
-                         f"{a.model} does not have")
-            lays = [tuple(l) for l in x["layouts"]]
-            Xs = points(lays, sizes)
-            t, path = fit(Xs, predictions(x["model"], x["algs"], lays), feats, a)
-            sub = lambda alg, fb=fb: "call=" + set_name(op, fb) if alg == "auto" else leaf(alg)
-            out[f"name={set_name(op, mask)}"] = json_tree(t, x["algs"], sub)
-            report(set_name(op, mask) + " (stage 2)", t, path, x["algs"], len(lays))
-            masks.add(mask)
-        if a.nested_dispatch:
-            out[f"name={op}-intra-auto"] = dispatch(op, d["conditions"], sorted(masks))
-        else:
-            bits = 0
-            for m in masks:
-                bits |= m
-            out[f"name={op}-intra-auto"] = "dispatch=%s-intra(0x%x)" % (op, bits) if bits else \
-                "call=" + set_name(op, 0)
+        bits = 0
+        for s in present:
+            bits |= s
+        out[f"name={op}-intra-auto"] = "dispatch=%s-intra(0x%x)" % (op, bits) if bits else "call=" + set_name(op, 0)
     depth = json_depth(out)
     if depth > 64:
         sys.exit(f"tree nests {depth} levels; MPICH's parser allows 64 (try a larger --tol)")
     with open(a.out, "w") as f:
         json.dump(out, f, indent=2)
         f.write("\n")
-    for line in lines:
+    for line in S.lines:
         print(line)
     print(f"{a.out}: features {','.join(feats)}; nesting {depth}")
+
+    def x_of(lay, size):
+        n, q = lay
+        mk = m.masks.get(lay, 0)
+        return {"p": n * q, "m": size, "N": n, "ppn": q, "pof2": float(is_pof2(n * q)),
+                "cond": {b: bool(mk >> k & 1) for k, b in enumerate(m.conditions)}}
+    found, notes = stale(m, S, out, x_of, a.stale_tol)
+    for n in notes:
+        print("staleness check: " + n)
+    for c, inner, r, ss, new, was, ratio in found:
+        print(f"stale: {c}'s inner {inner} at N={r[0]} ppn={r[1]}, {len(ss)} sizes ({ss[0]}..{ss[-1]}): the output "
+              f"selects {new}, {c} was measured with {was} (predicted {ratio:.2f}x)")
+    if found:
+        print(f"remeasure: bin/collmodel --model {a.model} --algs "
+              f"{','.join(sorted({c for c, *_ in found}))} --inner-selection {a.out} ...")
 
 
 if __name__ == "__main__":

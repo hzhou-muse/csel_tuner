@@ -22,10 +22,11 @@ def run(*args, check=True):
 
 
 def model(path):
+    """What must not depend on the cut: the fit, the measurements (without their
+    job, a resumed run has two) and the prechecks."""
     d = json.load(open(path))
-    for k in ("created", "jobs"):
-        d["meta"].pop(k, None)
-    return d
+    strip = lambda rs: sorted(json.dumps({k: v for k, v in r.items() if k != "job"}, sort_keys=True) for r in rs)
+    return d["fit"], strip(d["data"]["measurements"]), strip(d["data"]["prechecks"])
 
 
 def test_cut_journal_resumes_to_the_same_model():

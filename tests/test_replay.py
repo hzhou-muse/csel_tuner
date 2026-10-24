@@ -1,4 +1,4 @@
-"""End to end on recorded data: bin/collmodel --replay (v2), then bin/colltree.
+"""End to end on recorded data: bin/collmodel --replay (v2, a collmodel/4 model), then bin/colltree.
 Needs pandas and replay data (replay/README.md); skipped without data."""
 import json
 import os
@@ -26,11 +26,12 @@ def test_v2_then_tree():
                         "--algs", ",".join(FIXED[:3]), "--budget-node-h", "0.3"],
                        check=True, stdout=subprocess.DEVNULL)
         m = json.load(open(model))
-        assert m["format"] == "collmodel/2" and len(m["models"]) == 3
+        assert m["format"] == "collmodel/4" and len(m["fit"]["curves"]) == 3 and m["data"]["measurements"]
         subprocess.run([sys.executable, os.path.join(REPO, "bin", "colltree"), model, "--out", tuning],
                        check=True, stdout=subprocess.DEVNULL)
         t = json.load(open(tuning))
-        assert list(t) == ["name=bcast-intra-auto"]
+        assert list(t) == ["name=bcast-intra-0", "name=bcast-intra-auto"]
+        assert t["name=bcast-intra-auto"] == "call=bcast-intra-0"
 
 
 if __name__ == "__main__":

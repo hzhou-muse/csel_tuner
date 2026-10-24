@@ -9,14 +9,19 @@ per node) and message sizes, models where each algorithm wins, and writes a
 decision tree in MPICH's collective-selection JSON format (CSEL).
 
 ```
-bin/collmodel --algs a,b,...   measure, model all algorithms  ->  model.json
-bin/colltree model.json        regret-minimizing decision tree ->  tuning.json
+bin/collmodel --algs a,b,...              measure, model all algorithms   ->  model.json
+bin/collmodel --model model.json --algs c add an algorithm (or --layouts)  ->  model2.json
+bin/colltree model.json                   regret-minimizing decision tree  ->  tuning.json
 MPIR_CVAR_COLL_SELECTION_JSON_FILE=tuning.json mpiexec ... ./app
 ```
 
-Status: tested on replays of recorded measurements and in local
-functional runs; live validation is next. Only MPI_Bcast is wired through
-the builders so far.
+The model file keeps every measurement with its provenance, so a model
+grows over several runs: an algorithm added later costs only its own
+measurements (docs/design.md, section 12).
+
+Status: tested on replays of recorded measurements, in local functional
+runs and live on a large system. Only MPI_Bcast is wired through the
+builders so far.
 
 ## Quick start
 

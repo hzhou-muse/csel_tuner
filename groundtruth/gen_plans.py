@@ -301,7 +301,7 @@ def set_validate(a, rng):
     groundtruth/score_live.py validate scores them. --v-algs replaces the
     algorithms of truth/; those in --v-single-node-algs (e.g. release_gather)
     are measured on the single-node layouts only, those in --v-hier-algs (e.g.
-    smp, a stage-2 algorithm) on the layouts with several nodes and several
+    smp, a compositional algorithm) on the layouts with several nodes and several
     ranks per node; run truth/ with the stage-1 tuning file loaded then, for
     their inner calls."""
     allowed = [(n, q) for n in axis_values(a.nodes) for q in axis_values(a.ppn) if n * q > 1]

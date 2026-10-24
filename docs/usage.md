@@ -98,7 +98,7 @@ bin/collmodel --op bcast \
 - Needs the per-request algorithm switch; the server must report
   `cvar_switch=1` (`MPISRV_CVAR_SWITCH=1` in the site file).
 - `--log` keeps a journal of every measurement, which lets a later job
-  continue the run (§6.4). Always give one on a cluster.
+  continue the run (§6.5). Always give one on a cluster.
 
 **Every algorithm, restricted ones included** (docs/design.md §11):
 
@@ -121,14 +121,17 @@ bin/collmodel --op bcast --algs all \
   conditions hold (e.g. `800`, `release_gather` on single-node layouts). Each
   later set keeps a share of the budget in proportion to its layouts, and
   reuses the measurements made before it.
-- Compositional algorithms (`--stage2`, default those with an `inner` key
-  in `coll_algorithms.txt`, e.g. `smp`; for files without the key, those
-  restricted to `hierarchical`) are not measured yet.
+- Compositional algorithms (`--compositional`, default those with an
+  `inner` key in `coll_algorithms.txt`, e.g. `smp`; for files without the
+  key, those restricted to `hierarchical`) are left out: they are added to
+  the model afterwards with a tuning file for their inner calls (§6.2).
 - Needs an MPICH whose `release_gather` condition has no side effects
   (pmodels/mpich#8048); with an older one the precheck of `release_gather`
   depends on how often it was evaluated.
-- The model file is `collmodel/3`: the catalog's conditions, each layout's
-  mask and feasible algorithms, and one model per set.
+- The model file is `collmodel/4` (design.md §12): every measurement with
+  its job, the precheck results, the catalog's conditions and each layout's
+  mask (`data`), and each algorithm's curve at each layout it was sampled
+  at (`fit`).
 
 A PBS job on Aurora that stops cleanly before its walltime and continues a
 run an earlier job did not finish:
@@ -150,23 +153,61 @@ bin/collmodel --algs binomial,scatter_recursive_doubling_allgather,scatter_ring_
 The budget counts every job of the run; the deadline is this job's
 (walltime minus a margin for writing the model).
 
-**Stage 2, compositional algorithms** (e.g. smp; docs/design.md §11), after
-stage 1, on an allocation of the same size:
+### 6.2 Add to a model
+
+`--model` adds algorithms, or layouts, to a model, measuring only what is
+new (design.md §12). The allocation must have the model's size; write to a
+new file (`--out` must not be the `--model` file, so that `--resume` finds
+the model the run started from).
 
 ```sh
-bin/colltree bcast.json --out bcast_tuning.json                       # F1
-bin/collmodel --stage1 bcast.json --inner-selection bcast_tuning.json \
-    --coll-algorithms $MPICH_SRC/src/mpi/coll/coll_algorithms.txt \
-    --site aurora --nodes 8 --ppn 96 --budget-node-h 1 --out bcast2.json --log bcast2.jsonl
-bin/colltree bcast.json bcast2.json --out bcast_tuning2.json          # F2
+CAT=$MPICH_SRC/src/mpi/coll/coll_algorithms.txt
+# an algorithm the model lacks (all: every one of the catalog's it lacks)
+bin/collmodel --model bcast.json --algs pipelined_tree --coll-algorithms $CAT \
+    --site aurora --nodes 8 --ppn 96 --budget-node-h 1 --out bcast2.json --log add.jsonl
+# more layouts for the algorithms it has
+bin/collmodel --model bcast.json --layouts 4x24,16x8 --coll-algorithms $CAT ... --out bcast2.json
 ```
 
-- The launch loads F1, so smp's inner calls follow it; the candidates per
-  new set are the stage-2 algorithms and `auto` (F1's choice, measured).
-- It stops before building if an inner call could itself run a stage-2
-  algorithm (the two-stage check), and needs pmodels/mpich#8048.
+- A new algorithm is prechecked at every layout; a new restriction moves
+  the layouts where it runs to a new set. Then it is sampled at the
+  layouts the model has measured where it may run: its coarse pass skips
+  the sizes where it is predicted (from its first layouts) more than
+  `--prune` slower than the model's best, it is refined where it comes near
+  the best, and at its crossovers with the model's algorithms both are
+  measured. The model's earlier measurements are kept as they are.
+- A new layout gets every algorithm allowed there.
+- Each run first remeasures a few points of the model's best algorithms at
+  `--anchors` layouts (3) and prints the ratio to the earlier values, the
+  drift between jobs; above `--drift-tol` (1.10) it warns. Anchors are kept
+  in the data, flagged, and not used for the fit.
 
-### 6.2 One algorithm (v1)
+**Compositional algorithms** (e.g. smp; design.md §11) are added with the
+tuning file of their inner calls loaded in the launch:
+
+```sh
+bin/colltree bcast.json --out bcast_tuning.json
+bin/collmodel --model bcast.json --algs smp --inner-selection bcast_tuning.json --coll-algorithms $CAT \
+    --site aurora --nodes 8 --ppn 96 --budget-node-h 1 --out bcast2.json --log add.jsonl
+bin/colltree bcast2.json --out bcast_tuning2.json
+```
+
+- It stops before measuring if an inner call could itself run a
+  compositional algorithm (the two-stage check); needs pmodels/mpich#8048.
+- The model keeps the file (by hash, with its content); smp's measurements
+  record it. Adding smp again with another file replaces its curves.
+- `colltree` reports where its output selects smp's inner calls
+  differently from that file (§7); then add smp again with the output.
+
+**Convert older model files** (collmodel/3, with the journal of each run;
+a stage-2 file needs the stage-1 tuning file it ran with):
+
+```sh
+bin/collmodel --import bcast.json:bcast.jsonl --import bcast2.json:bcast2.jsonl \
+    --inner-selection bcast_tuning.json --out bcast4.json
+```
+
+### 6.3 One algorithm (v1)
 
 ```sh
 bin/collmodel --alg binomial --site aurora --nodes 8 --ppn 96 --out bcast_binomial.json
@@ -178,9 +219,9 @@ estimated median error ≤ `--tau-med` (5%) and p90 ≤ `--tau-p90` (20%), at a
 plateau, or at the budget. The output (collmodel/1) is a performance model
 of that algorithm (design.md §8).
 
-### 6.3 Options
+### 6.4 Options
 
-Also `--log`, `--resume`, `--deadline`, `--checkpoint-every` (§6.4) and
+Also `--log`, `--resume`, `--deadline`, `--checkpoint-every` (§6.5) and
 `--seed` (random checks; a resumed run must keep it).
 
 
@@ -196,7 +237,7 @@ Also `--log`, `--resume`, `--deadline`, `--checkpoint-every` (§6.4) and
 | `--rewarm-gap` | 0.05 | seconds of driver idle time after which a batch starts with a warm-up request |
 | `--env KEY=VALUE` | | extra environment for the launch |
 
-### 6.4 Long runs, deadlines and interruptions
+### 6.5 Long runs, deadlines and interruptions
 
 A run can span several jobs and survive a kill:
 
@@ -207,12 +248,13 @@ A run can span several jobs and survive a kill:
   decisions from the same values, so requests the journal already answers
   are taken from it and measuring continues where the earlier job stopped.
   Earlier jobs' time counts against `--budget-node-h`. A resume is refused
-  if the algorithms, seed, batches, sync, pruning or the allocation's shape
-  (nodes, ranks per node, largest size) differ; other nodes of the same
-  shape are allowed and noted.
+  if the algorithms, seed, batches, sync, pruning, the allocation's shape
+  (nodes, ranks per node, largest size), the input model, the inner
+  selection file or the added layouts differ; other nodes of the same shape
+  are allowed and noted.
 - **Checkpoints.** The model file is rewritten after a layout at most every
-  `--checkpoint-every` seconds (60) and at the end; a partial file has
-  `"complete": false` and the stop reason in its `meta`.
+  `--checkpoint-every` seconds (60) and at the end; the run's record in
+  the file's `runs` has the stop reason.
 - **Deadline (`--deadline SEC`).** A layout is not started if it might not
   finish SEC seconds after the job's start (judged by the slowest layout so
   far); the model is written and the job ends.
@@ -236,6 +278,8 @@ It prints the tree size, the predicted regret and the algorithms used.
 | `--tol` | 0.005 | allowed predicted geomean regret over the full tree; larger = smaller tree |
 | `--max-regret` | 1.5 | pruning never lets a point's predicted regret exceed this |
 | `--node-aware` | off | also split on `num_nodes` and `ppn` (MPICH with pmodels/mpich#8048) |
+| `--min-fallback-algs` | 3 | a set may call a subset's subtree that uses at least this many algorithms; a smaller one's algorithms are candidates directly |
+| `--stale-tol` | 1.05 | report a compositional algorithm's changed inner choice when the two are predicted more than this apart |
 | `--nested-dispatch` | off | dispatch on restrictions with nested conditions instead of `dispatch=` (MPICH without pmodels/mpich#8048) |
 | `--param ALG.KEY=VALUE` | | extra parameter of an algorithm leaf, e.g. `tree.k=4` |
 
@@ -251,18 +295,25 @@ The file defines `name=bcast-intra-auto`, which replaces MPICH's built-in
 subtree of that name; everything else keeps its defaults. A malformed file
 stops `MPI_Init` with the line and column of the error.
 
-From a `collmodel/3` file the output has a subtree per restriction set (the suffix is the mask of true conditions,
-bit k = the k-th non-threshold condition in `coll_algorithms.txt`),
-`name=bcast-intra-0`, `name=bcast-intra-800`, ..., and
-`name=bcast-intra-auto` dispatches on the restrictions, e.g.
+The output has a subtree per restriction set (the suffix is the mask of
+true conditions, bit k = the condition with index k in
+`coll_algorithms.txt`): `name=bcast-intra-0`, `name=bcast-intra-800`, ...,
+and `name=bcast-intra-auto` dispatches on the restrictions, e.g.
 `"dispatch=bcast-intra(0x820)"`: MPICH continues in `bcast-intra-800` on a
-single-node communicator, `bcast-intra-20` on a hierarchical one (after
-stage 2), else `bcast-intra-0`. An MPICH without `dispatch=`
-(pmodels/mpich#8048) needs `--nested-dispatch`, which writes nested
-conditions ending in `call=`. A restricted set's leaves are its algorithms or
-`"call=bcast-intra-0"`. To see which algorithms ran, set
+single-node communicator, `bcast-intra-20` on a hierarchical one, else
+`bcast-intra-0`. An MPICH without `dispatch=` (pmodels/mpich#8048) needs
+`--nested-dispatch`, which writes nested conditions ending in `call=`. A
+restricted set's leaves are the algorithms allowed there or `call=` a
+subset's subtree that uses at least `--min-fallback-algs` algorithms, each
+scored at the set's own layouts. To see which algorithms ran, set
 `MPIR_CVAR_DUMP_COLL_ALGO_COUNTERS=0` (rank 0 prints its counts at
 finalize).
+
+With a compositional algorithm in the model, `colltree` compares its
+output's choices for that algorithm's inner calls with those of the file
+it was measured under, and prints `stale:` lines where they differ by more
+than `--stale-tol`, followed by the `collmodel` command that remeasures it
+with the output loaded.
 
 ## 8. Replay (development)
 
@@ -323,11 +374,11 @@ tuning file, of the tree's and the model's own choices, whether MPICH
 applied the file, and whether the default beats every candidate algorithm
 somewhere (then the candidates miss one, e.g. `release_gather`). Regret is
 against the fastest of every algorithm measured and MPICH's default, split
-into single-node and multi-node layouts. `--model` takes a collmodel/2 or
-/3 file and `--tuning` a file with one or several subtrees. After stage 2,
-give `--model bcast.json --model bcast2.json --tuning bcast_tuning2.json`,
-and run `truth/` with `MPIR_CVAR_COLL_SELECTION_JSON_FILE` set to the
-tuning file too, so that smp's inner calls follow it.
+into single-node and multi-node layouts. `--model` takes a collmodel/4
+file and `--tuning` a file with one or several subtrees. With a
+compositional algorithm in the model, run `truth/` with
+`MPIR_CVAR_COLL_SELECTION_JSON_FILE` set to the tuning file too, so that
+smp's inner calls follow it.
 
 ## 10. Troubleshooting
 
@@ -349,7 +400,8 @@ python3 tests/test_interp.py     # numpy only
 python3 tests/test_tree.py       # numpy only
 python3 tests/test_replay.py     # replay end to end; needs pandas and replay data, else skipped
 python3 tests/test_resume.py     # a cut journal resumes to the same model; same needs
-python3 tests/test_restrict.py   # catalog, precheck, sets, dispatch; the two-set build needs replay data
+python3 tests/test_restrict.py   # catalog, precheck, sets, dispatch; the builds with sets need replay data
+python3 tests/test_extend.py     # adding an algorithm and layouts to a model, resume; needs replay data
 ```
 
 They also run under pytest.

@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """Build models T(N, ppn, m) of a collective's algorithms.
 
-One algorithm (--alg, builder v1, csel_tuner/single.py) or several together,
-sampled for selection (--algs a,b,..., builder v2, csel_tuner/multi.py; needs
-the per-request algorithm switch, MPISRV_CVAR_SWITCH=1).
+One algorithm (--alg, builder v1, csel_tuner/single.py; model file
+collmodel/1) or several, sampled for selection into a model file
+(collmodel/4, csel_tuner/model.py: the measurements and the fit derived
+from them; needs the per-request algorithm switch, MPISRV_CVAR_SWITCH=1).
 
-Live, through the benchmark server, one launch of the whole allocation
-(launch/config.sh with the site file launch/sites/<site>.sh):
+Create a model, live through the benchmark server, one launch of the whole
+allocation (launch/config.sh with the site file launch/sites/<site>.sh):
 
     bin/collmodel --algs binomial,scatter_ring_allgather,circ_graph --out bcast.json \\
         --site aurora --nodes 32 --ppn 96 --log bcast.log [--deadline 3300]
 
 or with any launcher (mpisrv and its max-m argument are appended):
 
-    bin/collmodel --alg binomial --out bcast_binomial.json --launcher "mpiexec -n 64 -ppn 32"
+    bin/collmodel --algs binomial,tree --out bcast.json --launcher "mpiexec -n 64 -ppn 32"
 
 All of the op's algorithms, restricted ones included (docs/design.md,
 section 11), from the build's coll_algorithms.txt:
 
-    bin/collmodel --algs all --coll-algorithms $MPICH_SRC/src/mpi/coll/coll_algorithms.txt \
+    bin/collmodel --algs all --coll-algorithms $MPICH_SRC/src/mpi/coll/coll_algorithms.txt \\
         --out bcast.json --site aurora --nodes 8 --ppn 96 --log bcast.log
 
 With --coll-algorithms the run starts with a precheck: one probe call of
@@ -27,24 +28,42 @@ MPIR_CVAR_COLLECTIVE_FALLBACK=error, so an algorithm whose restriction
 fails returns an error). From it each layout gets the set of restrictive
 conditions that hold there, and the builder runs once per restriction set:
 set 0 (the unrestricted algorithms) on every layout, then each set S on the
-layouts whose conditions are exactly S, over its restricted algorithms plus
-the unrestricted ones. The model file is collmodel/3. Compositional
-algorithms (--stage2, default: those with an inner key, e.g. smp) are left
-out: their inner calls go through the selection being built.
+layouts whose conditions are exactly S. Compositional algorithms (those
+with an inner key, e.g. smp; --compositional) are left out: their inner
+calls go through the selection being built, so they are added afterwards.
 
-Stage 2, the compositional algorithms (those with an inner key, e.g. smp),
-after stage 1 (docs/design.md, section 11):
+Add to a model (docs/design.md, section 12): algorithms, or layouts for the
+algorithms it has, at the cost of the new measurements only:
 
-    bin/colltree bcast.json --out bcast_tuning.json                # stage 1's file, F1
-    bin/collmodel --stage1 bcast.json --inner-selection bcast_tuning.json \
-        --coll-algorithms ... --out bcast2.json --site aurora --nodes 8 --ppn 96 --log bcast2.log
-    bin/colltree bcast.json bcast2.json --out bcast_tuning2.json   # F2
+    bin/collmodel --model bcast.json --algs pipelined_tree --coll-algorithms ... --out bcast2.json ...
+    bin/collmodel --model bcast.json --layouts 4x24,16x8 --coll-algorithms ... --out bcast2.json ...
 
-The server runs with F1 loaded, so a forced smp's inner calls go through
-F1. The run prechecks the stage-2 algorithms, checks that their inner calls
-cannot run a stage-2 algorithm themselves, and builds a model per new
-restriction set over the stage-2 algorithms and "auto" (MPICH with F1:
-F1's choice there).
+A new algorithm is prechecked at every layout (a new restriction may move
+layouts to a new set) and sampled at the layouts the model has measured
+where it may run: a coarse pass, skipping the sizes where its prediction
+from the layouts done so far is more than --prune slower than the best of
+the model, then refinement where it comes near the best, and crossovers
+with the model's algorithms measured on both sides. A new layout gets every
+algorithm allowed there. Each run first remeasures a few points of the
+model's best algorithms (anchors, --anchors) and reports their ratio to the
+earlier values: the drift between jobs.
+
+A compositional algorithm is added with the tuning file of its inner calls
+loaded in the launch (MPIR_CVAR_COLL_SELECTION_JSON_FILE), after a check
+that those inner calls cannot run a compositional algorithm themselves:
+
+    bin/colltree bcast.json --out bcast_tuning.json
+    bin/collmodel --model bcast.json --algs smp --inner-selection bcast_tuning.json --coll-algorithms ... \\
+        --out bcast2.json ...
+
+Its measurements record the file (by hash, the content kept in the model);
+adding it again with another file replaces its curves.
+
+Convert collmodel/3 files of earlier versions, each with the journal of
+its run (a stage-2 file needs the stage-1 tuning file it ran with):
+
+    bin/collmodel --import bcast_s1.json:s1.log --import bcast_s2.json:s2.log --inner-selection F1.json \\
+        --out bcast.json
 
 Replay on recorded data in replay/data (replay/README.md), for development:
 
@@ -55,7 +74,7 @@ largest size come from the server's info reply. Allowed layouts are N and
 ppn in {1, 2, 3, 4, 6, 8, 12, 16, 24, ...} up to the allocation, plus the
 allocation's own N and ppn; sizes are 4 per octave from 1 B to max_m. The
 builder samples until its estimate meets the target or the node-hour budget
-is spent, then writes the model file (collmodel/1, or collmodel/2 for v2).
+is spent, then writes the model file.
 
 Interruptions:
 - --log FILE keeps a journal: one JSON line per measurement, flushed after
@@ -63,10 +82,11 @@ Interruptions:
   builder makes the same decisions from the same values (seeded), requests
   already answered come from the journal, and measuring continues where the
   earlier job stopped; its time counts against the budget. A kill loses at
-  most the batch in flight.
+  most the batch in flight. When adding to a model, --out must not be the
+  --model file (a resumed run needs the model it started from).
 - The model file is rewritten after a layout at most every
   --checkpoint-every seconds, and at the end, so a killed job leaves a
-  usable partial model ("complete": false in its meta).
+  usable partial model.
 - --deadline SEC: do not start a layout that might not finish SEC seconds
   after the start (estimated from the slowest layout so far).
 - SIGTERM (a batch system's walltime warning): stop measuring and write the
@@ -74,6 +94,7 @@ Interruptions:
 """
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import shlex
@@ -90,15 +111,16 @@ import numpy as np  # noqa: E402
 
 from csel_tuner.algos import Catalog  # noqa: E402
 from csel_tuner.layouts import axis_values, size_grid  # noqa: E402
-from csel_tuner.restrict import fixed_point, plan_sets, precheck, set_name, stage2_sets  # noqa: E402
-from csel_tuner.multi import Builder2  # noqa: E402
-from csel_tuner.single import Builder  # noqa: E402
+from csel_tuner.model import Model, file_hash  # noqa: E402
+from csel_tuner.multi import Builder2, MultiSampler, known_sampler  # noqa: E402
+from csel_tuner.restrict import fixed_point, plan_sets, precheck, set_name  # noqa: E402
+from csel_tuner.single import Builder, initial_layouts  # noqa: E402
 
-VERSION = "collmodel 0.3"
+VERSION = "collmodel 0.4"
 OPS = {"bcast": "MPIR_CVAR_BCAST_INTRA_ALGORITHM"}
 # settings that change which requests the builder makes: a resumed job must keep them
 SAME_ON_RESUME = ["mode", "op", "algs", "seed", "batches", "sync", "prune", "nodes", "ppn_max", "max_m",
-                  "stage2", "probe_m", "stage1"]
+                  "compositional", "probe_m", "base", "inner", "layouts", "anchors"]
 
 
 class Terminated(Exception):
@@ -107,6 +129,11 @@ class Terminated(Exception):
 
 def req_key(req):
     return json.dumps({k: v for k, v in req.items() if k != "tag"}, sort_keys=True)
+
+
+def req_alg(req, op):
+    """The algorithm a request forces: replay names it, live sets the algorithm CVAR."""
+    return req.get("alg") or req.get("cvar." + OPS[op], "auto")
 
 
 class Journal:
@@ -120,6 +147,7 @@ class Journal:
         self.path, self.cache, self.jobs, self.n_cached = path, {}, [], 0
         self.replayed = 0.0     # run seconds (all jobs) at the latest reply taken from the journal
         self.live = False       # a request missed the journal: measuring live from here on
+        self.last_job = None    # index into self.jobs of the reply take() returned last
         if resume:
             if not path or not os.path.exists(path):
                 sys.exit(f"--resume: no journal {path} (give the --log of the earlier job)")
@@ -138,7 +166,7 @@ class Journal:
                         j["end"] = r["time"]
                         # run seconds when this reply came: earlier jobs whole, this one so far
                         at = sum(x["end"] - x["start"] for x in self.jobs[:-1]) + r["time"] - j["start"]
-                        self.cache.setdefault(req_key(r["req"]), deque()).append((at, r["rep"]))
+                        self.cache.setdefault(req_key(r["req"]), deque()).append((at, r["rep"], len(self.jobs) - 1))
             with open(path, "rb+") as f:
                 f.truncate(good)
             if not self.jobs:
@@ -149,7 +177,7 @@ class Journal:
         q = None if self.live else self.cache.get(req_key(req))
         if q:
             self.n_cached += 1
-            at, rep = q.popleft()
+            at, rep, self.last_job = q.popleft()
             self.replayed = max(self.replayed, at)
             return rep
         self.live = True
@@ -184,7 +212,7 @@ def live(a):
     if a.inner_selection:
         env["MPIR_CVAR_COLL_SELECTION_JSON_FILE"] = os.path.abspath(a.inner_selection)
     env.update(kv.split("=", 1) for kv in a.env)
-    several = len(a.algs) > 1 or bool(a.coll_algorithms)     # catalog: always several, with the precheck
+    several = len(a.algs) > 1 or bool(a.coll_algorithms) or bool(a.model)
     if a.switch != "request" and not several:
         env[OPS[a.op]] = a.algs[0]  # the launch's algorithm
     srv = Server(launcher=shlex.split(a.launcher), env=env, max_m=a.max_m, timeout=a.timeout,
@@ -264,18 +292,17 @@ def replay(a):
     return send, make_req, probe, layouts, sizes, NODES, max(p for _, p in layouts), max(sizes), meta, None
 
 
-def make_measure(journal, send, make_req):
-    """measure(n, ppn, alg, [m, ...]) -> [(t_us, wall_us), ...]: answers from
-    the journal where it has them, the rest measured as one batch and
-    journaled. send() also gets each request's occurrence count (how often it
-    was asked before), for an order-independent replay."""
+def make_measure(journal, send, make_req, on_reply=None):
+    """measure(n, ppn, alg, [m, ...], tag=None) -> [(t_us, wall_us), ...]:
+    answers from the journal where it has them, the rest measured as one batch
+    and journaled. send() also gets each request's occurrence count (how often
+    it was asked before), for an order-independent replay. on_reply(req, rep,
+    journal job index or None for this job) sees every answer, in order."""
     counts = {}
 
-    def measure(n, ppn, alg, ms):
-        """reuse: {request key: reply} answered earlier (by another set's builder),
-        returned again at no cost"""
-        reqs = [make_req(n, ppn, alg, m) for m in ms]
-        out, todo = [None] * len(reqs), []
+    def measure(n, ppn, alg, ms, tag=None):
+        reqs = [dict(make_req(n, ppn, alg, m), **({"tag": tag} if tag else {})) for m in ms]
+        out, todo, job = [None] * len(reqs), [], [None] * len(reqs)
         for i, r in enumerate(reqs):
             k = req_key(r)
             occ = counts.get(k, 0)
@@ -284,17 +311,21 @@ def make_measure(journal, send, make_req):
             if rep is None:
                 todo.append((i, occ))
             else:
-                out[i] = rep
+                out[i], job[i] = rep, journal.last_job
         if todo:
             reps = send([reqs[i] for i, _ in todo], [o for _, o in todo])
             for (i, _), rep in zip(todo, reps):
                 out[i] = rep
                 journal.write({"req": reqs[i], "rep": rep})
             journal.flush()
-        for r, rep in zip(reqs, out):
+        for r, rep, j in zip(reqs, out, job):
             measure.answered[req_key(r)] = rep
+            measure.wall_us += float(rep["wall_us"])
+            if on_reply:
+                on_reply(r, rep, j)
         return [(float(np.median(r["t_us"])), float(r["wall_us"])) for r in out]
     measure.answered = {}
+    measure.wall_us = 0.0       # recorded wall time of every answer (replay bills this)
     return measure
 
 
@@ -316,30 +347,30 @@ def reusing(measure, make_req):
     return f
 
 
+def make_probe(journal, probe, make_req, probe_m, on_reply=None):
+    """probe(n, ppn, alg) -> (ok, msg): one call of the algorithm on the layout,
+    journaled like a measurement."""
+    def f(n, ppn, alg):
+        req = dict(make_req(n, ppn, alg, probe_m), batches=1, probe=1)
+        rep = journal.take(req)
+        j = journal.last_job if rep is not None else None
+        if rep is None:
+            rep = probe(req)
+            journal.write({"req": req, "rep": rep})
+            journal.flush()
+        if on_reply:
+            on_reply(req, rep, j)
+        return rep["status"] == "ok", rep.get("msg", "")
+    return f
+
+
 def rnd(x, nd=4):
     """round, with NaN (no value) as JSON null"""
     return None if x != x else round(x, nd)
 
 
-def model_v2(algs, b, sizes):
-    """collmodel/2: one collmodel/1 model per algorithm, plus the selection
-    (the predicted fastest algorithm) at every measured layout and size, and
-    the crossovers located there."""
-    m = b.model()
-    models = {alg: m.models[alg].to_json(sizes)["model"] for alg in algs}
-    sel = []
-    for lay in sorted(b.samplers):
-        w, t = m.select(*lay)
-        sel.append({"N": lay[0], "ppn": lay[1], "alg": [algs[k] for k in w],
-                    "t_us": [round(float(2 ** v), 4) for v in t]})
-    return {"format": "collmodel/2", "inputs": ["N", "ppn", "m"], "output": "t_us", "algs": algs,
-            "sizes": [int(x) for x in sizes], "models": models, "selection": sel,
-            "crossovers": [{"N": l[0], "ppn": l[1], "lo": lo, "hi": hi, "from": x, "to": y}
-                           for l, s in sorted(b.samplers.items()) for lo, hi, x, y in s.crossovers]}
-
-
 def builder_meta(a, names, b):
-    """The builder's settings, stop and estimate, for the model file's meta."""
+    """The builder's settings, stop and estimate."""
     if len(names) > 1:
         return {"tau_gm": a.tau_gm, "tau_p95": a.tau_p95, "prune": a.prune,
                 "measurements_per_alg": b.n_meas_alg,
@@ -352,83 +383,81 @@ def builder_meta(a, names, b):
                        for l, k, md, p9, _, _ in b.checks]}
 
 
-def model_body(names, b, sizes):
-    if len(names) > 1:
-        return model_v2(names, b, sizes)
+def model_v1(a, b, sizes, nodes, ppn_max, meta, jobs, complete, cost):
+    """collmodel/1: one algorithm (builder v1)."""
     d = b.model().to_json(sizes)
-    d["alg"] = names[0]
+    d["alg"] = a.algs[0]
     d["jumps"] = [{"N": n, "ppn": p, "lo": lo, "hi": hi, "ratio": round(float(r), 3)}
                   for (n, p), g in sorted(b.samplers.items()) for lo, hi, r in g.jumps]
+    d["what"] = f"{a.op}-latency"
+    d["domain"] = {"N": [1, nodes], "ppn": [1, ppn_max], "m": [int(sizes[0]), int(sizes[-1])]}
+    d["meta"] = {"created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                 "tool": VERSION, **meta, "complete": complete, "n_measurements": b.n_meas,
+                 "n_layouts": len(b.samplers), "node_h": round(cost(), 4), "nodes_billed": nodes, "jobs": jobs,
+                 "stop": b.stop, **builder_meta(a, a.algs, b)}
     return d
 
 
-def model_file(a, built, cat, sizes, nodes, ppn_max, meta, jobs, complete, cost):
-    """built: [(mask, layouts, algorithm names, builder)], set 0 first. Without
-    a catalog (one set): collmodel/1 or /2; with one: collmodel/3, a model per
-    restriction set."""
-    common = {"created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-              "tool": VERSION, **meta, "complete": complete,
-              "n_measurements": sum(x[3].n_meas for x in built),
-              "n_layouts": sum(len(x[3].samplers) for x in built), "node_h": round(cost(), 4),
-              "nodes_billed": nodes, "jobs": jobs}
-    domain = {"N": [1, nodes], "ppn": [1, ppn_max], "m": [int(sizes[0]), int(sizes[-1])]}
-    if cat is None:
-        _, _, names, b = built[0]
-        d = model_body(names, b, sizes)
-        d["what"] = f"{a.op}-latency"
-        d["domain"] = domain
-        d["meta"] = dict(common, stop=b.stop, **builder_meta(a, names, b))
-        return d
-    sets = []
-    for mask, lays, names, b in built:
-        if not b.samplers:
-            continue
-        body = model_body(names, b, sizes)
-        fallback = dict(cat.get("fallbacks", [])).get(mask)
-        sets.append({"mask": mask, "name": set_name(a.op, mask), "layouts": [list(l) for l in lays],
-                     **({"fallback": fallback} if fallback is not None else {}),
-                     "algs": names, "model": body, "stop": b.stop, "n_layouts": len(b.samplers),
-                     "meta": builder_meta(a, names, b)})
-    return {"format": "collmodel/3", "what": f"{a.op}-latency", "domain": domain,
-            "sizes": [int(x) for x in sizes], **cat, "sets": sets,
-            "meta": dict(common, stop=built[-1][3].stop)}
+def builder_curves(b, names):
+    """{alg: {layout: curve}} of a set's builder (v1 for one algorithm, v2 for several)."""
+    if len(names) == 1:
+        return {names[0]: dict(b.curves)}
+    return {alg: dict(cs) for alg, cs in b.curves.items()}
 
 
-def make_probe(journal, probe, make_req, probe_m):
-    """probe(n, ppn, alg) -> (ok, msg): one call of the algorithm on the layout,
-    journaled like a measurement."""
-    def f(n, ppn, alg):
-        req = dict(make_req(n, ppn, alg, probe_m), batches=1, probe=1)
-        rep = journal.take(req)
-        if rep is None:
-            rep = probe(req)
-            journal.write({"req": req, "rep": rep})
-            journal.flush()
-        return rep["status"] == "ok", rep.get("msg", "")
-    return f
+def store_curves(model, built):
+    """The builders' curves into the model, one per (algorithm, layout): from the
+    builder of the layout's own restriction set (it sampled there against
+    every algorithm that runs there), else from set 0's."""
+    pick = {}
+    for mask, _, names, b in built:
+        for alg, cs in builder_curves(b, names).items():
+            for lay, c in cs.items():
+                rank = 0 if model.masks.get(lay, 0) == mask else 1 if mask == 0 else 2
+                if (alg, lay) not in pick or rank < pick[(alg, lay)][0]:
+                    pick[(alg, lay)] = (rank, c)
+    for (alg, lay), (_, c) in pick.items():
+        model.set_curve(alg, lay, c)
 
 
-def restriction_sets(a, layouts, probe):
-    """Precheck and restriction sets from the catalog: ([(mask, layouts, names)], catalog info)."""
+def catalog_algs(a):
+    """(catalog Alg objects of the op, restriction bit names) from --coll-algorithms, or (None, [])."""
+    if not a.coll_algorithms:
+        return None, []
     cat = Catalog.load(a.coll_algorithms)
-    algs = cat.algorithms(a.op)
     cat.check(a.op)
-    bits = cat.restriction_bits()
+    return cat.algorithms(a.op), cat.restriction_bits()
+
+
+def alg_info(x, bits):
+    return {"leaf": x.leaf, "restrictions": x.restrictions, "mask": x.mask(bits),
+            "inner": ["@".join(i) for i in x.inner]}
+
+
+def compositional_names(a, algs):
+    """The algorithms left for later: --compositional, default those with an inner key
+    (for files without the key: those restricted to hierarchical)."""
+    if a.compositional is not None:
+        return [x for x in a.compositional.split(",") if x]
+    has_inner = any(x.inner for x in algs)
+    return [x.name for x in algs if (x.inner if has_inner else "hierarchical" in x.restrictions)]
+
+
+def restriction_sets(a, model, algs, probe):
+    """Create: precheck and restriction sets from the catalog: [(mask, layouts, names)]."""
     if a.algs != ["all"]:
         known = {x.name for x in algs}
         bad = [x for x in a.algs if x not in known]
         if bad:
             sys.exit(f"--algs: not {a.op} algorithms in {a.coll_algorithms}: {', '.join(bad)}")
         algs = [x for x in algs if x.name in a.algs]
-    # default: the algorithms with an inner key; files from before the key: those restricted to hierarchical
-    has_inner = any("inner" in k for sec in cat.sections.values() for _, k in sec)
-    stage2 = a.stage2.split(",") if a.stage2 is not None else \
-        [x.name for x in algs if (x.inner if has_inner else "hierarchical" in x.restrictions)]
-    stage2 = [x for x in stage2 if x]
-    algs1 = [x for x in algs if x.name not in stage2]
-    if stage2:
-        print(f"stage 2 (not measured here): {', '.join(stage2)}", file=sys.stderr)
-    feas, masks, notes = precheck(probe, layouts, algs1, bits)
+    comp = compositional_names(a, algs)
+    algs1 = [x for x in algs if x.name not in comp]
+    if comp:
+        print(f"compositional (add them later with --model ... --inner-selection): {', '.join(comp)}",
+              file=sys.stderr)
+    bits = model.conditions
+    feas, masks, notes = precheck(probe, model.layouts, algs1, bits)
     for n in notes:
         print("precheck: " + n, file=sys.stderr)
     # an unrestricted algorithm that fails somewhere is left out everywhere
@@ -439,66 +468,11 @@ def restriction_sets(a, layouts, probe):
     sets = plan_sets(algs1, bits, masks)
     for mask, lays, names in sets:
         print(f"set {set_name(a.op, mask)}: {len(lays)} layouts, algorithms {', '.join(names)}", file=sys.stderr)
-    info = {"conditions": bits,
-            "algorithms": {x.name: {"leaf": x.leaf, "mask": x.mask(bits), "restrictions": x.restrictions}
-                           for x in algs},
-            "layout_masks": [[l[0], l[1], m] for l, m in sorted(masks.items())],
-            "feasible": [[l[0], l[1], sorted(f)] for l, f in sorted(feas.items())],
-            "stage2": stage2, "left_out": sorted(broken), "precheck_notes": notes}
-    return sets, info
-
-
-def stage2_restriction_sets(a, layouts, probe):
-    """Stage 2: precheck of the compositional algorithms with the stage-1 file
-    loaded, the two-stage check, and the new sets: ([(mask, layouts, names)], info)."""
-    cat = Catalog.load(a.coll_algorithms)
-    cat.check(a.op)
-    bits = cat.restriction_bits()
-    s1 = json.load(open(a.stage1))
-    if s1.get("format") != "collmodel/3" or s1.get("stage", 1) != 1:
-        sys.exit(f"--stage1 {a.stage1}: not a stage-1 collmodel/3 file (bin/collmodel --coll-algorithms)")
-    if s1["conditions"] != bits:
-        sys.exit(f"--stage1 {a.stage1}: built with a different coll_algorithms.txt (restrictions differ)")
-    masks1 = {(n, q): m for n, q, m in s1["layout_masks"]}
-    if set(layouts) != set(masks1):
-        sys.exit(f"--stage1 {a.stage1}: its layouts differ from this allocation's (run stage 2 on the same "
-                 "allocation size)")
-    algs = cat.algorithms(a.op)
-    names2 = a.stage2.split(",") if a.stage2 is not None else [x.name for x in algs if x.inner]
-    if a.algs != ["all"]:
-        names2 = [x for x in names2 if x in a.algs]
-    algs2 = [x for x in algs if x.name in names2]
-    if not algs2:
-        sys.exit("stage 2: no compositional algorithms (none with an inner key)")
-    if a.inner_selection:
-        f1 = json.load(open(a.inner_selection))
-        missing = sorted({sec for x in algs2 for sec, _ in x.inner if f"name={sec}-auto" not in f1})
-        if missing:
-            sys.exit(f"--inner-selection {a.inner_selection}: no subtree for {', '.join(missing)}")
-    elif not a.replay:
-        sys.exit("stage 2 needs --inner-selection (the stage-1 tuning file)")
-    feas2 = {lay: {x.name for x in algs2 if probe(lay[0], lay[1], x.name)[0]} for lay in layouts}
-    problems, notes = fixed_point(algs2, feas2, a.op)
-    for n in notes:
-        print("two-stage check: " + n, file=sys.stderr)
-    if problems:
-        sys.exit("two-stage check failed: an inner call can run a stage-2 algorithm:\n  " + "\n  ".join(problems))
-    sets, masks2, notes2 = stage2_sets(algs2, bits, masks1, feas2)
-    for n in notes2:
-        print("stage 2: " + n, file=sys.stderr)
-    for mask, lays, names, fb in sets:
-        print(f"set {set_name(a.op, mask)}: {len(lays)} layouts, algorithms {', '.join(names)}; "
-              f"falls back to {set_name(a.op, fb)}", file=sys.stderr)
-    info = {"stage": 2, "stage1": os.path.abspath(a.stage1),
-            "inner_selection": os.path.abspath(a.inner_selection) if a.inner_selection else None,
-            "conditions": bits,
-            "algorithms": dict({x.name: {"leaf": x.leaf, "mask": x.mask(bits), "restrictions": x.restrictions,
-                                         "inner": ["@".join(i) for i in x.inner]} for x in algs2},
-                               auto={"leaf": None, "mask": 0, "restrictions": []}),
-            "layout_masks": [[l[0], l[1], m] for l, m in sorted(masks2.items())],
-            "feasible": [[l[0], l[1], sorted(f)] for l, f in sorted(feas2.items())],
-            "fallbacks": [[m, fb] for m, _, _, fb in sets], "two_stage_notes": notes}
-    return [(m, lays, names) for m, lays, names, _ in sets], info
+    model.algorithms.update({x.name: alg_info(x, bits) for x in algs1})
+    model.masks = dict(masks)
+    model.left_out = sorted(broken)
+    model.notes += ["precheck: " + n for n in notes]
+    return sets
 
 
 def drop_unfinished(b):
@@ -519,6 +493,306 @@ def write_atomic(path, d):
     os.replace(tmp, path)
 
 
+# ---- adding to a model -----------------------------------------------------
+
+def parse_layouts(text, allowed):
+    out = []
+    for x in text.split(","):
+        n, q = (int(v) for v in x.lower().split("x"))
+        if (n, q) not in allowed:
+            sys.exit(f"--layouts: {x} is not an allowed layout of this allocation")
+        out.append((n, q))
+    return out
+
+
+def layout_order(lays):
+    """Layouts to visit: the initial layouts of the layout loop first (where a
+    new algorithm gets its full coarse pass), then the rest."""
+    lays = sorted(lays)
+    if not lays:
+        return []
+    first = initial_layouts(lays, max(n for n, _ in lays), max(q for _, q in lays))
+    return first + [l for l in lays if l not in first]
+
+
+class Extender:
+    """Sample algorithms into a model, one layout at a time (docs/design.md, section 12)."""
+
+    def __init__(self, a, model, measure, inner_of):
+        self.a, self.model, self.measure, self.inner_of = a, model, measure, inner_of
+        self.wall_us, self.n_meas, self.layouts = 0.0, 0, []
+
+    def prior(self, alg, lay):
+        """The model's prediction of alg at lay, from at least 3 of its curves of the
+        same kind (single-node or not), or None (then its coarse pass is full)."""
+        cs = [l for l in self.model.curves.get(alg, {}) if (l[0] == 1) == (lay[0] == 1)]
+        return self.model.predict(alg, *lay) if len(cs) >= 3 else None
+
+    def run_layout(self, lay, sample, feas):
+        """Sample the algorithms in `sample` that may run at lay, against every
+        algorithm the model has there. Returns the number of measurements."""
+        m = self.model
+        mask = m.masks.get(lay, 0)
+        algs = [x for x in m.algorithms if x not in m.left_out and m.allowed(x, mask) and x in feas.get(lay, ())
+                and (x in sample or lay in m.curves.get(x, {}))]
+        todo = [x for x in algs if x in sample]
+        if not todo:
+            return 0
+        n, ppn = lay
+        before = self.n_meas
+
+        def m1(alg, ms):
+            out = self.measure(n, ppn, alg, ms)
+            self.wall_us += sum(w for _, w in out)
+            self.n_meas += len(ms)
+            return [t for t, _ in out]
+        known = {x: known_sampler(lambda ms, x=x: m1(x, ms), m.sizes, m.values(x, lay, self.inner_of(x)),
+                                  m.curves[x][lay]) for x in algs if x not in sample}
+        prior = {x: self.prior(x, lay) for x in todo}
+        s = MultiSampler(m1, algs, m.sizes, prior=prior, prune=self.a.prune or 1e9, known=known).run()
+        for x in algs:
+            if s.g[x].vals:
+                m.set_curve(x, lay, s.curve(x))
+        self.layouts.append(lay)
+        return self.n_meas - before
+
+
+def anchors(a, model, measure, jobs_before):
+    """Remeasure a few points of the model's best algorithms at layouts earlier jobs
+    measured: (points, ratio geomean, ratio max) of new / earlier values."""
+    m = model
+    earlier = [r for r in m.measurements if r["job"] < jobs_before and not r.get("anchor")]
+    if not earlier or not a.anchors:
+        return None
+    have = {(r["N"], r["ppn"]) for r in earlier}
+    lays = layout_order(have)[:max(a.anchors, 0)]
+    idx = {s: i for i, s in enumerate(m.sizes)}
+    ratios = []
+    for lay in lays:
+        algs = [x for x in m.algorithms if not m.is_compositional(x) and lay in m.curves.get(x, {})]
+        if not algs:
+            continue
+        old = {x: {} for x in algs}
+        for r in earlier:
+            if (r["N"], r["ppn"]) == lay and r["alg"] in old and r["m"] in idx:
+                old[r["alg"]].setdefault(idx[r["m"]], []).append(float(np.median(r["t_us"])))
+        best = np.argmin([m.curves[x][lay] for x in algs], axis=0)
+        pts = sorted({i for i in range(len(m.sizes)) if i in old[algs[best[i]]]})
+        if not pts:
+            continue
+        pick = [pts[int(round(k * (len(pts) - 1) / 3))] for k in range(4)] if len(pts) > 4 else pts
+        for i in sorted(set(pick)):
+            x = algs[best[i]]
+            t, _ = measure(lay[0], lay[1], x, [m.sizes[i]], tag="anchor")[0]
+            ratios.append(t / float(np.median(old[x][i])))
+    if not ratios:
+        return None
+    lr = np.log(ratios)
+    return {"points": len(ratios), "ratio_geomean": round(float(np.exp(lr.mean())), 4),
+            "ratio_max": round(float(np.exp(lr[np.argmax(np.abs(lr))])), 4)}
+
+
+def extend(a, model, measure, probe, inner_hash, clock, nodes, on_layout, stop_check, cost):
+    """Add algorithms (a.algs) or layouts (a.layouts) to the model. Returns the run record."""
+    m = model
+    algs, bits = catalog_algs(a)
+    if algs is not None:
+        if bits[:len(m.conditions)] != m.conditions:
+            sys.exit(f"--coll-algorithms: its restrictions {bits} do not extend the model's {m.conditions}")
+        m.conditions = bits
+        by_name = {x.name: x for x in algs}
+        for name in m.algorithms:
+            if name in by_name:
+                m.algorithms[name] = alg_info(by_name[name], bits)
+    elif m.conditions:
+        sys.exit("the model has restriction sets: give --coll-algorithms to add to it")
+    else:
+        by_name = {}
+    if a.algs == ["all"]:       # the catalog's algorithms the model lacks (compositional ones need their file)
+        want = [x.name for x in algs if x.name not in m.algorithms and x.name not in m.left_out
+                and (not x.inner or a.inner_selection or a.replay)]
+    else:
+        want = list(a.algs)
+    for name in want:
+        if algs is not None and name not in by_name:
+            sys.exit(f"--algs: {name} is not a {a.op} algorithm in {a.coll_algorithms}")
+    comp = [x for x in want if by_name.get(x) is not None and by_name[x].inner]
+    if comp and not a.inner_selection and not a.replay:
+        sys.exit(f"--algs: {', '.join(comp)} compositional: give --inner-selection (the tuning file of its "
+                 "inner calls)")
+    sample = set()
+    for name in want:
+        if name not in m.algorithms:
+            m.algorithms[name] = alg_info(by_name[name], bits) if name in by_name else \
+                {"leaf": None, "restrictions": [], "mask": 0, "inner": []}
+            sample.add(name)
+        elif m.is_compositional(name) and m.fit_inner.get(name) != inner_hash:
+            print(f"{name}: measured under another inner selection; its curves are replaced", file=sys.stderr)
+            m.drop_curves(name)
+            sample.add(name)
+        else:
+            print(f"{name}: in the model already (give --layouts to measure it at more layouts)", file=sys.stderr)
+    # precheck what has none: the new algorithms everywhere, every algorithm at new layouts
+    new_lays = parse_layouts(a.layouts, set(m.layouts)) if a.layouts else []
+    if by_name:
+        for lay in m.layouts:
+            for name in m.algorithms:
+                if name in m.left_out or m.prechecked(name, lay) or name not in by_name:
+                    continue
+                if name in sample or lay in new_lays:
+                    probe(lay[0], lay[1], name)
+        cat_algs = [by_name[x] for x in m.algorithms if x in by_name]
+        for n in m.update_masks(cat_algs):
+            print("precheck: " + n, file=sys.stderr)
+        feas = m.feasible()
+        broken = sorted(x for x in sample if m.mask_of(x) == 0 and any(x not in f for f in feas.values()))
+        if broken:
+            print(f"precheck: left out (fails without a restriction): {', '.join(broken)}", file=sys.stderr)
+            m.left_out = sorted(set(m.left_out) | set(broken))
+            sample -= set(broken)
+        comp_algs = [by_name[x] for x in m.algorithms if x in by_name and by_name[x].inner and x not in m.left_out]
+        problems, notes = fixed_point(comp_algs, feas, a.op)
+        for n in notes:
+            print("two-stage check: " + n, file=sys.stderr)
+        if problems:
+            sys.exit("two-stage check failed: an inner call can run a compositional algorithm:\n  "
+                     + "\n  ".join(problems))
+    else:
+        feas = {l: set(m.algorithms) for l in m.layouts}
+    for mask, lays in sorted(m.sets().items()):
+        names = [x for x in m.algorithms if x not in m.left_out and m.allowed(x, mask)]
+        print(f"set {set_name(a.op, mask)}: {len(lays)} layouts, algorithms {', '.join(names)}", file=sys.stderr)
+    run = {"mode": "add", "algs": sorted(sample), "layouts": [list(l) for l in new_lays]}
+    run["anchors"] = anchors(a, m, measure, a._jobs_before)
+    if run["anchors"]:
+        x = run["anchors"]
+        print(f"anchors: {x['points']} points, new / earlier ratio geomean {x['ratio_geomean']:.3f}, "
+              f"worst {x['ratio_max']:.3f}", file=sys.stderr)
+        if abs(np.log(x["ratio_max"])) > np.log(a.drift_tol):
+            print(f"warning: an anchor moved more than {a.drift_tol}x since the earlier jobs; consider "
+                  "remeasuring rather than mixing", file=sys.stderr)
+    ext = Extender(a, m, measure, lambda x: inner_hash if m.is_compositional(x) else None)
+    ext.clock_spent = lambda: clock() * nodes / 3600
+    run["stop"] = "done"
+    plan = [(lay, sample) for lay in layout_order(m.measured_layouts())] + \
+        [(lay, set(m.algorithms) - set(m.left_out)) for lay in new_lays]
+    try:
+        for lay, what in plan:
+            why = stop_check()
+            if why:
+                run["stop"] = why
+                break
+            if ext.clock_spent() >= a.budget_node_h:
+                run["stop"] = "budget"
+                break
+            if lay in new_lays:
+                what = {x for x in what if lay not in m.curves.get(x, {})}
+            if ext.run_layout(lay, what, feas):
+                on_layout()
+    except Terminated:
+        run["stop"] = "terminated"
+        print("SIGTERM: writing the model from the finished layouts", file=sys.stderr)
+    for x in sample:
+        if m.is_compositional(x):
+            m.fit_inner[x] = inner_hash
+    run.update(n_measurements=ext.n_meas, n_layouts=len(ext.layouts), node_h=round(cost(), 4))
+    return run
+
+
+# ---- import of collmodel/3 ---------------------------------------------------
+
+def import_v3(a):
+    """collmodel/3 files (stage 1, then stage 2) and their journals into one model."""
+    model = None
+    for spec in a.import_:
+        path, _, log = spec.partition(":")
+        d = json.load(open(path))
+        if d.get("format") != "collmodel/3":
+            sys.exit(f"--import {path}: not a collmodel/3 file")
+        op = d["what"].split("-")[0]
+        stage2 = d.get("stage") == 2
+        if model is None:
+            if stage2:
+                sys.exit(f"--import {path}: a stage-2 file comes after its stage-1 file")
+            n_hi, p_hi = d["domain"]["N"][1], d["domain"]["ppn"][1]
+            layouts = [(n, q) for n, q, _ in d["layout_masks"]] or \
+                [(n, q) for n in axis_values(n_hi) for q in axis_values(p_hi) if n * q > 1]
+            model = Model(op, d["sizes"], layouts, d["domain"], d["conditions"])
+            model.left_out = d.get("left_out", [])
+            model.notes += ["precheck: " + n for n in d.get("precheck_notes", [])]
+        elif d["conditions"] != model.conditions:
+            sys.exit(f"--import {path}: other restrictions than the stage-1 file")
+        inner = None
+        if stage2:
+            if not a.inner_selection:
+                sys.exit(f"--import {path}: a stage-2 file needs --inner-selection (the stage-1 tuning file)")
+            inner = model.add_inner_file(open(a.inner_selection).read())
+        for name, x in d["algorithms"].items():
+            if name == "auto":
+                continue
+            model.algorithms[name] = {"leaf": x["leaf"], "restrictions": x["restrictions"], "mask": x["mask"],
+                                      "inner": x.get("inner", [])}
+        model.masks = {(n, q): mk for n, q, mk in d["layout_masks"]}
+        # journal: jobs, measurements, prechecks
+        base = len(model.jobs)
+        if log:
+            jobs = -1
+            for line in open(log):
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    break
+                if "job" in r:
+                    model.add_job(dict(r["job"], end=r["time"], inner_selection=inner, imported_from=log))
+                    jobs += 1
+                    continue
+                if "req" not in r or jobs < 0:
+                    continue
+                req, rep, job = r["req"], r["rep"], base + jobs
+                model.jobs[job]["end"] = r["time"]
+                alg = req_alg(req, op)
+                n, q = req["p"] // req["ppn"], req["ppn"]
+                if req.get("probe"):
+                    model.add_precheck(job, alg, n, q, rep["status"] == "ok", rep.get("msg", ""))
+                elif rep.get("status") == "ok" and alg != "auto":
+                    model.add_measurement(job, alg, n, q, req["m"], rep["t_us"], rep["wall_us"],
+                                          inner=inner if model.is_compositional(alg) else None,
+                                          anchor=req.get("tag") == "anchor")
+        else:
+            print(f"--import {path}: no journal; the model has its curves but no measurements", file=sys.stderr)
+            model.add_job({"imported_from": path, "inner_selection": inner})
+        if not any(p for p in model.prechecks if p["job"] >= base):
+            for n, q, ok in d.get("feasible", []):
+                for name in d["algorithms"]:
+                    if name != "auto":
+                        model.add_precheck(base, name, n, q, name in ok, "")
+        # curves: each (algorithm, layout) from the set of the layout's own mask, else set 0 (as
+        # store_curves); a stage-2 set's "auto" (the stage-1 file's choice) is not an algorithm
+        pick = {}
+        for x in d["sets"]:
+            mask = x["mask"]
+            for name in x["algs"]:
+                if name == "auto":
+                    continue
+                mod = x["model"]
+                one = mod["models"][name] if "models" in mod else mod["model"]    # a one-algorithm set: collmodel/1
+                for c in one["layouts"]:
+                    lay = (c["N"], c["ppn"])
+                    rank = 0 if model.masks.get(lay, 0) == mask else 1 if mask == 0 else 2
+                    if (name, lay) not in pick or rank < pick[(name, lay)][0]:
+                        pick[(name, lay)] = (rank, c["log2_t"])
+                if stage2 and model.is_compositional(name):
+                    model.fit_inner[name] = inner
+        for (name, lay), (_, c) in pick.items():
+            model.set_curve(name, lay, c)
+        model.runs.append({"mode": "import", "from": path, "journal": log or None, "meta": d.get("meta")})
+    model.save(a.out)
+    print(f"{a.out}: {len(model.algorithms)} algorithms, {len(model.measured_layouts())} layouts, "
+          f"{len(model.measurements)} measurements, {len(model.jobs)} jobs")
+
+
+# ---- main ----------------------------------------------------------------------
+
 def parse_args(argv):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--op", default="bcast", choices=sorted(OPS))
@@ -527,15 +801,22 @@ def parse_args(argv):
     g.add_argument("--algs", help="several algorithms, comma-separated (builder v2: selection); all: every "
                    "algorithm in --coll-algorithms")
     ap.add_argument("--out", required=True, help="model file to write (JSON)")
+    ap.add_argument("--model", metavar="MODEL", help="add to this model file (collmodel/4): the algorithms of "
+                    "--algs that it does not have, and the layouts of --layouts")
+    ap.add_argument("--layouts", metavar="NxPPN,...", help="with --model: measure every algorithm at these "
+                    "layouts too")
+    ap.add_argument("--anchors", type=int, default=3, help="with --model: layouts at which to remeasure a few "
+                    "points of the best algorithms, for the drift between jobs (0: none)")
+    ap.add_argument("--drift-tol", type=float, default=1.10, help="warn when an anchor moved more than this")
+    ap.add_argument("--import", dest="import_", action="append", default=[], metavar="MODEL3[:JOURNAL]",
+                    help="convert collmodel/3 files (stage 1, then stage 2) with their journals into --out")
     ap.add_argument("--coll-algorithms", metavar="PATH", help="the build's src/mpi/coll/coll_algorithms.txt: "
-                    "restriction sets, with a precheck (collmodel/3)")
-    ap.add_argument("--stage2", help="compositional algorithms to leave out, comma-separated (default: those "
-                    "with an inner key in coll_algorithms.txt)")
+                    "restriction sets, with a precheck")
+    ap.add_argument("--compositional", help="when creating a model: algorithms to leave for later, "
+                    "comma-separated (default: those with an inner key in coll_algorithms.txt)")
     ap.add_argument("--probe-m", type=int, default=1024, help="message size of the precheck calls")
-    ap.add_argument("--stage1", metavar="MODEL", help="stage 2: the stage-1 model file (collmodel/3); measures "
-                    "the compositional algorithms")
-    ap.add_argument("--inner-selection", metavar="JSON", help="stage 2: the stage-1 tuning file, loaded in the "
-                    "launch (MPIR_CVAR_COLL_SELECTION_JSON_FILE) for the inner calls")
+    ap.add_argument("--inner-selection", metavar="JSON", help="the tuning file loaded in the launch "
+                    "(MPIR_CVAR_COLL_SELECTION_JSON_FILE) for a compositional algorithm's inner calls")
     ap.add_argument("--budget-node-h", type=float, default=2.0, help="stop after this many node-hours, all jobs")
     ap.add_argument("--tau-med", type=float, default=0.05, help="v1: stop when the estimated median error is below this")
     ap.add_argument("--tau-p90", type=float, default=0.20, help="v1: ... and the estimated p90 error is below this")
@@ -574,13 +855,20 @@ def parse_args(argv):
                         "or multi-node layouts with several ranks per node (hier); e.g. release_gather=auto@single "
                         "(MPICH's default on one node)")
     a = ap.parse_args(argv)
-    if not (a.alg or a.algs or a.stage1):
-        ap.error("one of --alg, --algs or --stage1 is required")
-    a.algs = a.algs.split(",") if a.algs else [a.alg] if a.alg else ["all"]
+    if a.import_:
+        return a
+    if not (a.alg or a.algs or (a.model and a.layouts)):
+        ap.error("one of --alg or --algs is required (or --model with --layouts)")
+    a.algs = a.algs.split(",") if a.algs else [a.alg] if a.alg else []
+    if a.model:
+        if a.alg:
+            ap.error("--model adds to a model of several algorithms: use --algs")
+        if os.path.abspath(a.model) == os.path.abspath(a.out):
+            ap.error("--out must not be the --model file (a resumed run needs the model it started from)")
+    elif a.layouts:
+        ap.error("--layouts needs --model")
     if a.algs == ["all"] and not a.coll_algorithms:
         ap.error("--algs all needs --coll-algorithms")
-    if a.stage1 and not a.coll_algorithms:
-        ap.error("--stage1 needs --coll-algorithms")
     if a.site:
         if not (a.nodes and a.ppn):
             ap.error("--site needs --nodes and --ppn")
@@ -603,18 +891,27 @@ def on_sigterm(signum, frame):
 
 def main(argv=None):
     a = parse_args(argv)
+    if a.import_:
+        return import_v3(a)
     t_start = time.time()
     signal.signal(signal.SIGTERM, on_sigterm)
+    base = Model.load(a.model) if a.model else None
+    base_hash = hashlib.sha256(open(a.model, "rb").read()).hexdigest()[:16] if a.model else None
+    inner_text = open(a.inner_selection).read() if a.inner_selection else None
+    inner_hash = file_hash(inner_text) if inner_text else None
     journal = Journal(a.log, a.resume)
     srv = None
-    built = []      # [(mask, layouts, algorithm names, builder)], in build order
+    v1 = not a.model and len(a.algs) == 1 and not a.coll_algorithms
+    built = []      # [(mask, layouts, algorithm names, builder)], in build order (creating a model)
+    model, run = None, None
     try:
         send, make_req, probe, layouts, sizes, nodes, ppn_max, max_m, meta, srv = \
             (replay if a.replay else live)(a)
         job = {"start": round(t_start, 3), "mode": "replay" if a.replay else "live", "op": a.op, "algs": a.algs,
                "seed": a.seed, "batches": a.batches, "sync": a.sync, "prune": a.prune, "nodes": nodes,
                "ppn_max": ppn_max, "max_m": max_m, "hosts": meta.get("hosts"), "tool": VERSION,
-               "stage2": a.stage2, "probe_m": a.probe_m, "stage1": a.stage1}
+               "compositional": a.compositional, "probe_m": a.probe_m, "base": base_hash, "inner": inner_hash,
+               "layouts": a.layouts, "anchors": a.anchors if a.model else None}
         if journal.jobs:
             first = journal.jobs[0]
             diff = [k for k in SAME_ON_RESUME if first.get(k) != job.get(k)]
@@ -627,32 +924,61 @@ def main(argv=None):
         journal.flush()
         jobs = [{k: j.get(k) for k in ("start", "end", "hosts")} for j in journal.jobs] + \
                [{"start": job["start"], "end": None, "hosts": job["hosts"]}]
-        # live: bill the real elapsed time of all jobs (launch, driver, fitting); replay: the recorded wall
-        # time of every set's builder
-        clock = (lambda: sum(x[3].wall_us for x in built) * 1e-6) if a.replay else \
-            (lambda: journal.clock(t_start))
-        # what the run has cost so far, for the model file (the budget clock above may lag while replaying)
-        cost = (lambda: built[-1][3].spent()) if a.replay else \
-            (lambda: (journal.earlier_seconds() + time.time() - t_start) * nodes / 3600)
-        measure = make_measure(journal, send, make_req)
-        cat = None
-        if a.stage1:
-            sets, cat = stage2_restriction_sets(a, layouts, make_probe(journal, probe, make_req, a.probe_m))
-            if not sets:
-                sys.exit("stage 2: no layout where a compositional algorithm runs; nothing to build")
-        elif a.coll_algorithms:
-            sets, cat = restriction_sets(a, layouts, make_probe(journal, probe, make_req, a.probe_m))
+        if not v1:
+            if base is not None:
+                model = base
+                if model.op != a.op:
+                    sys.exit(f"--model {a.model}: a model of {model.op}, not {a.op}")
+                if model.sizes != [int(x) for x in sizes][:len(model.sizes)] or set(layouts) != set(model.layouts):
+                    sys.exit(f"--model {a.model}: its layouts or sizes differ from this allocation's (add to a "
+                             "model on an allocation of the same size)")
+            else:
+                cat, bits = catalog_algs(a)
+                model = Model(a.op, sizes, layouts, {"N": [1, nodes], "ppn": [1, ppn_max],
+                                                     "m": [int(sizes[0]), int(sizes[-1])]}, bits)
+            # this run's jobs in the model: the journal's earlier ones, then this one
+            a._jobs_before = len(model.jobs)
+            for j in journal.jobs:
+                model.add_job(dict(j, inner_selection=inner_hash))
+            this_job = model.add_job(dict(job, end=None, inner_selection=inner_hash, **{
+                k: meta.get(k) for k in ("library", "launch", "topology_warnings", "replay") if k in meta}))
+            if inner_text:
+                model.add_inner_file(inner_text)
+
+            def on_reply(req, rep, j):
+                jid = this_job if j is None else a._jobs_before + j
+                alg = req_alg(req, a.op)
+                n, q = req["p"] // req["ppn"], req["ppn"]
+                if req.get("probe"):
+                    model.add_precheck(jid, alg, n, q, rep["status"] == "ok", rep.get("msg", ""))
+                elif rep.get("status") == "ok":
+                    model.add_measurement(jid, alg, n, q, req["m"], rep["t_us"], rep["wall_us"],
+                                          inner=inner_hash if model.is_compositional(alg) else None,
+                                          anchor=req.get("tag") == "anchor")
         else:
-            sets = [(0, layouts, a.algs)]
+            on_reply = None
+        measure = make_measure(journal, send, make_req, on_reply)
+        # live: bill the real elapsed time of all jobs (launch, driver, fitting); replay: the recorded wall
+        # time of every measurement
+        clock = (lambda: measure.wall_us * 1e-6) if a.replay else (lambda: journal.clock(t_start))
+        cost = (lambda: measure.wall_us * 1e-6 * nodes / 3600) if a.replay else \
+            (lambda: (journal.earlier_seconds() + time.time() - t_start) * nodes / 3600)
         state = {"ckpt": time.time(), "layout": time.time(), "slowest": 0.0}
 
-        def on_layout(bb):
+        def checkpoint():
+            if v1:
+                return write_atomic(a.out, model_v1(a, built[0][3], sizes, nodes, ppn_max, meta, jobs, False, cost))
+            if base is None:
+                store_curves(model, built)
+            model.save(a.out)
+
+        def on_layout(*_):
             now = time.time()
             state["slowest"] = max(state["slowest"], now - state["layout"])
             state["layout"] = now
             if a.checkpoint_every and now - state["ckpt"] >= a.checkpoint_every:
                 try:
-                    write_atomic(a.out, model_file(a, built, cat, sizes, nodes, ppn_max, meta, jobs, False, cost))
+                    checkpoint()
                     state["ckpt"] = now
                 except Terminated:
                     raise
@@ -663,51 +989,81 @@ def main(argv=None):
             if a.deadline and t_start + a.deadline - time.time() < 1.5 * state["slowest"] + 10:
                 return "deadline"
             return None
-        # each later set keeps a share of the budget in proportion to its layouts
-        share = [len(x[1]) / sum(len(y[1]) for y in sets) * a.budget_node_h for x in sets]
-        for i, (mask, lays, names) in enumerate(sets):
-            kw = dict(n_max=max(n for n, _ in lays), ppn_max=max(q for _, q in lays), seed=a.seed, clock=clock)
-            meas = measure if i == 0 else reusing(measure, make_req)
-            if len(names) > 1:
-                b = Builder2(meas, names, lays, sizes, tau_gm=a.tau_gm, tau_p95=a.tau_p95,
-                             prune=a.prune or None, **kw)
+        prober = make_probe(journal, probe, make_req, a.probe_m, on_reply)
+        if base is not None:
+            run = extend(a, model, measure, prober, inner_hash, clock, nodes, on_layout, stop_check, cost)
+        else:
+            if a.coll_algorithms:
+                sets = restriction_sets(a, model, catalog_algs(a)[0], prober)
             else:
-                b = Builder(lambda n, ppn, ms, alg=names[0]: meas(n, ppn, alg, ms), lays, sizes,
-                            tau_med=a.tau_med, tau_p90=a.tau_p90, **kw)
-            built.append((mask, lays, names, b))
-            b.on_layout, b.stop_check = on_layout, stop_check
-            try:
-                b.run(budget_node_h=a.budget_node_h - sum(share[i + 1:]), nodes_billed=nodes)
-            except Terminated:
-                b.stop = "terminated"
-                drop_unfinished(b)
-                print("SIGTERM: writing the model from the finished layouts", file=sys.stderr)
-                break
-            if b.stop == "deadline" and i < len(sets) - 1:
-                print(f"stop: {b.stop} in set {set_name(a.op, mask)}; later sets not built", file=sys.stderr)
-                break
+                sets = [(0, layouts, a.algs)]
+                if model is not None:
+                    model.algorithms.update({x: {"leaf": None, "restrictions": [], "mask": 0, "inner": []}
+                                             for x in a.algs})
+            # each later set keeps a share of the budget in proportion to its layouts
+            share = [len(x[1]) / sum(len(y[1]) for y in sets) * a.budget_node_h for x in sets]
+            for i, (mask, lays, names) in enumerate(sets):
+                kw = dict(n_max=max(n for n, _ in lays), ppn_max=max(q for _, q in lays), seed=a.seed, clock=clock)
+                meas = measure if i == 0 else reusing(measure, make_req)
+                if len(names) > 1:
+                    b = Builder2(meas, names, lays, sizes, tau_gm=a.tau_gm, tau_p95=a.tau_p95,
+                                 prune=a.prune or None, **kw)
+                else:
+                    b = Builder(lambda n, ppn, ms, alg=names[0]: meas(n, ppn, alg, ms), lays, sizes,
+                                tau_med=a.tau_med, tau_p90=a.tau_p90, **kw)
+                built.append((mask, lays, names, b))
+                b.on_layout, b.stop_check = on_layout, stop_check
+                try:
+                    b.run(budget_node_h=a.budget_node_h - sum(share[i + 1:]), nodes_billed=nodes)
+                except Terminated:
+                    b.stop = "terminated"
+                    drop_unfinished(b)
+                    print("SIGTERM: writing the model from the finished layouts", file=sys.stderr)
+                    break
+                if b.stop == "deadline" and i < len(sets) - 1:
+                    print(f"stop: {b.stop} in set {set_name(a.op, mask)}; later sets not built", file=sys.stderr)
+                    break
     except Terminated:
         sys.exit("terminated before the builder started; the journal keeps what was measured")
     finally:
         if srv:
+            stopped = run["stop"] if run else built[-1][3].stop if built else "terminated"
             # after SIGTERM there is little time, but a clean quit still lets MPI remove its shared memory
-            srv.close(wait=30 if built and built[-1][3].stop != "terminated" else 5)
+            srv.close(wait=30 if stopped != "terminated" else 5)
     jobs[-1]["end"] = round(time.time(), 3)
-    b = built[-1][3]
-    complete = len(built) == len(sets) and all(x[3].stop not in ("terminated", "deadline") for x in built)
-    if not built[0][3].samplers:
-        sys.exit(f"stop: {built[0][3].stop} before the first layout was measured; no model written")
-    try:
-        write_atomic(a.out, model_file(a, built, cat, sizes, nodes, ppn_max, meta, jobs, complete, cost))
-    except Exception as e:
-        sys.exit(f"no model written ({type(e).__name__}: {e}); the journal {a.log} keeps the measurements for --resume")
-    if cat is not None:
+    if v1:
+        b = built[0][3]
+        if not b.samplers:
+            sys.exit(f"stop: {b.stop} before the first layout was measured; no model written")
+        complete = b.stop not in ("terminated", "deadline")
+        write_atomic(a.out, model_v1(a, b, sizes, nodes, ppn_max, meta, jobs, complete, cost))
+        print(f"{a.out}: {len(b.samplers)} layouts, {b.n_meas} measurements ({journal.n_cached} from the "
+              f"journal), {cost():.3f} node-h, stop: {b.stop}")
+        return
+    model.jobs[-1]["end"] = jobs[-1]["end"]
+    if base is None:
+        if not built[0][3].samplers:
+            sys.exit(f"stop: {built[0][3].stop} before the first layout was measured; no model written")
+        store_curves(model, built)
+        complete = len(built) == len(sets) and all(x[3].stop not in ("terminated", "deadline") for x in built)
+        run = {"mode": "create", "algs": sorted({x for _, _, names, _ in built for x in names}),
+               "complete": complete, "stop": built[-1][3].stop, "node_h": round(cost(), 4),
+               "n_measurements": sum(x[3].n_meas for x in built),
+               "sets": [{"mask": mask, "name": set_name(a.op, mask), "algs": names, "stop": b.stop,
+                         "n_layouts": len(b.samplers), "n_measurements": b.n_meas,
+                         **builder_meta(a, names, b)} for mask, _, names, b in built]}
         for mask, _, _, x in built:
             print(f"  set {set_name(a.op, mask)}: {len(x.samplers)} layouts, {x.n_meas} measurements, "
                   f"stop: {x.stop}")
-    print(f"{a.out}: {sum(len(x[3].samplers) for x in built)} layouts, {sum(x[3].n_meas for x in built)} "
-          f"measurements ({journal.n_cached} from the journal), {cost():.3f} node-h, stop: {b.stop}"
-          + ("" if complete or cat is None else " (incomplete)"))
+    run["jobs"] = list(range(a._jobs_before, len(model.jobs)))
+    model.runs.append(run)
+    try:
+        model.save(a.out)
+    except Exception as e:
+        sys.exit(f"no model written ({type(e).__name__}: {e}); the journal {a.log} keeps the measurements for --resume")
+    print(f"{a.out}: {len(model.measured_layouts())} layouts, {run['n_measurements']} measurements in this run "
+          f"({journal.n_cached} from the journal), {cost():.3f} node-h, stop: {run['stop']}"
+          + ("" if run.get("complete", True) else " (incomplete)"))
 
 
 if __name__ == "__main__":

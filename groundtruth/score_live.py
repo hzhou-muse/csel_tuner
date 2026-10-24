@@ -2,7 +2,7 @@
 """Score the live checks (numpy only).
 
     python3 score_live.py switch RESULT_DIR
-    python3 score_live.py validate --truth DIR --default DIR --tuned DIR --model MODEL.json [--model STAGE2.json] \\
+    python3 score_live.py validate --truth DIR --default DIR --tuned DIR --model MODEL.json \\
         --tuning TUNING.json [--tuning-node-aware T.json] [--json SUMMARY.json]
 
 switch: the plan set "switch" (gen_plans.py) measures the same requests with
@@ -119,28 +119,13 @@ def switch(a):
     return 1 if final.endswith("FAILED") else 0
 
 
-def load_model(paths):
-    """(first model file, {set mask: (algs, {alg: LayoutModel}, fallback)}, measured layouts,
-    {layout: mask}) of one or several model files (stage 1, then stage 2). collmodel/2 is one
-    set, mask 0; a stage-2 set's "auto" candidate stands for its fallback set's choice."""
-    from csel_tuner.single import LayoutModel
-    models, sel, masks, first = {}, [], {}, None
-    for path in paths:
-        d = json.load(open(path))
-        first = first or d
-        if d.get("format") == "collmodel/2":
-            sets = [(0, d["algs"], d, None)]
-            sel += d.get("selection", [])
-        elif d.get("format") == "collmodel/3":
-            sets = [(x["mask"], x["algs"], x["model"], x.get("fallback")) for x in d["sets"]]
-            sel += [s for x in d["sets"] for s in x["model"].get("selection", [])]
-        else:
-            sys.exit(f"{path}: not a collmodel/2 or /3 file")
-        for mask, algs, m, fb in sets:
-            models[mask] = (algs, {alg: LayoutModel.from_json({"model": m["models"][alg]}) for alg in algs}, fb)
-        masks.update({(n, q): m for n, q, m in d.get("layout_masks", [])})   # stage 2 adds bits
-    measured = {(s["N"], s["ppn"]) for s in sel}
-    return first, models, measured, masks
+def load_model(path):
+    """The model file (collmodel/4; older ones convert with bin/collmodel --import)."""
+    from csel_tuner.model import Model
+    try:
+        return Model.load(path)
+    except ValueError as e:
+        sys.exit(str(e))
 
 
 def layout_mask(masks, n, q):
@@ -173,19 +158,23 @@ def summary(r):
 
 def validate(a):
     from csel_tuner.tree import json_choice
-    d, models, measured, masks = load_model(a.model)
+    model = load_model(a.model)
+    measured = set(model.measured_layouts())
+    masks = model.masks
+
+    def set_algs(mask):
+        return [x for x in model.set_algs(mask)]
 
     def model_choice(mask, n, q, i):
-        """The model's algorithm at (n, q) and size index i; "auto" goes to the fallback set."""
-        algs, mods, fb = models.get(mask, models[0])
+        """The model's algorithm at (n, q) and size index i: the fastest predicted of those allowed there."""
+        algs = set_algs(mask)
         if (mask, n, q) not in pred:
-            pred[(mask, n, q)] = np.array([mods[alg].predict(n, q) for alg in algs])
-        alg = algs[int(np.argmin(pred[(mask, n, q)][:, i]))]
-        return model_choice(fb, n, q, i) if alg == "auto" and fb is not None else alg
-    sizes = np.array(d["sizes"])
-    op = d["what"].split("-")[0]
-    bits = d.get("conditions", [])
-    leaf_alg = {x["leaf"]: alg for alg, x in d.get("algorithms", {}).items()}
+            pred[(mask, n, q)] = np.array([model.predict(alg, n, q) for alg in algs])
+        return algs[int(np.argmin(pred[(mask, n, q)][:, i]))]
+    sizes = np.array(model.sizes)
+    op = model.op
+    bits = model.conditions
+    leaf_alg = {model.leaf(x): x for x in model.algorithms}
     truth, _ = times(a.truth)
     default, env_d = times(a.default)
     tuned, env_t = times(a.tuned)
@@ -203,9 +192,8 @@ def validate(a):
     consistency, skipped, default_wins = [], 0, []
     for n, q, m in points:
         mask = layout_mask(masks, n, q)
-        set_algs = models.get(mask, models[0])[0]
         t = {alg: truth[(alg, n, q, m)] for alg in algs if (alg, n, q, m) in truth}
-        if any(alg not in t for alg in set_algs if alg != "auto"):
+        if any(alg not in t for alg in set_algs(mask)):
             skipped += 1
             continue
         # the fastest of every algorithm measured here and MPICH's default
@@ -231,8 +219,13 @@ def validate(a):
                 rows[name].append(v)
                 split[name][0 if (n, q) in measured else 1].append(v)
                 by_node[name][0 if n == 1 else 1].append(v)
-    est = d["meta"].get("estimate") or next((x["meta"].get("estimate", {}) for x in d.get("sets", [])
-                                             if x["mask"] == 0), {})
+    first = next((r for r in model.runs if r.get("mode") == "create"), {})
+    imported = next((r.get("meta") or {} for r in model.runs if r.get("mode") == "import"), {})
+    est = next((x.get("estimate", {}) for x in first.get("sets", []) if x["mask"] == 0), None) or \
+        imported.get("estimate") or next((x["meta"].get("estimate", {}) for r in model.runs
+                                          for x in (r.get("sets") or []) if "meta" in x), {})
+    info = {"stop": first.get("stop", imported.get("stop")), "n_layouts": len(measured),
+            "node_h": sum(r.get("node_h") or 0 for r in model.runs) or imported.get("node_h")}
     out = ["# Validation of the tuning file", "",
            f"{len(points) - skipped} points ({len({p[:2] for p in points})} layouts); regret = T(selection) / "
            f"T(fastest at that point), the fastest of every algorithm measured per request and MPICH's default.", "",
@@ -264,7 +257,7 @@ def validate(a):
                 f"{np.median(c):.3f} (p10 {np.quantile(c, .1):.3f}, p90 {np.quantile(c, .9):.3f}); about 1 if MPICH "
                 "applied the file."]
     out += ["", f"The model's own estimate: regret geomean {est.get('regret_geomean')}, p95 {est.get('regret_p95')} "
-            f"(stop: {d['meta'].get('stop')}, {d['meta'].get('n_layouts')} layouts, {d['meta'].get('node_h')} node-h)."]
+            f"(stop: {info['stop']}, {info['n_layouts']} layouts, {info['node_h']} node-h)."]
     if "MPIR_CVAR_COLL_SELECTION_JSON_FILE" not in env_t:
         out.append("\nWARNING: the tuned launch's environment has no MPIR_CVAR_COLL_SELECTION_JSON_FILE.")
     if "MPIR_CVAR_COLL_SELECTION_JSON_FILE" in env_d:
@@ -284,8 +277,7 @@ def main():
     v = sub.add_parser("validate")
     for k in ("truth", "default", "tuned", "tuning"):
         v.add_argument("--" + k, required=True)
-    v.add_argument("--model", required=True, action="append",
-                   help="model file; give it twice for stage 1 and stage 2")
+    v.add_argument("--model", required=True, help="model file (collmodel/4)")
     v.add_argument("--tuning-node-aware")
     v.add_argument("--json")
     a = ap.parse_args()

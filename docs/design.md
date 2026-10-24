@@ -31,7 +31,7 @@ bin/collmodel (driver, Python)                server/mpisrv (one MPI job of P ra
   csel_tuner.server.Server   -- batch of  -->   the requested sub-communicator measures,
                              <-- replies ---    rank 0 writes one JSON reply per request
         |
-        v  model file (collmodel/2)
+        v  model file (collmodel/4: measurements + fit)
 bin/colltree (builder v3)  -->  tuning JSON  -->  MPIR_CVAR_COLL_SELECTION_JSON_FILE
 ```
 
@@ -288,10 +288,26 @@ predicted regret of choosing a at point i):
 `log2_t` is the measured layout's curve on the size grid; prediction at
 other layouts follows §5 (`LayoutModel.from_json`).
 
-**collmodel/2** (several algorithms): `algs`, `sizes`, `models` (a
-collmodel/1 `model` per algorithm), `selection` (the predicted best
-algorithm and time at each measured layout and size), `crossovers`, and in
-`meta` the regret estimate and per-algorithm measurement counts.
+**collmodel/4** (several algorithms, `csel_tuner/model.py`; §12.1):
+
+```json
+{"format": "collmodel/4", "op": "bcast", "sizes": [...], "domain": {...}, "layouts": [[1, 2], ...],
+ "conditions": ["inplace", ...], "algorithms": {"binomial": {"leaf": "...", "restrictions": [], "mask": 0,
+                                                              "inner": []}, ...},
+ "layout_masks": [[1, 2, 2048], ...], "left_out": ["nb"],
+ "data": {"jobs": [{...}], "measurements": [{"alg": "binomial", "N": 2, "ppn": 4, "m": 1024,
+                                             "t_us": [...], "wall_us": ..., "job": 0}, ...],
+          "prechecks": [{"alg": ..., "N": ..., "ppn": ..., "ok": true, "msg": "", "job": 0}, ...],
+          "inner_files": {"<hash>": "<tuning file text>"}},
+ "fit": {"version": 1, "inner": {"smp": "<hash>"},
+         "curves": {"binomial": [{"N": 2, "ppn": 4, "log2_t": [...]}, ...], ...}},
+ "runs": [{"mode": "create" | "add" | "import", "jobs": [...], "stop": ..., "node_h": ..., ...}]}
+```
+
+A measurement of a compositional algorithm also has `"inner": "<hash>"`,
+an anchor `"anchor": true`. An algorithm's model across layouts is a
+LayoutModel (§5) over all its curves, fitted on load. collmodel/2 and /3,
+written by earlier versions, convert with `bin/collmodel --import`.
 
 **Tuning JSON:** a CSEL subtree (`name=bcast-intra-auto`), loaded with
 `MPIR_CVAR_COLL_SELECTION_JSON_FILE`; it replaces MPICH's built-in subtree
@@ -357,13 +373,14 @@ shaped the design:
 
 ## 11. Restricted algorithms and staged sampling
 
-Status: stage 1 is implemented (`csel_tuner/algos.py`,
-`csel_tuner/restrict.py`, `bin/collmodel --coll-algorithms`, `bin/colltree`
-on collmodel/3, mpisrv `probe=1` and error replies), and so is stage 2 for a
-compositional algorithm whose inner calls are its own op (bcast smp:
-`bin/collmodel --stage1`). Both are tested on the replay (with
-`--replay-alias`) and in local functional runs; stage 2 across ops
-(allreduce smp needs reduce and bcast files) is not.
+Status: implemented (`csel_tuner/algos.py`, `csel_tuner/restrict.py`,
+`bin/collmodel --coll-algorithms`, mpisrv `probe=1` and error replies) for
+restricted algorithms and for compositional ones whose inner calls are
+their own op (bcast smp), tested on the replay (with `--replay-alias`), in
+local functional runs and live. Compositional algorithms across ops
+(allreduce smp needs reduce and bcast files) are not. Since §12, a
+compositional algorithm is added to the model rather than built as a
+second stage; the stages below describe that order of work.
 
 Before, the builders chose among the algorithms that have no
 `restrictions` in MPICH's `src/mpi/coll/coll_algorithms.txt`. On a
@@ -438,39 +455,40 @@ other collectives on sub-communicators (the node comm, the comm of node
 leaders), and those calls go through the selection itself, so its time
 depends on the file being built.
 
-1. Stage 1: sample every non-compositional algorithm (with their
+1. Create the model with every non-compositional algorithm (with their
    restrictions), build the subtrees: file F1.
-2. Stage 2 (`bin/collmodel --stage1 MODEL1 --inner-selection F1`):
-   relaunch the server with F1 loaded (`MPIR_CVAR_COLL_SELECTION_JSON_FILE`)
-   and precheck the compositional algorithms; they decide new bits (smp:
-   `hierarchical`), so some layouts move from their stage-1 mask S' to a
-   new mask S. Each new set S is built on its layouts over its stage-2
-   algorithms and `auto`, which with F1 loaded is F1's choice there,
-   measured in the same launch.
-3. `bin/colltree MODEL1 MODEL2` writes F2: F1's subtrees unchanged, a
-   subtree per new set S whose leaves are a stage-2 algorithm or
-   `call=<op>-intra-<S'>` (the `auto` candidate), and a dispatch over the
-   sets of both stages.
+2. Add the compositional algorithms (`bin/collmodel --model M --algs smp
+   --inner-selection F1`): the server runs with F1 loaded
+   (`MPIR_CVAR_COLL_SELECTION_JSON_FILE`) and prechecks them; they decide
+   new bits (smp: `hierarchical`), so some layouts move to a new mask S.
+   They are sampled at the model's measured layouts where they run, against
+   every algorithm the model has there (§12.2).
+3. `bin/colltree M2` writes F2 from the one model: a subtree per set,
+   S's candidates being the algorithms allowed there and calls of subsets'
+   subtrees (§12.3), and a dispatch over all sets. Where F2 selects the
+   inner calls differently from F1, colltree reports smp's measurements as
+   stale (§12.3).
 
-Two stages are enough when the inner calls do not reach a stage-2
-algorithm: `smp` needs `hierarchical`, which the node comm (one node) and
+One file for the inner calls is enough when they do not reach a
+compositional algorithm: `smp` needs `hierarchical`, which the node comm (one node) and
 the leaders' comm (one rank per node) do not have, so F2 selects the same
-algorithms as F1 for every inner call. The tool checks this on the stage-2
-precheck before building (a stage-2 algorithm that ran at an inner call's
-layout fails the check); with pmodels/mpich#8048 a single-node communicator
+algorithms as F1 for every inner call, up to the changes the staleness
+check reports. The tool checks this on the precheck of the compositional
+algorithms before measuring them (one that ran at an inner call's layout
+fails the check); with pmodels/mpich#8048 a single-node communicator
 is not `hierarchical`, so user layouts and inner sub-communicators of the
 same shape have the same conditions.
 Compositional algorithms carry an `inner` key in `coll_algorithms.txt`
 (pmodels/mpich#8048): the collectives they call through the selection, as
 `<section>@<communicator>`, e.g. bcast smp `bcast-intra@node_comm,
 bcast-intra@node_roots_comm`, allreduce smp `reduce-intra@node_comm,
-allreduce-intra@node_roots_comm, bcast-intra@node_comm`. `--stage2`
+allreduce-intra@node_roots_comm, bcast-intra@node_comm`. `--compositional`
 defaults to those algorithms (for files without the key: those restricted
 to `hierarchical`). From the key the tool gets, per algorithm, the ops
-whose stage-1 files stage 2 must load (other ops too: allreduce smp needs
+whose tuning files must be loaded (other ops too: allreduce smp needs
 reduce and bcast), and the layouts the inner calls see: `node_comm` gives
 (1, ppn), `node_roots_comm` (N, 1), both in every stage-1 grid. The
-two-stage check is then per inner (op, communicator): no stage-2 algorithm
+two-stage check is then per inner (op, communicator): no compositional algorithm
 of that op may be allowed under the precheck masks of those layouts (smp
 needs `hierarchical`, false on both). An inner call can name its own op
 (allreduce smp: `allreduce-intra@node_roots_comm`); the check covers it.
@@ -513,9 +531,11 @@ MPICH's default, per restriction set (e.g. single-node / multi-node).
 
 ## 12. Incremental models and batch strategies
 
-Status (2026-10-24): target design, not implemented. It replaces the
-stages of §11 as a property of the tools; §11's restriction sets, dispatch
-and two-stage check stay.
+Status (2026-10-24): implemented (`csel_tuner/model.py`, `bin/collmodel
+--model / --layouts / --import`, `bin/colltree` on collmodel/4) and tested
+on the replay, except `--refit`, `--merge` and continuing the layout loop
+when adding (§13). It replaces the stages of §11 as a property of the
+tools; §11's restriction sets, dispatch and two-stage check stay.
 
 **Principle.** Two tools around one model file, and the plan of what to
 measure when outside both:
@@ -546,7 +566,8 @@ One file (collmodel/4) with two sections:
 - **`fit`**, derived: the per-algorithm layout models (§5) per restriction
   set, the selection and the regret estimate, with the fitting code's
   version. `collmodel --refit` recomputes it from `data`; any tool that
-  finds an older fit version refits.
+  finds an older fit version refits (not implemented yet: tools refuse a
+  fit of another version).
 
 *Alternative, not adopted for now:* store only `data` and fit on load. The
 fit is a function of the data and the fitter version (per-layout PCHIP and
@@ -560,7 +581,8 @@ of a point across jobs) and a refit in every tool that reads the model.
 
 The **journal** stays a per-job crash log for `--resume` (§4) and audit.
 At the end of a job its measurements are merged into `data`
-(`collmodel --merge JOURNAL` does the same for a job killed before that);
+(`collmodel --merge JOURNAL`, not implemented yet, would do the same for a
+job killed before that; checkpoints and `--resume` cover it meanwhile);
 nothing reads a journal for sampling decisions. A journal is unsuited for
 that, not because of size (ten thousand measurements are a few MB and
 parse in under a second) but because of its semantics: it is one job's requests in
@@ -629,7 +651,7 @@ import from their journals.
   (N, 1); other ops from their files) with those of the inner selection
   its data were measured under, and lists the layouts where they differ as
   "remeasure". With the two-stage check this converges in one remeasure.
-- The stage-specific paths of §11 (`MODEL1 MODEL2`, `auto` leaves) go.
+- The stage-specific paths of §11 (`MODEL1 MODEL2`, `auto` leaves) are gone.
 
 ### 12.4 Batch strategies
 
@@ -655,7 +677,12 @@ measurements predicts.
 
 ## 13. Limitations and next steps
 
-- **Incremental models** (§12): not implemented.
+- **Incremental models** (§12): no `--refit` or `--merge` yet; adding to a
+  model samples the given algorithms at the measured layouts and the given
+  `--layouts`, but does not continue the layout loop (risk and random
+  checks, the regret estimate) on its own.
+- **Compositional algorithms across ops** (allreduce smp): neither the
+  two-stage check nor the staleness check covers inner calls of another op.
 - **Collectives:** only bcast is wired through the builders (`OPS` in
   `bin/collmodel`, leaf parameters in `bin/colltree`); mpisrv also measures
   allreduce and ping-pong.

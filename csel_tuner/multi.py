@@ -45,19 +45,35 @@ import numpy as np
 from .single import GridSampler, LayoutModel, candidate_layouts, initial_layouts
 
 
+def known_sampler(measure, sizes, vals, curve, sampler_kw=None):
+    """A GridSampler holding earlier measurements (vals: {grid index: [log2 T]})
+    whose prior is the stored curve, so its curve stays the stored one until
+    new measurements move it (the residuals at the measured sizes are zero)."""
+    g = GridSampler(measure, sizes, prior=curve, init=[], **(sampler_kw or {}))
+    g.vals = {i: list(v) for i, v in vals.items()}
+    return g
+
+
 class MultiSampler:
     def __init__(self, measure, algs, sizes, step=8, sparse_step=16, margin=1.3, sparse=(), full=False,
-                 prior=None, prune=2.0, sampler_kw=None):
+                 prior=None, prune=2.0, sampler_kw=None, known=None):
         """measure(alg, [m, ...]) -> [t, ...]. full: every algorithm on the
         coarse grid (a random check), sparse algorithms included. prior: the
-        model's prediction here (log2 T, one row per algorithm) or None; then
-        an algorithm's coarse pass skips the sizes where it is predicted more
-        than `prune` slower than the predicted best (unless full), and its
-        curve is the prior corrected by the measured residuals."""
+        model's prediction here (log2 T), one row per algorithm or {alg: row}
+        for some, or None; an algorithm with a prior skips the sizes in its
+        coarse pass where it is predicted more than `prune` slower than the
+        predicted best (unless full), and its curve is the prior corrected by
+        the measured residuals. known: {alg: GridSampler} of algorithms
+        measured here before (known_sampler); they count for the envelope and
+        the pruning but are not sampled again, except at crossovers with the
+        sampled ones."""
         self.measure, self.algs, self.sizes = measure, list(algs), np.asarray(sizes)
         self.step, self.sparse_step, self.margin = step, sparse_step, margin
         self.sparse = set() if full else set(sparse)
+        if prior is not None and not isinstance(prior, dict):
+            prior = dict(zip(self.algs, prior))
         self.prior, self.prune, self.full = prior, prune, full
+        self.known = dict(known or {})
         self.kw = sampler_kw or {}
         self.crossovers = []
         self.pruned = {}            # alg -> number of coarse sizes skipped
@@ -74,22 +90,25 @@ class MultiSampler:
 
     def run(self):
         n = len(self.sizes)
-        self.g = {}
-        if self.prior is not None:
-            pbest = self.prior.min(axis=0)
-        for k, a in enumerate(self.algs):
+        self.g = dict(self.known)
+        rows = [self.prior[a] for a in self.algs if self.prior and self.prior.get(a) is not None] + \
+            [g.curve() for g in self.known.values()]
+        pbest = np.min(rows, axis=0) if rows else None
+        for a in self.algs:
+            if a in self.known:
+                continue
             st = self.sparse_step if a in self.sparse else self.step
             init = sorted(set(range(0, n - 1, st)) | {n - 1})
-            prior = None
-            if self.prior is not None:
-                prior = self.prior[k]
-                if not self.full:
-                    keep = [i for i in init if prior[i] - pbest[i] <= np.log2(self.prune)]
-                    self.pruned[a] = len(init) - len(keep)
-                    init = keep
+            prior = self.prior.get(a) if self.prior else None
+            if prior is not None and not self.full:
+                keep = [i for i in init if prior[i] - pbest[i] <= np.log2(self.prune)]
+                self.pruned[a] = len(init) - len(keep)
+                init = keep
             self.g[a] = GridSampler(lambda ms, a=a: self.measure(a, ms), self.sizes, step=st, prior=prior,
                                     init=init, **self.kw)
         for a in self.algs:
+            if a in self.known:
+                continue
             env = self.envelope()
             if a in self.sparse:
                 if not self.contends(a, 0, n - 1, env):
@@ -115,6 +134,8 @@ class MultiSampler:
         win = np.argmin(curves, axis=0)
         for i in np.nonzero(win[1:] != win[:-1])[0]:
             pair = [self.algs[win[i]], self.algs[win[i + 1]]]
+            if all(a in self.known for a in pair):
+                continue            # located when they were measured
             lo = max([k for k in range(i + 1) if all(k in self.g[a].vals for a in pair)], default=None)
             hi = min([k for k in range(i + 1, len(self.sizes)) if all(k in self.g[a].vals for a in pair)],
                      default=None)
