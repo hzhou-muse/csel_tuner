@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Quick sweep: does each algorithm of an op run, at one message size, on a few layouts?
+
+    bin/algsweep --op bcast,allreduce --catalog coll_algorithms.txt --site aurora --nodes 2 --ppn 12 \\
+        --mem device --m 16384 --out sweep_device.json
+
+One launch per algorithm (so a call that crashes or never returns costs only that algorithm: the
+launch is restarted for the next layout), one probe call per layout: the algorithm forced by its
+CVAR with MPIR_CVAR_COLLECTIVE_FALLBACK=error, on buffers of the given memory kind. Prints a table
+(ok / error / crash / hang per algorithm and layout) and writes it to --out.
+Algorithms that crashed or hung are listed in `exclude` (collmodel --exclude-algs); one that
+merely returns an error is not: collmodel's precheck leaves such an algorithm out. An error is
+expected where a restriction fails (smp on one node, release_gather on several). `unavailable`
+lists the algorithms that failed on every layout.
+
+Layouts: --layouts NxPPN,... or by default 1x2, 1xP, 2x1, 2x2, 2xP, NxP of the allocation (those that
+fit). Algorithms: the op's catalog algorithms (nb and compositional ones included; buffer_swap is not
+swept, it needs a tuning file); --algs picks some.
+"""
+import argparse
+import json
+import os
+import shlex
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+sys.path.insert(0, REPO)
+
+from csel_tuner.algos import Catalog  # noqa: E402
+from csel_tuner.server import Server, ServerError  # noqa: E402
+
+CVARS = {"bcast": "MPIR_CVAR_BCAST_INTRA_ALGORITHM", "allreduce": "MPIR_CVAR_ALLREDUCE_INTRA_ALGORITHM"}
+
+
+def default_layouts(nodes, ppn):
+    want = [(1, 2), (1, ppn), (2, 1), (2, 2), (2, ppn), (nodes, ppn)]
+    out = []
+    for n, q in want:
+        if n <= nodes and q <= ppn and n * q > 1 and (n, q) not in out:
+            out.append((n, q))
+    return out
+
+
+def one_probe(srv, op, alg, m, lay):
+    """(status, message) of one probe call; the server is restarted after a crash or a hang."""
+    req = dict(op=op, m=m, p=lay[0] * lay[1], ppn=lay[1], batches=1, probe=1)
+    req["cvar." + CVARS[op]] = alg
+    try:
+        rep = srv.request(**req)
+    except ServerError as e:
+        msg = str(e)
+        return ("hang" if "no reply" in msg else "crash"), msg.splitlines()[0][:200]
+    if rep["status"] == "ok":
+        return "ok", ""
+    return "error", rep.get("msg", "").replace("\n", " ")[:200]
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--op", default="bcast,allreduce", help="comma-separated ops")
+    ap.add_argument("--catalog", required=True)
+    ap.add_argument("--site", required=True)
+    ap.add_argument("--nodes", type=int, required=True)
+    ap.add_argument("--ppn", type=int, required=True)
+    ap.add_argument("--mem", default="host", choices=["host", "device"])
+    ap.add_argument("--m", type=int, default=16384, help="message size in bytes (default 16 KiB)")
+    ap.add_argument("--layouts", help="NxPPN,... (default: a few of the allocation)")
+    ap.add_argument("--algs", help="only these algorithms")
+    ap.add_argument("--timeout", type=float, default=60, help="seconds without a reply that count as a hang")
+    ap.add_argument("--out", required=True, help="JSON result")
+    ap.add_argument("--server", default=None, help="the mpisrv binary (default server/mpisrv)")
+    a = ap.parse_args(argv)
+
+    os.environ["SITE"], os.environ["MEM"] = a.site, a.mem
+    cfg = os.path.join(REPO, "launch", "config.sh")
+    launcher = shlex.split("bash -c 'source %s && launch %d %d \"$0\" \"$@\"'" % (cfg, a.nodes, a.ppn))
+    lays = [tuple(int(v) for v in x.lower().split("x")) for x in a.layouts.split(",")] if a.layouts \
+        else default_layouts(a.nodes, a.ppn)
+    cat = Catalog.load(a.catalog)
+    env = {"MPIR_CVAR_COLLECTIVE_FALLBACK": "error", "MPISRV_CVAR_SWITCH": "1"}
+    kw = dict(launcher=launcher, env=env, max_m=a.m, timeout=a.timeout, warmup=(),
+              args=["--mem", a.mem] if a.mem != "host" else [])
+    if a.server:
+        kw["server"] = a.server
+    result = {"mem": a.mem, "m": a.m, "nodes": a.nodes, "ppn": a.ppn, "layouts": [list(x) for x in lays],
+              "time": time.strftime("%Y-%m-%dT%H:%M:%S"), "ops": {}, "exclude": {}}
+    for op in a.op.split(","):
+        if op not in CVARS:
+            sys.exit(f"--op {op}: not one of {', '.join(CVARS)}")
+        algs = [x.name for x in cat.algorithms(op) if x.name != "buffer_swap"]
+        if a.algs:
+            algs = [x for x in algs if x in a.algs.split(",")]
+        table, bad = {}, []
+        print(f"{op} on {a.mem} buffers, {a.m} B; layouts {' '.join('%dx%d' % x for x in lays)}")
+        for alg in algs:
+            row, srv = {}, None
+            for lay in lays:
+                if srv is None:
+                    srv = Server(**kw)
+                st, msg = one_probe(srv, op, alg, a.m, lay)
+                row["%dx%d" % lay] = {"status": st, "msg": msg}
+                if st in ("crash", "hang"):
+                    bad.append(alg) if alg not in bad else None
+                    srv.kill()
+                    srv = None          # a fresh launch for the next layout
+            if srv is not None:
+                srv.close()
+            table[alg] = row
+            cells = " ".join("%-5s" % row["%dx%d" % x]["status"] for x in lays)
+            print(f"  {alg:<40s} {cells}", flush=True)
+            for k, v in row.items():
+                if v["status"] != "ok":
+                    print(f"      {k}: {v['status']}: {v['msg']}")
+        none = [alg for alg, row in table.items() if all(v["status"] != "ok" for v in row.values())]
+        print(f"fails on every layout {op}: {','.join(none) if none else '-'} (not available here, or restricted away)")
+        result["ops"][op] = table
+        result["unavailable"] = dict(result.get("unavailable", {}), **{op: none})
+        result["exclude"][op] = bad
+        print(f"exclude {op}: {','.join(bad) if bad else '-'}")
+        with open(a.out, "w") as f:
+            json.dump(result, f, indent=1)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
