@@ -72,7 +72,12 @@ from csel_tuner.tree import fit_tree, json_choice, json_tree, prune_to, select  
 # the CVAR defaults the measurements ran with; --param alg.key=value overrides
 PARAMS = {"bcast": {"tree": {"tree_type": "kary", "k": 2, "is_non_blocking": True},
                     "pipelined_tree": {"tree_type": "kary", "k": 2, "is_non_blocking": True,
-                                       "chunk_size": 8192, "recv_pre_posted": False}}}
+                                       "chunk_size": 8192, "recv_pre_posted": False}},
+          "allreduce": {"tree": {"tree_type": "knomial_1", "k": 2, "chunk_size": 0, "buffer_per_child": False},
+                        "recursive_multiplying": {"k": 2},
+                        "recexch": {"k": 2, "single_phase_recv": False},
+                        "k_reduce_scatter_allgather": {"k": 2, "single_phase_recv": False},
+                        "ccl": {"ccl": "auto"}}}
 
 
 def json_depth(o):
@@ -271,6 +276,12 @@ def main(argv=None):
     ap.add_argument("--param", action="append", default=[], metavar="ALG.KEY=VALUE")
     ap.add_argument("--nested-dispatch", action="store_true", help="dispatch on restrictions with nested "
                     "conditions (for an MPICH without dispatch=, pmodels/mpich#8048)")
+    ap.add_argument("--buffer-swap", action="store_true", help="host model only: the file measures buffer_swap "
+                    "(device buffers swap to host, then the host tree): <op>-intra-auto is "
+                    "{gpu: buffer_swap, any: <host dispatch>}")
+    ap.add_argument("--with", dest="with_files", action="append", default=[], metavar="FILE",
+                    help="also write the subtrees of FILE's other ops into --out (a tuning file for the inner "
+                    "calls of another op, or the final file of several ops)")
     a = ap.parse_args(argv)
     models = []
     for path in a.model:
@@ -332,11 +343,22 @@ def main(argv=None):
         built.append((path, m, S))
     out[f"name={op}-intra-auto"] = {GPU: disp["device"], "any": disp["host"]} if "device" in disp else \
         disp["host"]
-    depth = json_depth(out)
+    if a.buffer_swap:
+        if "device" in disp:
+            sys.exit("--buffer-swap: give the host model only")
+        out[f"name={op}-intra-auto"] = {GPU: {"algorithm=MPIR_Coll_buffer_swap": {}}, "any": disp["host"]}
+    written = dict(out)
+    for path in a.with_files:
+        with open(path) as f:
+            other = json.load(f)
+        for k, v in other.items():
+            if not k.startswith(f"name={op}-intra-"):
+                written[k] = v
+    depth = json_depth(written)
     if depth > 64:
         sys.exit(f"tree nests {depth} levels; MPICH's parser allows 64 (try a larger --tol)")
     with open(a.out, "w") as f:
-        json.dump(out, f, indent=2)
+        json.dump(written, f, indent=2)
         f.write("\n")
     for path, m, S in built:
         for line in S.lines:

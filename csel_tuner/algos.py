@@ -94,6 +94,14 @@ class Catalog:
         out = [Alg(op, n, k) for n, k in self.sections[sec]]
         if nb and kind == "intra" and not op.startswith("i"):
             out.append(Alg(op, "nb", {"func_name": "MPIR_Coll_nb"}))
+        if kind == "intra" and not op.startswith("i") and any(n == "MPIR_Coll_buffer_swap" for n, _ in
+                                                              self.sections.get("general", [])):
+            # swaps device buffers for host buffers and continues in the op's own selection
+            # (inner "self"), which the launch's tuning file decides: measure it compositionally
+            keys = dict(self.sections["general"][[n for n, _ in self.sections["general"]].index(
+                "MPIR_Coll_buffer_swap")][1])
+            out.append(Alg(op, "buffer_swap", dict(keys, func_name="MPIR_Coll_buffer_swap",
+                                                   inner="%s-intra@self" % op)))
         return out
 
     def restriction_bits(self):

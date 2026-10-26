@@ -13,9 +13,11 @@ def axis_values(top):
     return sorted(out)
 
 
-def size_grid(max_m, per_octave=4):
+def size_grid(max_m, per_octave=4, unit=1):
+    """The message sizes: 4 per octave up to max_m. With unit > 1 (allreduce: the element size)
+    every size is a multiple of unit, at least unit."""
     out, k = set(), 0
     while round(2 ** (k / per_octave)) <= max_m:
-        out.add(round(2 ** (k / per_octave)))
+        out.add(max(unit, round(2 ** (k / per_octave) / unit) * unit))
         k += 1
-    return sorted(out | {max_m})
+    return sorted(out | {max_m // unit * unit})

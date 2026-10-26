@@ -105,7 +105,7 @@ def set_name(op, mask, mem="host"):
 def role_layout(lay, comm):
     """The layout of an inner call on `comm` from a call at `lay`."""
     n, ppn = lay
-    return {"node_comm": (1, ppn), "node_roots_comm": (n, 1)}[comm]
+    return {"node_comm": (1, ppn), "node_roots_comm": (n, 1), "self": (n, ppn)}[comm]
 
 
 def fixed_point(algs2, feas2, op):
@@ -113,12 +113,15 @@ def fixed_point(algs2, feas2, op):
     file for their inner calls when no inner call can run a compositional
     algorithm of its own op: (problems, notes). Checked on the precheck: a
     compositional algorithm that ran at an inner call's layout."""
-    names = {a.name for a in algs2}
+    # buffer_swap (inner "self") does not count: its inner call has host buffers, where it is restricted away
+    names = {a.name for a in algs2 if any(c != "self" for _, c in a.inner)}
     problems, notes = [], []
     for a in algs2:
         for section, comm in a.inner:
             if section != op + "-intra":
                 notes.append("%s: inner %s@%s is another op; not checked here" % (a.name, section, comm))
+                continue
+            if comm == "self":      # buffer_swap: its inner call has host buffers, so `gpu` fails there
                 continue
             for lay, ok in sorted(feas2.items()):
                 if a.name not in ok:

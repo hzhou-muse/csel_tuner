@@ -127,11 +127,12 @@ from csel_tuner.restrict import fixed_point, mem_known, plan_sets, precheck, set
 from csel_tuner.single import Builder, initial_layouts  # noqa: E402
 
 VERSION = "collmodel 0.4"
-OPS = {"bcast": "MPIR_CVAR_BCAST_INTRA_ALGORITHM"}
+OPS = {"bcast": "MPIR_CVAR_BCAST_INTRA_ALGORITHM", "allreduce": "MPIR_CVAR_ALLREDUCE_INTRA_ALGORITHM"}
+UNIT = {"bcast": 1, "allreduce": 4}      # message sizes are multiples of the op's element size (mpisrv: MPI_INT)
 # settings that change which requests the builder makes: a resumed job must keep them
 SAME_ON_RESUME = ["mode", "op", "algs", "seed", "batches", "sync", "prune", "nodes", "ppn_max", "max_m",
-                  "compositional", "probe_m", "base", "inner", "layouts", "anchors", "mem"]
-RESUME_DEFAULTS = {"mem": "host"}       # for journals written before the setting existed
+                  "compositional", "probe_m", "base", "inner", "layouts", "anchors", "mem", "exclude_algs"]
+RESUME_DEFAULTS = {"mem": "host", "exclude_algs": ""}       # for journals written before the setting existed
 
 
 class Terminated(Exception):
@@ -144,7 +145,10 @@ def req_key(req):
 
 def req_alg(req, op):
     """The algorithm a request forces: replay names it, live sets the algorithm CVAR."""
-    return req.get("alg") or req.get("cvar." + OPS[op], "auto")
+    alg = req.get("alg") or req.get("cvar." + OPS[op], "auto")
+    # buffer_swap has no CVAR value: its requests set the CVAR to auto and the launch's tuning file
+    # (--inner-selection) selects it on device buffers
+    return "buffer_swap" if alg == "auto" and "cvar." + OPS[op] in req else alg
 
 
 class Journal:
@@ -217,7 +221,7 @@ class Journal:
 
 def live(a):
     """(send, make_req, probe, layouts, sizes, nodes, ppn_max, max_m, meta, server)"""
-    from csel_tuner.server import Server
+    from csel_tuner.server import Server, ServerError
     # a forced algorithm whose restriction fails must fail, not run the default
     env = {"MPIR_CVAR_COLLECTIVE_FALLBACK": "error"}
     if a.inner_selection:
@@ -237,24 +241,46 @@ def live(a):
         srv.close()
         sys.exit("per-request algorithms (--switch request or --algs): the server reports no runtime CVAR "
                  "switch (MPISRV_CVAR_SWITCH)")
-    sel = lambda alg: {"cvar." + OPS[a.op]: alg} if by_request else {}
+    sel = lambda alg: {"cvar." + OPS[a.op]: "auto" if alg == "buffer_swap" else alg} if by_request else {}
     nodes, ppn_max = info["nodes"], info["min_ppn"]
     layouts = [(n, p) for n in axis_values(nodes) for p in axis_values(ppn_max) if n * p > 1]
-    sizes = size_grid(info["max_m"])
+    sizes = size_grid(info["max_m"], unit=UNIT[a.op])
     rewarm_m = min(1 << 20, info["max_m"])
 
+    # An algorithm restricted by count_ge_pof2 (count >= the largest power of two <= p) fails on smaller
+    # messages, which no layout-wide precheck can tell. Below its minimum its time is taken as the time at the
+    # minimum (a grid point): MPICH never selects it there, because the restriction fails and the dispatch falls
+    # back to a set without it.
+    algs, _ = catalog_algs(a)
+    min_count = {x.name for x in algs or [] if "count_ge_pof2" in x.restrictions}
+    elem = UNIT[a.op]
+
     def make_req(n, ppn, alg, m):
+        if alg in min_count:
+            m = max(m, elem * (1 << ((n * ppn).bit_length() - 1)))
         return dict(op=a.op, m=m, p=n * ppn, ppn=ppn, batches=a.batches, sync=a.sync, **sel(alg))
+
+    def retrying(call):
+        """call(), again on a fresh server if a call never returned (--timeout), up to 3 tries."""
+        for attempt in range(3):
+            try:
+                return call()
+            except ServerError as e:
+                if attempt == 2 or "no reply" not in str(e):
+                    raise
+                print(f"warning: {e}\n  restarting the server (attempt {attempt + 2} of 3)", file=sys.stderr)
+                srv.restart()
 
     def send(reqs, occurrences):
         # After a driver pause, mid-size messages measure slow for a while
         # (a pause of a few hundred ms is enough): re-warm first.
         if time.time() - srv.last > a.rewarm_gap:
             srv.measure(**dict(reqs[0], m=rewarm_m, batches=1, target_us=20000, tag="rewarm"))
-        return [{"status": "ok", "t_us": rep["t_us"], "wall_us": rep["wall_us"]} for rep in srv.measure_many(reqs)]
+        return [{"status": "ok", "t_us": rep["t_us"], "wall_us": rep["wall_us"]}
+                for rep in retrying(lambda: srv.measure_many(reqs))]
 
     def probe(req):
-        rep = srv.request(**req)
+        rep = retrying(lambda: srv.request(**req))
         return {"status": rep["status"], "msg": rep.get("msg", ""), "wall_us": rep.get("wall_us", 0.0)}
     meta = {"launch": {"cmd": srv.cmd, "env": env}, "algorithm_by": "request" if by_request else "launch",
             "library": info.get("library"), "hosts": info.get("hosts"),
@@ -440,7 +466,8 @@ def catalog_algs(a):
         return None, []
     cat = Catalog.load(a.catalog)
     cat.check(a.op)
-    return cat.algorithms(a.op), cat.restriction_bits()
+    skip = [x for x in a.exclude_algs.split(",") if x]
+    return [x for x in cat.algorithms(a.op) if x.name not in skip], cat.restriction_bits()
 
 
 def alg_info(x, bits):
@@ -814,6 +841,8 @@ def parse_args(argv):
     g.add_argument("--alg", help="one algorithm (builder v1): a value of the op's algorithm CVAR")
     g.add_argument("--algs", help="several algorithms, comma-separated (builder v2: selection); all: every "
                    "algorithm in --catalog")
+    ap.add_argument("--exclude-algs", default="", metavar="A,B", help="leave these catalog algorithms out of "
+                    "--algs all (e.g. one that hangs)")
     ap.add_argument("--out", required=True, help="model file to write (JSON)")
     ap.add_argument("--model", metavar="MODEL", help="add to this model file (collmodel/4): the algorithms of "
                     "--algs that it does not have, and the layouts of --layouts")
@@ -930,7 +959,8 @@ def main(argv=None):
         job = {"start": round(t_start, 3), "mode": "replay" if a.replay else "live", "op": a.op, "algs": a.algs,
                "seed": a.seed, "batches": a.batches, "sync": a.sync, "prune": a.prune, "nodes": nodes,
                "ppn_max": ppn_max, "max_m": max_m, "hosts": meta.get("hosts"), "tool": VERSION,
-               "compositional": a.compositional, "probe_m": a.probe_m, "base": base_hash, "inner": inner_hash,
+               "compositional": a.compositional, "exclude_algs": a.exclude_algs, "probe_m": a.probe_m,
+               "base": base_hash, "inner": inner_hash,
                "layouts": a.layouts, "anchors": a.anchors if a.model else None, "mem": a.mem}
         if journal.jobs:
             first = journal.jobs[0]
