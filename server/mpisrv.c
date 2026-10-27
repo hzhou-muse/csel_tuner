@@ -820,6 +820,51 @@ static double run(const struct req *rq, MPI_Comm c, int crank, long count, int k
     return rq->sync_call ? sum : MPI_Wtime() - t0;
 }
 
+/* Agreement among the members of c during a measurement, for the decisions
+ * that every rank must take alike (failure, spin-up, calibration, bcast check).
+ * It uses MPI_Allgather, so a CVAR that forces the measured operation's
+ * algorithm cannot reach it: with MPI_Allreduce or MPI_Bcast here, a forced
+ * algorithm that does not support the helper's tiny count (reduce_scatter_
+ * allgather with count < pof2) fails the call, and the ranks that missed the
+ * result take different branches and issue different collectives (a hang). */
+enum { AGREE_MAX, AGREE_SUM, AGREE_ROOT };
+
+static double agree(MPI_Comm c, double v, int how)
+{
+    int n;
+    MPI_Comm_size(c, &n);
+    double *all = malloc(n * sizeof(double));
+    int rc = MPI_Allgather(&v, 1, MPI_DOUBLE, all, 1, MPI_DOUBLE, c);
+    if (rc != MPI_SUCCESS) {            /* nothing left to agree on */
+        char msg[MPI_MAX_ERROR_STRING];
+        int len;
+        MPI_Error_string(rc, msg, &len);
+        fprintf(stderr, "mpisrv: rank %d: MPI_Allgather of a measurement helper failed: %s\n", world_rank, msg);
+        MPI_Abort(MPI_COMM_WORLD, 4);
+    }
+    double r = all[0];
+    for (int i = 1; i < n; i++) {
+        if (how == AGREE_MAX && all[i] > r)
+            r = all[i];
+        else if (how == AGREE_SUM)
+            r += all[i];
+    }
+    free(all);
+    return r;                           /* AGREE_ROOT: the value of rank 0 */
+}
+
+/* A helper collective that must not fail (it is not the measured call). */
+static void helper_ok(int rc, const char *what)
+{
+    if (rc != MPI_SUCCESS) {
+        char msg[MPI_MAX_ERROR_STRING];
+        int len;
+        MPI_Error_string(rc, msg, &len);
+        fprintf(stderr, "mpisrv: rank %d: %s failed: %s\n", world_rank, what, msg);
+        MPI_Abort(MPI_COMM_WORLD, 4);
+    }
+}
+
 /* Broadcast a pattern once and count wrong bytes over all ranks. */
 static int check_bcast(const struct req *rq, MPI_Comm c, int crank)
 {
@@ -834,17 +879,16 @@ static int check_bcast(const struct req *rq, MPI_Comm c, int crank)
     for (long i = 0; i < n; i++)
         if (b[i] != (unsigned char) (i * 131 + rq->seq + 7))
             bad++;
-    MPI_Allreduce(MPI_IN_PLACE, &bad, 1, MPI_INT, MPI_SUM, c);
-    return bad;
+    return (int) agree(c, bad, AGREE_SUM);
 }
 
 /* Whether a call has failed on any member; comm rank 0 gets the message. The
- * failure is agreed on with an MPI_Allreduce of MPI_INT, which a restriction
- * on the measured operation does not affect. */
+ * failure is agreed on with agree(), which the CVARs of the measured operation
+ * do not affect. */
 static int any_failed(MPI_Comm c, int crank, struct result *res)
 {
     int failed = call_err != MPI_SUCCESS;
-    MPI_Allreduce(MPI_IN_PLACE, &failed, 1, MPI_INT, MPI_MAX, c);
+    failed = (int) agree(c, failed, AGREE_MAX);
     if (failed && crank == 0) {
         res->failed = 1;
         if (call_err) {
@@ -879,7 +923,7 @@ static void measure(const struct req *rq, MPI_Comm c, struct result *res)
     res->spun_up = spinup_us > 0;
     if (res->spun_up && idle_mode == IDLE_SPLIT) {      /* only if some member was asleep */
         int cold = !hot;
-        MPI_Allreduce(MPI_IN_PLACE, &cold, 1, MPI_INT, MPI_MAX, c);
+        cold = (int) agree(c, cold, AGREE_MAX);
         res->spun_up = cold;
     }
     if (res->spun_up) {                 /* time-based spin-up, decided by comm rank 0 */
@@ -888,13 +932,13 @@ static void measure(const struct req *rq, MPI_Comm c, struct result *res)
         while (more) {
             run(rq, c, crank, count, 1);
             more = (MPI_Wtime() - s0) * 1e6 < spinup_us;
-            MPI_Bcast(&more, 1, MPI_INT, 0, c);
+            more = (int) agree(c, more, AGREE_ROOT);
         }
     }
     int k = 1;
     for (;;) {                          /* calibration */
         double t = run(rq, c, crank, count, k);
-        MPI_Allreduce(MPI_IN_PLACE, &t, 1, MPI_DOUBLE, MPI_MAX, c);
+        t = agree(c, t, AGREE_MAX);
         if (t * 1e6 >= rq->target_us / 2 || k >= (1 << 20))
             break;
         k *= 2;
@@ -908,8 +952,8 @@ static void measure(const struct req *rq, MPI_Comm c, struct result *res)
         double b = run(rq, c, crank, count, k);
         e[j] = rq->sync_call ? (j ? e[j - 1] : 0.0) + b : MPI_Wtime() - t0;
     }
-    MPI_Reduce(e, emax, rq->batches, MPI_DOUBLE, MPI_MAX, 0, c);
-    MPI_Reduce(e, emin, rq->batches, MPI_DOUBLE, MPI_MIN, 0, c);
+    helper_ok(MPI_Reduce(e, emax, rq->batches, MPI_DOUBLE, MPI_MAX, 0, c), "MPI_Reduce");
+    helper_ok(MPI_Reduce(e, emin, rq->batches, MPI_DOUBLE, MPI_MIN, 0, c), "MPI_Reduce");
     if (any_failed(c, crank, res))
         return;
     if (crank == 0) {
