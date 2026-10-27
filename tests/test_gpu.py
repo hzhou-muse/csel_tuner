@@ -173,10 +173,18 @@ def test_precheck_known():
     assert not any("not decided" in x for x in notes), notes
 
 
+def test_warmup_no_zero():
+    """The warmup must not send count 0 (MPICH device allreduce crashes on it)."""
+    from csel_tuner.server import warmup_sizes
+    assert warmup_sizes(65536) == [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536]
+    assert min(warmup_sizes(1)) == 1
+
+
 if __name__ == "__main__":
     test_mem_known()
     test_model_mem_roundtrip()
     test_merge()
     test_merge_errors()
     test_precheck_known()
+    test_warmup_no_zero()
     print("ok")

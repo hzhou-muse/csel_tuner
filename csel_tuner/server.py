@@ -27,7 +27,9 @@ class ServerError(RuntimeError):
 
 
 def warmup_sizes(max_m, step=4):
-    sizes, m = [0], 1
+    """No size 0: the models never measure it, and on device buffers MPICH's default
+    allreduce crashes on count 0 (circ_graph's zero-size copy leaves its request unset)."""
+    sizes, m = [], 1
     while m <= max_m:
         sizes.append(m)
         m *= step
