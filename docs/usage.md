@@ -281,6 +281,21 @@ A run can span several jobs and survive a kill:
   (nodes, ranks per node, largest size), the input model, the inner
   selection file or the added layouts differ; other nodes of the same shape
   are allowed and noted.
+- **Resume with fewer algorithms.** The one change to the algorithms a
+  resume allows is leaving some out: add them to `--exclude-algs`, or drop
+  them from an explicit `--algs` list (not from `all`; exclude those
+  instead). Their replies in the journal are ignored, every other request
+  the journal answers is taken from it in any order, and an earlier job
+  counts against the budget only for the replies taken (the job's time per
+  reply). The job's stderr names the dropped algorithms and how many
+  replies are left out, and at the end the earlier jobs' node-hours and the
+  part billed. Put an algorithm back by starting a new journal.
+
+  ```sh
+  bin/collmodel ... --exclude-algs A --log a.log --out a.json
+  # algorithm B turns out to be broken: resume without it, keeping the rest
+  bin/collmodel ... --exclude-algs A,B --log a.log --resume --out a.json
+  ```
 - **Checkpoints.** The model file is rewritten after a layout at most every
   `--checkpoint-every` seconds (60) and at the end; the run's record in
   the file's `runs` has the stop reason.

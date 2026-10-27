@@ -91,7 +91,11 @@ Interruptions:
   each batch, and one per job. With --resume, a new job reads it back: the
   builder makes the same decisions from the same values (seeded), requests
   already answered come from the journal, and measuring continues where the
-  earlier job stopped; its time counts against the budget. A kill loses at
+  earlier job stopped; its time counts against the budget. A resume may
+  leave algorithms out (a longer --exclude-algs, a shorter explicit --algs):
+  the dropped algorithms' replies are ignored, every other request the
+  journal answers is taken from it in any order, and an earlier job counts
+  against the budget only for the replies taken. A kill loses at
   most the batch in flight. When adding to a model, --out must not be the
   --model file (a resumed run needs the model it started from).
 - The model file is rewritten after a layout at most every
@@ -156,13 +160,22 @@ class Journal:
         {"time": t, "job": {...}}                  one per job: start, settings, allocation
         {"time": t, "req": {...}, "rep": {...}}    one per measurement reply
     Replies are flushed after each batch. Reading back stops at a line cut by
-    a kill, and the file is truncated there before new records are added."""
+    a kill, and the file is truncated there before new records are added.
+
+    A resumed job replays in order: the first request the journal does not
+    answer starts live measuring for good. With salvage set (this job measures
+    fewer algorithms than an earlier one, so its requests come in another
+    order), every request the journal answers is taken from it, in any order,
+    and a reply costs its job's seconds per reply."""
 
     def __init__(self, path, resume):
         self.path, self.cache, self.jobs, self.n_cached = path, {}, [], 0
         self.replayed = 0.0     # run seconds (all jobs) at the latest reply taken from the journal
         self.live = False       # a request missed the journal: measuring live from here on
         self.last_job = None    # index into self.jobs of the reply take() returned last
+        self.salvage = False
+        self.reused = 0.0       # salvage: seconds billed for the replies taken from the journal
+        self.n_replies = []     # replies journaled by each job
         if resume:
             if not path or not os.path.exists(path):
                 sys.exit(f"--resume: no journal {path} (give the --log of the earlier job)")
@@ -176,9 +189,11 @@ class Journal:
                     good += len(line)
                     if "job" in r:
                         self.jobs.append(dict(r["job"], end=r["time"]))
+                        self.n_replies.append(0)
                     elif "req" in r and self.jobs:
                         j = self.jobs[-1]
                         j["end"] = r["time"]
+                        self.n_replies[-1] += 1
                         # run seconds when this reply came: earlier jobs whole, this one so far
                         at = sum(x["end"] - x["start"] for x in self.jobs[:-1]) + r["time"] - j["start"]
                         self.cache.setdefault(req_key(r["req"]), deque()).append((at, r["rep"], len(self.jobs) - 1))
@@ -189,11 +204,13 @@ class Journal:
         self.f = open(path, "a" if resume else "w") if path else None
 
     def take(self, req):
-        q = None if self.live else self.cache.get(req_key(req))
+        q = None if self.live and not self.salvage else self.cache.get(req_key(req))
         if q:
             self.n_cached += 1
             at, rep, self.last_job = q.popleft()
             self.replayed = max(self.replayed, at)
+            j = self.jobs[self.last_job]
+            self.reused += (j["end"] - j["start"]) / self.n_replies[self.last_job]
             return rep
         self.live = True
         return None
@@ -213,10 +230,45 @@ class Journal:
         """Run seconds for the budget: while replaying the journal, the time at
         which the original run had reached the same point (so a resumed run
         stops where an uninterrupted one would); once live, every earlier job
-        plus this one so far."""
+        plus this one so far. Salvage: the replies taken plus this job so far."""
+        if self.salvage:
+            return self.reused + time.time() - t_start
         if not self.live:
             return self.replayed
         return self.earlier_seconds() + time.time() - t_start
+
+    def billed(self, t_start):
+        """Run seconds the model is charged for: every job, or with salvage the
+        replies taken from earlier jobs plus this job."""
+        return (self.reused if self.salvage else self.earlier_seconds()) + time.time() - t_start
+
+
+def resume_check(jobs, job):
+    """(error or None, algorithms dropped): a resumed job keeps the first job's
+    SAME_ON_RESUME settings, except that it may measure fewer algorithms than
+    every earlier job (a shorter explicit --algs list, a longer --exclude-algs)."""
+    first = jobs[0]
+    diff = [k for k in SAME_ON_RESUME if k not in ("algs", "exclude_algs")
+            and first.get(k, RESUME_DEFAULTS.get(k)) != job.get(k)]
+    if diff:
+        return "the journal's run differs in " + ", ".join(f"{k} ({first.get(k)} -> {job.get(k)})" for k in diff), set()
+    algs, skip = job["algs"], {x for x in job["exclude_algs"].split(",") if x}
+    dropped = set()
+    for e in jobs:
+        e_skip = {x for x in e.get("exclude_algs", "").split(",") if x}
+        if e["algs"] != algs:
+            if "all" in e["algs"] or "all" in algs:
+                return f"--algs differs ({','.join(e['algs'])} -> {','.join(algs)}); from or to 'all' it cannot be " \
+                       "resumed (to leave algorithms out of 'all', add them to --exclude-algs)", set()
+            if not set(algs) <= set(e["algs"]):
+                return f"--algs adds {','.join(sorted(set(algs) - set(e['algs'])))}: a resume may only leave " \
+                       "algorithms out", set()
+            dropped |= set(e["algs"]) - set(algs)
+        if not e_skip <= skip:
+            return f"--exclude-algs no longer excludes {','.join(sorted(e_skip - skip))}: a resume may only " \
+                   "exclude more", set()
+        dropped |= {x for x in skip - e_skip if "all" in algs or x in algs}
+    return None, dropped
 
 
 def live(a):
@@ -964,10 +1016,16 @@ def main(argv=None):
                "layouts": a.layouts, "anchors": a.anchors if a.model else None, "mem": a.mem}
         if journal.jobs:
             first = journal.jobs[0]
-            diff = [k for k in SAME_ON_RESUME if first.get(k, RESUME_DEFAULTS.get(k)) != job.get(k)]
-            if diff:
-                sys.exit("--resume: the journal's run differs in " + ", ".join(
-                    f"{k} ({first.get(k)} -> {job.get(k)})" for k in diff))
+            err, dropped = resume_check(journal.jobs, job)
+            if err:
+                sys.exit("--resume: " + err)
+            # an earlier job measured more algorithms: the requests come in another order
+            if dropped:
+                journal.salvage = job["salvage"] = True
+                n_out = sum(len(q) for k, q in journal.cache.items() if req_alg(json.loads(k), a.op) in dropped)
+                print(f"--resume: fewer algorithms than an earlier job (dropped: {','.join(sorted(dropped))}); "
+                      f"every request the journal answers is taken from it, in any order; {n_out} replies of "
+                      "dropped algorithms are left out", file=sys.stderr)
             if first.get("hosts") != job.get("hosts"):
                 print("note: this job runs on other nodes than the first one", file=sys.stderr)
         journal.write({"job": job})
@@ -1014,7 +1072,7 @@ def main(argv=None):
         # time of every measurement
         clock = (lambda: measure.wall_us * 1e-6) if a.replay else (lambda: journal.clock(t_start))
         cost = (lambda: measure.wall_us * 1e-6 * nodes / 3600) if a.replay else \
-            (lambda: (journal.earlier_seconds() + time.time() - t_start) * nodes / 3600)
+            (lambda: journal.billed(t_start) * nodes / 3600)
         state = {"ckpt": time.time(), "layout": time.time(), "slowest": 0.0}
 
         def checkpoint():
@@ -1083,6 +1141,10 @@ def main(argv=None):
             # after SIGTERM there is little time, but a clean quit still lets MPI remove its shared memory
             srv.close(wait=30 if stopped != "terminated" else 5)
     jobs[-1]["end"] = round(time.time(), 3)
+    if journal.salvage and not a.replay:
+        print(f"salvage: the earlier jobs took {journal.earlier_seconds() * nodes / 3600:.3f} node-h, "
+              f"{journal.reused * nodes / 3600:.3f} of it billed for the {journal.n_cached} replies reused",
+              file=sys.stderr)
     if v1:
         b = built[0][3]
         if not b.samplers:

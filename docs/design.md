@@ -185,6 +185,19 @@ together; with stdio buffering a batch of requests hung the server.
   dropped. Replay measurements are drawn from (seed, request, occurrence),
   not from call order, so a cut-and-resumed replay equals an uninterrupted
   one exactly (`tests/test_resume.py`).
+- **Resume with fewer algorithms.** An algorithm found broken mid-run (it
+  hangs, or MPICH rejects it) can be left out on resume: a longer
+  `--exclude-algs` or a shorter explicit `--algs`. With fewer algorithms the
+  builder's requests can change order (pruning and the sampler's choice of
+  points depend on all algorithms' curves, and the restriction sets may
+  change), so in-order replay would keep only the prefix before the first
+  difference. Instead the journal answers every
+  request it has, in any order ("salvage"); a reply is a real measurement
+  of the same request on the same allocation shape, so the model stays
+  valid, but it is no longer equal to any uninterrupted run. The dropped
+  algorithms' replies are never requested. For the budget and the cost, an
+  earlier job is charged its seconds per reply for each reply taken, so the
+  discarded work does not use up the budget of the rest.
 - **Stopping safely.** The model file is checkpointed after layouts; a
   deadline stops before a layout that might not fit; SIGTERM stops
   measuring and writes the model from the layouts whose recording finished
