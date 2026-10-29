@@ -59,7 +59,7 @@ op=bcast m=65536 p=256 ppn=8 batches=5 sync=call cvar.MPIR_CVAR_BCAST_INTRA_ALGO
 
 | Key | Meaning | Default |
 |---|---|---|
-| `op` | `bcast`, `allreduce`, `pingpong`, `info`, `quit` | — |
+| `op` | `bcast`, `allreduce`, `reduce`, `ireduce`, `iallreduce` (the reductions sum `MPI_INT`s; the nonblocking ones are waited on at once), `pingpong`, `info`, `quit` | — |
 | `m` | message size in bytes | — |
 | `p`, `ppn` | sub-communicator size and ranks per node | the whole job |
 | `place` | which local ranks of a node: `nic` (§3.3), `spread`, `compact` | `nic` |

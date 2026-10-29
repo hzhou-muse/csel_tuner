@@ -139,7 +139,7 @@ class Server:
     def warmup(self, op, **layout):
         """One pass of `op` over a coarse size grid; not counted as cost."""
         for m in warmup_sizes(self.max_m):
-            if op == "allreduce" and m % 4:
+            if op != "bcast" and m % 4:     # the reductions sum MPI_INTs
                 continue
             self.request(op=op, m=m, batches=1, target_us=200, tag="warmup", **layout)
 

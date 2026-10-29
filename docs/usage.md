@@ -256,7 +256,7 @@ Also `--log`, `--resume`, `--deadline`, `--checkpoint-every` (§6.5) and
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--op` | `bcast` | the collective |
+| `--op` | `bcast` | the collective: `bcast`, `allreduce`, `reduce`, `ireduce` or `iallreduce` |
 | `--budget-node-h` | 2 | stop after this many node-hours |
 | `--prune` | 2.0 | v2: skip sizes predicted this much slower than the best; 0 = off |
 | `--batches` | 5 | timed batches per request |

@@ -77,7 +77,14 @@ PARAMS = {"bcast": {"tree": {"tree_type": "kary", "k": 2, "is_non_blocking": Tru
                         "recursive_multiplying": {"k": 2},
                         "recexch": {"k": 2, "single_phase_recv": False},
                         "k_reduce_scatter_allgather": {"k": 2, "single_phase_recv": False},
-                        "ccl": {"ccl": "auto"}}}
+                        "ccl": {"ccl": "auto"}},
+          "ireduce": {"tsp_tree": {"tree_type": "kary", "k": 2, "chunk_size": -1, "buffer_per_child": False},
+                      "tsp_ring": {"chunk_size": 0, "buffer_per_child": False}},
+          "iallreduce": {"tsp_recexch_single_buffer": {"k": 2},
+                         "tsp_recexch_multiple_buffer": {"k": 2},
+                         "tsp_recexch": {"k": 2},
+                         "tsp_tree": {"tree_type": "kary", "k": 2, "chunk_size": 0, "buffer_per_child": False},
+                         "tsp_recexch_reduce_scatter_recexch_allgatherv": {"k": 2}}}
 
 
 def json_depth(o):

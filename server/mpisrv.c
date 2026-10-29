@@ -16,6 +16,7 @@
  *   op=pingpong m=8113 pair=0,1 batches=3
  *   op=bcast m=65536 p=256 ppn=8 root=0 place=nic nodes=0:1 check=1
  *   op=allreduce m=65536 p=8 ppn=4 batches=3 target_us=1000 cache=hot
+ *   op=reduce m=65536 p=8 ppn=4 root=0 (also ireduce with root, iallreduce)
  *   op=info | op=quit
  *
  * Each request runs on a sub-communicator: the two ranks of `pair`, or p
@@ -109,8 +110,18 @@
 #define MAX_CVARS 4
 #define CVAR_LEN 64
 
-enum op { OP_NONE, OP_INFO, OP_QUIT, OP_PINGPONG, OP_ALLREDUCE, OP_BCAST };
-static const char *op_names[] = { "none", "info", "quit", "pingpong", "allreduce", "bcast" };
+enum op { OP_NONE, OP_INFO, OP_QUIT, OP_PINGPONG, OP_ALLREDUCE, OP_BCAST, OP_REDUCE, OP_IREDUCE,
+    OP_IALLREDUCE
+};
+static const char *op_names[] = { "none", "info", "quit", "pingpong", "allreduce", "bcast", "reduce",
+    "ireduce", "iallreduce"
+};
+
+/* the reductions sum MPI_INTs; m is in bytes, a multiple of sizeof(int) */
+static int is_reduction(enum op op)
+{
+    return op == OP_ALLREDUCE || op == OP_REDUCE || op == OP_IREDUCE || op == OP_IALLREDUCE;
+}
 
 struct req {
     int op;
@@ -720,7 +731,7 @@ static const char *parse(char *line, struct req *rq)
         if (a == b || a < 0 || b < 0 || a >= world_size || b >= world_size)
             return "pair must be two different world ranks";
     }
-    if (rq->op == OP_ALLREDUCE || rq->op == OP_BCAST) {
+    if (is_reduction(rq->op) || rq->op == OP_BCAST) {
         if (rq->p < 1 || rq->p > world_size || rq->ppn < 1 || rq->p % rq->ppn)
             return "need 1 <= p <= world size and p a multiple of ppn";
         if (rq->node_off < 0 || rq->node_stride < 1 || rq->ppn > min_ppn ||
@@ -786,7 +797,7 @@ static char *read_line(char *line, int len)
  * the sum of the calls' own times, barriers excluded) */
 static double run(const struct req *rq, MPI_Comm c, int crank, long count, int k)
 {
-    long bytes = rq->op == OP_ALLREDUCE ? count * (long) sizeof(int) : count;
+    long bytes = is_reduction(rq->op) ? count * (long) sizeof(int) : count;
     double t0 = MPI_Wtime(), sum = 0;
     for (int i = 0; i < k; i++) {
         long off = rq->cold ? (i * bytes) % max_m : 0;
@@ -809,6 +820,16 @@ static double run(const struct req *rq, MPI_Comm c, int crank, long count, int k
             }
         } else if (rq->op == OP_BCAST) {
             rc = MPI_Bcast(s, count, MPI_BYTE, rq->root, c);
+        } else if (rq->op == OP_REDUCE) {
+            rc = MPI_Reduce(s, r, count, MPI_INT, MPI_SUM, rq->root, c);
+        } else if (rq->op == OP_IREDUCE || rq->op == OP_IALLREDUCE) {
+            MPI_Request req;
+            if (rq->op == OP_IREDUCE)
+                rc = MPI_Ireduce(s, r, count, MPI_INT, MPI_SUM, rq->root, c, &req);
+            else
+                rc = MPI_Iallreduce(s, r, count, MPI_INT, MPI_SUM, c, &req);
+            if (rc == MPI_SUCCESS)
+                rc = MPI_Wait(&req, MPI_STATUS_IGNORE);
         } else {
             rc = MPI_Allreduce(s, r, count, MPI_INT, MPI_SUM, c);
         }
@@ -865,6 +886,29 @@ static void helper_ok(int rc, const char *what)
     }
 }
 
+/* The max and min over the members of c of each batch time, on comm rank 0.
+ * MPI_Gather, not MPI_Reduce: a CVAR that forces the measured reduce
+ * algorithm must not reach the helper (see agree). */
+static void batch_extremes(const double *e, double *emax, double *emin, int n, MPI_Comm c,
+                           int crank)
+{
+    int csize;
+    MPI_Comm_size(c, &csize);
+    double *all = crank == 0 ? malloc(sizeof(double) * n * csize) : NULL;
+    helper_ok(MPI_Gather(e, n, MPI_DOUBLE, all, n, MPI_DOUBLE, 0, c), "MPI_Gather");
+    if (crank != 0)
+        return;
+    for (int j = 0; j < n; j++) {
+        emax[j] = emin[j] = all[j];
+        for (int i = 1; i < csize; i++) {
+            double v = all[i * n + j];
+            emax[j] = v > emax[j] ? v : emax[j];
+            emin[j] = v < emin[j] ? v : emin[j];
+        }
+    }
+    free(all);
+}
+
 /* Broadcast a pattern once and count wrong bytes over all ranks. */
 static int check_bcast(const struct req *rq, MPI_Comm c, int crank)
 {
@@ -905,7 +949,7 @@ static void measure(const struct req *rq, MPI_Comm c, struct result *res)
 {
     int crank;
     MPI_Comm_rank(c, &crank);
-    long count = rq->op == OP_ALLREDUCE ? rq->m / (long) sizeof(int) : rq->m;
+    long count = is_reduction(rq->op) ? rq->m / (long) sizeof(int) : rq->m;
     double w0 = MPI_Wtime();
 
     call_err = MPI_SUCCESS;
@@ -913,7 +957,7 @@ static void measure(const struct req *rq, MPI_Comm c, struct result *res)
     res->msg[0] = '\0';
     res->k = 0;
     res->spread = 0;
-    res->m = rq->op == OP_ALLREDUCE ? count * (long) sizeof(int) : count;
+    res->m = is_reduction(rq->op) ? count * (long) sizeof(int) : count;
     res->check_err = rq->check && rq->op == OP_BCAST ? check_bcast(rq, c, crank) : -1;
     run(rq, c, crank, count, 1);        /* first-call exclusion */
     if (any_failed(c, crank, res) || rq->probe) {
@@ -952,8 +996,7 @@ static void measure(const struct req *rq, MPI_Comm c, struct result *res)
         double b = run(rq, c, crank, count, k);
         e[j] = rq->sync_call ? (j ? e[j - 1] : 0.0) + b : MPI_Wtime() - t0;
     }
-    helper_ok(MPI_Reduce(e, emax, rq->batches, MPI_DOUBLE, MPI_MAX, 0, c), "MPI_Reduce");
-    helper_ok(MPI_Reduce(e, emin, rq->batches, MPI_DOUBLE, MPI_MIN, 0, c), "MPI_Reduce");
+    batch_extremes(e, emax, emin, rq->batches, c, crank);
     if (any_failed(c, crank, res))
         return;
     if (crank == 0) {
@@ -963,7 +1006,7 @@ static void measure(const struct req *rq, MPI_Comm c, struct result *res)
         int last = rq->batches - 1;
         res->spread = (emax[last] - emin[last]) / emax[last];
         res->k = k;
-        res->m = rq->op == OP_ALLREDUCE ? count * (long) sizeof(int) : count;
+        res->m = is_reduction(rq->op) ? count * (long) sizeof(int) : count;
         res->wall_us = (MPI_Wtime() - w0) * 1e6;
     }
 }
@@ -1058,7 +1101,7 @@ static void reply_result(const struct req *rq, const struct result *res)
     else
         fprintf(out, "\"p\":%d,\"ppn\":%d,\"place\":\"%s\",\"nodes\":\"%d:%d\",", rq->p, rq->ppn,
                 place_names[rq->place], rq->node_off, rq->node_stride);
-    if (rq->op == OP_BCAST)
+    if (rq->op == OP_BCAST || rq->op == OP_REDUCE || rq->op == OP_IREDUCE)
         fprintf(out, "\"root\":%d,", rq->root);
     if (res->check_err >= 0 && !res->failed) {
         fprintf(out, "\"check\":\"%s\",\"check_err\":%d,", res->check_err ? "fail" : "ok",

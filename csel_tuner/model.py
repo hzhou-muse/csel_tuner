@@ -173,7 +173,12 @@ class Model:
 
     def leaf(self, alg):
         x = self.algorithms.get(alg, {}).get("leaf")
-        return x or "MPIR_%s_intra_%s" % (self.op[0].upper() + self.op[1:], alg)
+        if x:
+            return x
+        Op = self.op[0].upper() + self.op[1:]
+        if self.op.startswith("i") and alg.startswith("tsp_"):     # gen_coll.py's name for tsp algorithms
+            return "MPIR_TSP_%s_sched_intra_%s" % (Op, alg[4:])
+        return "MPIR_%s_intra_%s" % (Op, alg)
 
     def update_masks(self, algs):
         """Masks from the precheck: the conditions true at each layout, inferred

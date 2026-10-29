@@ -131,8 +131,10 @@ from csel_tuner.restrict import fixed_point, mem_known, plan_sets, precheck, set
 from csel_tuner.single import Builder, initial_layouts  # noqa: E402
 
 VERSION = "collmodel 0.4"
-OPS = {"bcast": "MPIR_CVAR_BCAST_INTRA_ALGORITHM", "allreduce": "MPIR_CVAR_ALLREDUCE_INTRA_ALGORITHM"}
-UNIT = {"bcast": 1, "allreduce": 4}      # message sizes are multiples of the op's element size (mpisrv: MPI_INT)
+OPS = {op: "MPIR_CVAR_%s_INTRA_ALGORITHM" % op.upper()
+       for op in ("bcast", "allreduce", "reduce", "ireduce", "iallreduce")}
+# message sizes are multiples of the op's element size (mpisrv: MPI_INT for the reductions)
+UNIT = {op: 1 if op == "bcast" else 4 for op in OPS}
 # settings that change which requests the builder makes: a resumed job must keep them
 SAME_ON_RESUME = ["mode", "op", "algs", "seed", "batches", "sync", "prune", "nodes", "ppn_max", "max_m",
                   "compositional", "probe_m", "base", "inner", "layouts", "anchors", "mem", "exclude_algs"]
