@@ -132,14 +132,22 @@ from csel_tuner.restrict import fixed_point, mem_known, plan_sets, precheck, set
 from csel_tuner.single import Builder, initial_layouts  # noqa: E402
 
 VERSION = "collmodel 0.4"
-OPS = {op: "MPIR_CVAR_%s_INTRA_ALGORITHM" % op.upper()
-       for op in ("bcast", "allreduce", "reduce", "ireduce", "iallreduce")}
-# message sizes are multiples of the op's element size (mpisrv: MPI_INT for the reductions)
-UNIT = {op: 1 if op == "bcast" else 4 for op in OPS}
+
+
+class _AlgCvars(dict):
+    """op -> its algorithm CVAR, MPIR_CVAR_<OP>_INTRA_ALGORITHM, for any op."""
+    def __missing__(self, op):
+        return "MPIR_CVAR_%s_INTRA_ALGORITHM" % op.upper()
+
+
+OPS = _AlgCvars()
+# the server's operations and their properties come from its info record ("colls"); a server
+# without it knows these, with their element sizes (MPI_INT for the reductions)
+OLD_OPS = {"bcast": 1, "allreduce": 4, "reduce": 4, "ireduce": 4, "iallreduce": 4}
 # settings that change which requests the builder makes: a resumed job must keep them
-SAME_ON_RESUME = ["mode", "op", "algs", "seed", "batches", "sync", "prune", "nodes", "ppn_max", "max_m",
+SAME_ON_RESUME = ["mode", "op", "algs", "seed", "batches", "sync", "prune", "nodes", "ppn_max", "max_m", "counts", "inplace",
                   "compositional", "probe_m", "base", "inner", "layouts", "anchors", "mem", "exclude_algs"]
-RESUME_DEFAULTS = {"mem": "host", "exclude_algs": ""}       # for journals written before the setting existed
+RESUME_DEFAULTS = {"mem": "host", "exclude_algs": "", "counts": "uniform", "inplace": False}       # for journals written before the setting existed
 
 
 class Terminated(Exception):
@@ -252,7 +260,7 @@ def resume_check(jobs, job):
     every earlier job (a shorter explicit --algs list, a longer --exclude-algs)."""
     first = jobs[0]
     diff = [k for k in SAME_ON_RESUME if k not in ("algs", "exclude_algs")
-            and first.get(k, RESUME_DEFAULTS.get(k)) != job.get(k)]
+            and first.get(k, RESUME_DEFAULTS.get(k)) != job.get(k, RESUME_DEFAULTS.get(k))]
     if diff:
         return "the journal's run differs in " + ", ".join(f"{k} ({first.get(k)} -> {job.get(k)})" for k in diff), set()
     algs, skip = job["algs"], {x for x in job["exclude_algs"].split(",") if x}
@@ -298,9 +306,27 @@ def live(a):
                  "switch (MPISRV_CVAR_SWITCH)")
     sel = lambda alg: {"cvar." + OPS[a.op]: "auto" if alg == "buffer_swap" else alg} if by_request else {}
     nodes, ppn_max = info["nodes"], info["min_ppn"]
+    colls = info.get("colls") or {op: {"layout": "comm", "elem": e} for op, e in OLD_OPS.items()}
+    coll = colls.get(a.op)
+    if coll is None or coll.get("layout") != "comm":
+        srv.close()
+        sys.exit(f"--op {a.op}: not a collective of this server ({', '.join(sorted(colls))})")
+    if a.counts != "uniform" and not coll.get("vcounts"):
+        srv.close()
+        sys.exit(f"--counts {a.counts}: {a.op} is not a v-operation")
     layouts = [(n, p) for n in axis_values(nodes) for p in axis_values(ppn_max) if n * p > 1]
-    sizes = size_grid(info["max_m"], unit=UNIT[a.op])
-    rewarm_m = min(1 << 20, info["max_m"])
+    elem = coll["elem"]
+    # m is the per-member block; with p blocks per buffer the largest layout must fit max_m
+    # (one grid for all layouts for now: smaller layouts could go further)
+    cap = info["max_m"] // (nodes * ppn_max) if coll.get("sbuf_p") or coll.get("rbuf_p") else info["max_m"]
+    sizes = [0] if coll.get("no_data") else size_grid(cap, unit=elem)
+    rewarm_m = 0 if coll.get("no_data") else min(1 << 20, cap) // elem * elem
+    if a.inplace and not coll.get("inplace_ok"):
+        srv.close()
+        sys.exit(f"--inplace: {a.op} takes no MPI_IN_PLACE")
+    counts = {"counts": a.counts} if coll.get("vcounts") else {}
+    if a.inplace:
+        counts["inplace"] = 1
 
     # An algorithm restricted by count_ge_pof2 (count >= the largest power of two <= p) fails on smaller
     # messages, which no layout-wide precheck can tell. Below its minimum its time is taken as the time at the
@@ -308,12 +334,13 @@ def live(a):
     # back to a set without it.
     algs, _ = catalog_algs(a)
     min_count = {x.name for x in algs or [] if "count_ge_pof2" in x.restrictions}
-    elem = UNIT[a.op]
 
     def make_req(n, ppn, alg, m):
+        if coll.get("no_data"):     # barrier: every request (also the precheck's probe) has m=0
+            m = 0
         if alg in min_count:
             m = max(m, elem * (1 << ((n * ppn).bit_length() - 1)))
-        return dict(op=a.op, m=m, p=n * ppn, ppn=ppn, batches=a.batches, sync=a.sync, **sel(alg))
+        return dict(op=a.op, m=m, p=n * ppn, ppn=ppn, batches=a.batches, sync=a.sync, **counts, **sel(alg))
 
     def retrying(call):
         """call(), again on a fresh server if a call never returned (--timeout), up to 3 tries."""
@@ -911,7 +938,12 @@ def import_v3(a):
 
 def parse_args(argv):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--op", default="bcast", choices=sorted(OPS))
+    ap.add_argument("--op", default="bcast", help="the collective to measure: an operation of the server "
+                    "(its info record lists them), e.g. bcast, allreduce, allgather, alltoallv (default bcast)")
+    ap.add_argument("--counts", default="uniform", choices=["uniform", "linear", "onebig"],
+                    help="v-operations: the per-member blocks, with m the mean block (default uniform)")
+    ap.add_argument("--inplace", action="store_true", help="measure with MPI_IN_PLACE (mpisrv inplace=1), for the "
+                    "operations that allow it")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--alg", help="one algorithm (builder v1): a value of the op's algorithm CVAR")
     g.add_argument("--algs", help="several algorithms, comma-separated (builder v2: selection); all: every "
@@ -1036,7 +1068,8 @@ def main(argv=None):
                "ppn_max": ppn_max, "max_m": max_m, "hosts": meta.get("hosts"), "tool": VERSION,
                "compositional": a.compositional, "exclude_algs": a.exclude_algs, "probe_m": a.probe_m,
                "base": base_hash, "inner": inner_hash,
-               "layouts": a.layouts, "anchors": a.anchors if a.model else None, "mem": a.mem}
+               "layouts": a.layouts, "anchors": a.anchors if a.model else None, "mem": a.mem,
+               "counts": a.counts, "inplace": a.inplace}
         if journal.jobs:
             first = journal.jobs[0]
             err, dropped = resume_check(journal.jobs, job)
@@ -1133,6 +1166,11 @@ def main(argv=None):
                 if model is not None:
                     model.algorithms.update({x: {"leaf": None, "restrictions": [], "mask": 0, "inner": []}
                                              for x in a.algs})
+            # a set where no algorithm can run (e.g. only in-place ones, which the requests never are)
+            for mask, lays, names in sets:
+                if not names:
+                    print(f"set {set_name(a.op, mask)}: no algorithm runs there; skipped", file=sys.stderr)
+            sets = [x for x in sets if x[2]]
             # each later set keeps a share of the budget in proportion to its layouts
             share = [len(x[1]) / sum(len(y[1]) for y in sets) * a.budget_node_h for x in sets]
             for i, (mask, lays, names) in enumerate(sets):

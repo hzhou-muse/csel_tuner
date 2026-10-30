@@ -268,7 +268,9 @@ Also `--log`, `--resume`, `--deadline`, `--checkpoint-every` (§6.5) and
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--op` | `bcast` | the collective: `bcast`, `allreduce`, `reduce`, `ireduce` or `iallreduce` |
+| `--op` | `bcast` | the collective: any operation of the server (its info record lists them in `colls`: the blocking and nonblocking collectives, including the v-operations and barrier); for operations with p blocks per buffer (allgather, alltoall, gather, scatter, reduce_scatter(_block) and the v-operations) the size grid stops at max-m / (nodes × ppn) |
+| `--counts` | `uniform` | v-operations: the per-member blocks, `uniform`, `linear` or `onebig`, with `m` the mean block (mpisrv `counts=`) |
+| `--inplace` | off | measure with `MPI_IN_PLACE` (mpisrv `inplace=1`), for the operations that allow it |
 | `--budget-node-h` | 2 | stop after this many node-hours |
 | `--prune` | 2.0 | v2: skip sizes predicted this much slower than the best; 0 = off |
 | `--batches` | 5 | timed batches per request |

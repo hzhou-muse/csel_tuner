@@ -138,8 +138,13 @@ class Server:
 
     def warmup(self, op, **layout):
         """One pass of `op` over a coarse size grid; not counted as cost."""
-        for m in warmup_sizes(self.max_m):
-            if op != "bcast" and m % 4:     # the reductions sum MPI_INTs
+        coll = self.world.get("colls", {}).get(op)
+        if coll is None:    # a server without "colls" in its info record
+            coll = {"elem": 1 if op == "bcast" else 4}
+        blocks = coll.get("sbuf_p") or coll.get("rbuf_p")
+        cap = self.max_m // (layout.get("p", self.world.get("world_size", 1)) if blocks else 1)
+        for m in [0] if coll.get("no_data") else warmup_sizes(cap):
+            if m % coll["elem"]:
                 continue
             self.request(op=op, m=m, batches=1, target_us=200, tag="warmup", **layout)
 
