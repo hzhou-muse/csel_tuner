@@ -1,0 +1,71 @@
+# ---- buffers -----------------------------------------------------------
+# sbuf and rbuf, in host memory or (--mem device) GPU memory through gpu.h.
+
+subcode: _autoload
+    $include gpu.h, stdio, stdlib, string
+
+# Ranks of one node that share a GPU, as a topology warning.
+fncode: check_devices
+    $my unsigned char mine[GPU_UUID_LEN]
+    $my unsigned char *all = malloc((size_t) GPU_UUID_LEN * world_size)
+    gpu_uuid(mine)
+    MPI_Allgather(mine, GPU_UUID_LEN, MPI_BYTE, all, GPU_UUID_LEN, MPI_BYTE, MPI_COMM_WORLD)
+    # r = world_size leaves both loops (C form, and a semicolon: r is declared in the loop header)
+    $for int r = 0; r < world_size; r++
+        $for q=r+1:world_size
+            $if node_of[q] == node_of[r] && !memcmp(all + (size_t) r * GPU_UUID_LEN, all + (size_t) q * GPU_UUID_LEN, GPU_UUID_LEN)
+                $my char msg[160]
+                snprintf(msg, sizeof(msg), "node %d: local ranks %d and %d share a GPU", node_of[r], local_of[r], local_of[q])
+                warn(msg)
+                r = world_size;
+                break
+    free(all)
+
+fncode: buf_alloc(long n, int byte): char *
+    $my void *p = NULL
+    $if mem_device
+        p = gpu_alloc(n)
+        $if p && gpu_fill(p, byte, n)
+            p = NULL
+    $elif !posix_memalign(&p, 4096, n)
+        memset(p, byte, n)
+    $else
+        p = NULL
+    return p
+
+# sbuf and rbuf, in host or (--mem device) GPU memory. After init_site.
+fncode: init_buffers
+    $global char *sbuf, char *rbuf        # max_m each, 2 * max_m with --cold
+    $if mem_device
+        $my char err[256] = ""
+        $my const char *bind_err
+        bind_err = getenv("MPISRV_BIND_ERROR")    # from launch/gpu_bind.sh
+        $my int bad = 1, int any
+        $if bind_err
+            snprintf(err, sizeof(err), "%s", bind_err)
+        $else
+            bad = gpu_init(err, sizeof(err)) != 0
+        MPI_Allreduce(&bad, &any, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD)
+        $if bad
+            fprintf(stderr, "mpisrv: rank %d (node %d, local %d): %s\n", world_rank, my_node, my_local, err)
+        $if any
+            MPI_Abort(MPI_COMM_WORLD, 1)
+        $my size_t n = strlen(topo_warn)
+        check_devices()
+        $if world_rank == 0 && topo_warn[n]
+            fprintf(stderr, "mpisrv: topology: %s\n", topo_warn + n + (n ? 2 : 0))
+    $my long buflen = (cold_ok ? 2 : 1) * (max_m > 0 ? max_m : 1)
+    sbuf = buf_alloc(buflen, 1)
+    rbuf = buf_alloc(buflen, 0)
+    $if !sbuf || !rbuf
+        fprintf(stderr, "mpisrv: rank %d: cannot allocate %ld bytes of %s memory\n", world_rank, buflen, mem_device ? "device" : "host")
+        MPI_Abort(MPI_COMM_WORLD, 1)
+
+fncode: free_buffers
+    $if mem_device
+        gpu_free(sbuf)
+        gpu_free(rbuf)
+        gpu_finalize()
+    $else
+        free(sbuf)
+        free(rbuf)

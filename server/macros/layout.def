@@ -1,0 +1,79 @@
+# ---- layout ------------------------------------------------------------
+# Which world ranks a request uses (p, ppn, place, node_off, node_stride, or
+# the pingpong pair) and the cached sub-communicators per layout.
+
+subcode: _autoload
+    $define(MAX_COMMS) 512
+    $enum(place) PLACE_COMPACT, PLACE_SPREAD, PLACE_NIC
+    $global const char *place_names[] = { "compact", "spread", "nic" }
+    $struct(comm_entry) struct req key, MPI_Comm comm  # key: layout fields only
+
+# Local rank of the j-th member on each node. For place=nic, ranks j < j'
+# in one group of nic_mod have base ranks less than nic_mod apart, so
+# j' - j < nic_mod and their residues differ: the ranks are distinct.
+fncode: place_local(int j, const struct req *rq): int
+    $if rq->place == PLACE_COMPACT
+        return j
+    $my int base = (int) ((long) j * min_ppn / rq->ppn)
+    $if rq->place == PLACE_SPREAD
+        return base
+    return base - base % nic_mod + j % nic_mod
+
+# Whether world rank r belongs to the request's sub-communicator.
+fncode: is_member(int r, const struct req *rq): int
+    $if rq->op == OP_PINGPONG
+        return r == rq->pair[0] || r == rq->pair[1]
+    $my int rel = node_of[r] - rq->node_off
+    $if rel < 0 || rel % rq->node_stride || rel / rq->node_stride >= rq->p / rq->ppn
+        return 0
+    $for j=0:rq->ppn
+        $if place_local(j, rq) == local_of[r]
+            return 1
+    return 0
+
+# World rank of the sub-communicator's rank 0.
+fncode: comm_root(const struct req *rq): int
+    $if rq->op == OP_PINGPONG
+        return rq->pair[0]
+    $for r=0:world_size
+        $if is_member(r, rq)
+            return r
+    return 0
+
+fncode: same_layout(const struct req *a, const struct req *b): int
+    $if (a->op == OP_PINGPONG) != (b->op == OP_PINGPONG)
+        return 0
+    $if a->op == OP_PINGPONG
+        return a->pair[0] == b->pair[0] && a->pair[1] == b->pair[1]
+    return a->p == b->p && a->ppn == b->ppn && a->place == b->place && a->node_off == b->node_off && a->node_stride == b->node_stride
+
+# Sub-communicator for a request; collective over MPI_COMM_WORLD the first
+# time a layout is seen. Returns MPI_COMM_NULL on non-members.
+fncode: get_comm(const struct req *rq): MPI_Comm
+    $call comm_cache
+    $for i=0:num_comms
+        $if same_layout(&comms[i].key, rq)
+            return comms[i].comm
+
+    $my int color = MPI_UNDEFINED, int key = world_rank
+    $if is_member(world_rank, rq)
+        color = 0
+        $if rq->op == OP_PINGPONG
+            key = world_rank == rq->pair[0] ? 0 : 1
+    $my MPI_Comm c
+    MPI_Comm_split(MPI_COMM_WORLD, color, key, &c)
+    $if c != MPI_COMM_NULL
+        MPI_Comm_set_errhandler(c, MPI_ERRORS_RETURN)
+    $if num_comms < MAX_COMMS
+        comms[num_comms].key = *rq
+        comms[num_comms].comm = c
+        num_comms++
+    return c
+
+# The sub-communicators by layout, freed before MPI_Finalize.
+subcode: comm_cache
+    $global struct comm_entry comms[MAX_COMMS], int num_comms
+    $(block:before_mpi_finalize)
+        $for i=0:num_comms
+            $if comms[i].comm != MPI_COMM_NULL
+                MPI_Comm_free(&comms[i].comm)

@@ -1,0 +1,52 @@
+# ---- idle --------------------------------------------------------------
+# How ranks wait between requests (MPISRV_IDLE, MPISRV_IDLE_NS): without
+# MPI calls, spinning or sleeping.
+
+subcode: _autoload
+    $include time, poll, unistd
+    $global long idle_ns = 50000
+    $enum(idle) IDLE_SPIN, IDLE_SLEEP, IDLE_BUSY, IDLE_SPLIT
+    $global int idle_mode = IDLE_SPIN
+    $global int hot                       # split: member of the last request, so spinning
+    $global double spinup_us = 0
+
+# Pause between checks without MPI calls: spin keeps the core at speed,
+# sleep lets it idle.
+fncode: idle_pause
+    $if idle_mode == IDLE_SLEEP || (idle_mode == IDLE_SPLIT && !hot)
+        $my struct timespec ts
+        ts.tv_sec = idle_ns / 1000000000
+        ts.tv_nsec = idle_ns % 1000000000
+        nanosleep(&ts, NULL)
+    $else
+        $my double t0 = MPI_Wtime()
+        $while (MPI_Wtime() - t0) * 1e9 < idle_ns
+            $for i=0:100
+                __builtin_ia32_pause()
+
+# Wait for the next request without driving MPI progress in between.
+fncode: bcast_request(struct req *rq)
+    $if idle_mode == IDLE_BUSY
+        MPI_Bcast(rq, sizeof(*rq), MPI_BYTE, 0, MPI_COMM_WORLD)
+        return
+    $my MPI_Request r
+    $my int done = 0
+    MPI_Ibcast(rq, sizeof(*rq), MPI_BYTE, 0, MPI_COMM_WORLD, &r)
+    $while 1
+        MPI_Test(&r, &done, MPI_STATUS_IGNORE)
+        $if done
+            break
+        idle_pause()
+
+# Rank 0: read the next line; from stdin, wait for input in the idle mode.
+# stdin is unbuffered (see main), so poll() sees every line not yet read even
+# when a driver sends several requests at once.
+fncode: read_line(char *line, int len): char *
+    $if in == stdin && idle_mode != IDLE_SLEEP
+        $my struct pollfd pfd
+        pfd.fd = STDIN_FILENO
+        pfd.events = POLLIN
+        pfd.revents = 0
+        $while poll(&pfd, 1, 0) == 0
+            idle_pause()
+    return fgets(line, len, in)

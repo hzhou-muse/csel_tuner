@@ -44,7 +44,7 @@ bin/colltree (builder v3)  -->  tuning JSON  -->  MPIR_CVAR_COLL_SELECTION_JSON_
 - Batch mode (`--plan FILE --out FILE`) runs a fixed list of requests with
   no driver, for dense ground-truth sets (`groundtruth/`).
 
-## 3. The benchmark server (`server/mpisrv.c`)
+## 3. The benchmark server (`server/mpisrv.def`)
 
 ### 3.1 Requests and replies
 

@@ -1,5 +1,7 @@
 # Build the benchmark server with the MPICH under test:
 #   make MPICC=$MPICH_PREFIX/bin/mpicc [GPU=ze|cuda|fake]
+# mpisrv.c is generated from mpisrv.def and macros/*.def with MyDef
+# (mydef_page, https://github.com/hzhou/MyDef with output_c).
 # GPU selects the device-buffer backend for mpisrv --mem device (gpu.c):
 #   none  host buffers only (default)
 #   ze    Level Zero: needs level_zero/ze_api.h and libze_loader (ZE_PREFIX if
@@ -26,5 +28,8 @@ endif
 mpisrv: mpisrv.c gpu.c gpu.h
 	$(MPICC) $(CFLAGS) $(GPU_CFLAGS) -o $@ mpisrv.c gpu.c $(GPU_LIBS)
 
+mpisrv.c: mpisrv.def $(wildcard macros/*.def)
+	mydef_page mpisrv.def
+
 clean:
-	rm -f mpisrv
+	rm -f mpisrv mpisrv.c

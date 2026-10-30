@@ -66,7 +66,7 @@ JSON selection), Python ≥ 3.6 with numpy; pandas only for replay and tests.
 ```
 bin/          collmodel, colltree
 csel_tuner/   Python package: interp, server driver, builders single (v1), multi (v2), tree (v3)
-server/       mpisrv.c (benchmark server), Makefile
+server/       mpisrv.def + macros/*.def (benchmark server, MyDef; generates mpisrv.c), gpu.c, Makefile
 launch/       config.sh, sites/*.sh
 replay/       replay of recorded measurements: converter, scripts
 groundtruth/  batch-mode plans, runner, checks

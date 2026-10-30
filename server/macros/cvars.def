@@ -1,0 +1,103 @@
+# ---- per-request control variables (MPI_T) -----------------------------
+# cvar.NAME=VALUE tokens of a request: rank 0 validates them in parse(), every
+# rank writes them before the measurement and restores them after it.
+
+subcode: _autoload
+    $include stdio, stdlib, string, strings
+    $global int cvar_switch               # MPISRV_CVAR_SWITCH: the build applies CVAR writes at run time
+    $struct(cvar) char name[CVAR_LEN], MPI_T_cvar_handle h, MPI_Datatype dtype, MPI_T_enum etype, int count, void *saved, char *desc
+    # dtype: MPI_INT (plain or enum) or MPI_CHAR; saved: the value before the
+    # request, restored after it; desc: the MPI_T description, MPICH lists its
+    # enum values there
+    $global struct cvar cvars[64]
+    $global int num_cvars
+
+# The cached MPI_T handle of a control variable, or NULL with *err set.
+fncode: find_cvar(const char *name, const char **err): struct cvar *
+    $for i=0:num_cvars
+        $if !strcmp(cvars[i].name, name)
+            return &cvars[i]
+    $my int idx, int nlen = 0, int dlen = 0, int verb, int bind, int scope
+    $my struct cvar c = { { 0 } }
+    $if num_cvars == (int) (sizeof(cvars) / sizeof(cvars[0]))
+        *err = "too many distinct cvars"
+        return NULL
+    $if strlen(name) >= CVAR_LEN || MPI_T_cvar_get_index(name, &idx) != MPI_SUCCESS
+        *err = "unknown cvar"
+        return NULL
+    MPI_T_cvar_get_info(idx, NULL, &nlen, &verb, &c.dtype, &c.etype, NULL, &dlen, &bind, &scope)
+    c.desc = calloc((size_t) dlen + 1, 1)
+    MPI_T_cvar_get_info(idx, NULL, &nlen, &verb, &c.dtype, &c.etype, c.desc, &dlen, &bind, &scope)
+    $if bind != MPI_T_BIND_NO_OBJECT
+        *err = "cvar is bound to an MPI object"
+        return NULL
+    $if c.dtype != MPI_INT && c.dtype != MPI_CHAR
+        *err = "cvar type is not int, enum or string"
+        return NULL
+    $if MPI_T_cvar_handle_alloc(idx, NULL, &c.h, &c.count) != MPI_SUCCESS
+        *err = "cannot allocate a handle for the cvar"
+        return NULL
+    strcpy(c.name, name)
+    c.saved = calloc((size_t) c.count + CVAR_LEN, c.dtype == MPI_INT ? sizeof(int) : 1)
+    cvars[num_cvars] = c
+    return &cvars[num_cvars++]
+
+# Convert a value string to the cvar's representation in buf (an int, or a
+# string of < CVAR_LEN chars); NULL on success, else the reason.
+fncode: cvar_value(const struct cvar *c, const char *val, void *buf): const char *
+    $if c->dtype == MPI_CHAR
+        $if strlen(val) >= CVAR_LEN
+            return "cvar value too long"
+        strcpy(buf, val)
+        return NULL
+    $my char *end, long v
+    v = strtol(val, &end, 0)
+    $if *val && !*end
+        # a number is taken as is
+        *(int *) buf = (int) v
+        return NULL
+    $if c->etype != MPI_T_ENUM_NULL
+        # MPICH main since f95b6ec93d
+        $my int n, int len = 0
+        MPI_T_enum_get_info(c->etype, &n, NULL, &len)
+        $for i=0:n
+            $my char item[256]
+            $my int iv
+            $my int ilen = sizeof(item)
+            $if MPI_T_enum_get_item(c->etype, i, &iv, item, &ilen) == MPI_SUCCESS && !strcasecmp(item, val)
+                *(int *) buf = iv
+                return NULL
+        return "value is not one of the cvar's enum items"
+    # Older MPICH registers enum CVARs as plain MPI_INT; the value is the
+    # position of the "name - text" line in the description (maint/extractcvars).
+    $my int pos = 0
+    $for const char *l = c->desc; l && *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : NULL
+        $my const char *w, size_t n, const char *after
+        w = l + strspn(l, " \t")
+        n = strcspn(w, " \t\n")
+        after = w + n + strspn(w + n, " \t")
+        $if n && *after == '-'
+            $if n == strlen(val) && !strncasecmp(w, val, n)
+                *(int *) buf = pos
+                return NULL
+            pos++
+    $if pos
+        return "value is not one of the cvar's listed values"
+    return "cvar value is not an integer"
+
+# All ranks: write the request's cvars (saving the old values) or restore them.
+fncode: apply_cvars(const struct req *rq, int restore)
+    $for int k = restore ? rq->ncvar - 1 : 0; restore ? k >= 0 : k < rq->ncvar; k += restore ? -1 : 1
+        $my const char *err = NULL
+        $my struct cvar *c
+        c = find_cvar(rq->cvar_name[k], &err)
+        $my int buf[CVAR_LEN]
+        $if c && !restore
+            MPI_T_cvar_read(c->h, c->saved)
+            err = cvar_value(c, rq->cvar_val[k], buf)
+        $if !err && MPI_T_cvar_write(c->h, restore ? c->saved : (void *) buf) != MPI_SUCCESS
+            err = "MPI_T_cvar_write failed"
+        $if err
+            # rank 0 validated it, so ranks disagree: give up
+            fprintf(stderr, "mpisrv: rank %d: %s: %s\n", world_rank, rq->cvar_name[k], err)
+            MPI_Abort(MPI_COMM_WORLD, 3)

@@ -4,3 +4,5 @@ server/mpisrv
 replay/results/
 .pytest_cache/
 replay/data/
+server/mpisrv.c
+*.swp

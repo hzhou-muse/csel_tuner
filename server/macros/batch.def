@@ -1,0 +1,68 @@
+# ---- batch mode --------------------------------------------------------
+# Request input and reply output (rank 0): stdin/stdout, or --plan/--out
+# with --resume and --deadline.
+
+subcode: _autoload
+    $include stdio, stdlib, string
+
+# --resume: mark the requests already answered in the output file.
+fncode: load_done(const char *path, int *n): char *
+    $my char *done
+    done = calloc(1, 1 << 20)
+    *n = 0
+    $my FILE *f
+    f = fopen(path, "r")
+    $if !f
+        return done
+    $my char line[65536]
+    $while fgets(line, sizeof(line), f)
+        $my char *s
+        s = strstr(line, "\"seq\":")
+        $my int seq
+        $if s && sscanf(s + 6, "%d", &seq) == 1 && seq >= 0 && seq < (1 << 20) && !strstr(line, "\"status\":\"deadline\"")
+            done[seq] = 1
+            (*n)++
+    fclose(f)
+    return done
+
+# in and out (rank 0: requests and replies) and done (--resume: seqs
+# already answered); batch mode starts with an info record, so this comes
+# after init_buffers (the record reports the topology and the GPU runtime).
+subcode: open_io
+    $global FILE *in, FILE *out, char *done = NULL, int ndone = 0
+    in = stdin
+    $if world_rank == 0 && !plan
+        setvbuf(stdin, NULL, _IONBF, 0)
+    out = stdout
+    $if world_rank == 0 && plan
+        $if !outpath
+            fprintf(stderr, "mpisrv: --plan needs --out\n")
+            MPI_Abort(MPI_COMM_WORLD, 2)
+        $if resume
+            done = load_done(outpath, &ndone)
+        in = fopen(plan, "r")
+        out = fopen(outpath, resume ? "a" : "w")
+        $if !in || !out
+            perror(!in ? plan : outpath)
+            MPI_Abort(MPI_COMM_WORLD, 2)
+    $if plan
+        reply_info(-1)
+
+subcode: close_io
+    $if world_rank == 0 && plan
+        fclose(in)
+        fclose(out)
+    free(done)
+
+# rank 0, before reading the next request: past --deadline, write the
+# deadline record and quit
+subcode: check_deadline(seq)
+    $global double t_start
+    # the deadline counts from MPI startup
+    $(block:after_mpi_init)
+        t_start = MPI_Wtime()
+    $if plan && deadline > 0 && MPI_Wtime() - t_start > deadline
+        fprintf(out, "{\"status\":\"deadline\",\"seq\":%d,\"elapsed_s\":%.1f}\n", $(seq) + 1, MPI_Wtime() - t_start)
+        fflush(out)
+        rq->op = OP_QUIT
+        break

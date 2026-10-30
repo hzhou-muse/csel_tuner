@@ -1,0 +1,191 @@
+# ---- measurement -------------------------------------------------------
+# One request on its sub-communicator: the untimed call, the optional bcast
+# check and spin-up, calibration of k, warmup, then the timed batches. Every
+# decision the members must take alike goes through agree().
+
+subcode: _autoload
+    $include stdio, stdlib
+    $define(MAX_BATCHES) 1000
+    # failed: a call failed on some member; msg: error string of the first
+    # failure on comm rank 0; check_err: -1 if not checked
+    $struct(result) int failed, char msg[MPI_MAX_ERROR_STRING], long m, int k, int check_err
+    $struct(result) int spun_up, double wall_us, double spread, double t_us[MAX_BATCHES]
+    $global int call_err                  # first error code of an MPI call in this measurement
+    $enum(agree_how) AGREE_MAX, AGREE_SUM, AGREE_ROOT
+
+# k calls of the operation; returns local elapsed seconds (with sync=call,
+# the sum of the calls' own times, barriers excluded)
+fncode: run(const struct req *rq, MPI_Comm c, int crank, long count, int k): double
+    $my long bytes = is_reduction(rq->op) ? count * (long) sizeof(int) : count
+    $my double t0 = MPI_Wtime(), double sum = 0
+    $for i=0:k
+        $my long off = rq->cold ? (i * bytes) % max_m : 0
+        $if rq->sync_call
+            MPI_Barrier(c)
+            t0 = MPI_Wtime()
+        # ping-pong and bcast use one buffer, like bench/pingpong.c
+        $my char *s = sbuf + off, char *r = rbuf + off
+        $my int rc
+        rc = call_op(rq, c, crank, s, r, count)
+        $if rc != MPI_SUCCESS && !call_err
+            call_err = rc
+        $if rq->sync_call
+            sum += MPI_Wtime() - t0
+    return rq->sync_call ? sum : MPI_Wtime() - t0
+
+# Agreement among the members of c during a measurement, for the decisions
+# that every rank must take alike (failure, spin-up, calibration, bcast check).
+# It uses MPI_Allgather, so a CVAR that forces the measured operation's
+# algorithm cannot reach it: with MPI_Allreduce or MPI_Bcast here, a forced
+# algorithm that does not support the helper's tiny count (reduce_scatter_
+# allgather with count < pof2) fails the call, and the ranks that missed the
+# result take different branches and issue different collectives (a hang).
+fncode: agree(MPI_Comm c, double v, int how): double
+    $my int n
+    MPI_Comm_size(c, &n)
+    $my double *all = malloc(n * sizeof(double))
+    $my int rc
+    rc = MPI_Allgather(&v, 1, MPI_DOUBLE, all, 1, MPI_DOUBLE, c)
+    $if rc != MPI_SUCCESS
+        # nothing left to agree on
+        $my char msg[MPI_MAX_ERROR_STRING], int len
+        MPI_Error_string(rc, msg, &len)
+        fprintf(stderr, "mpisrv: rank %d: MPI_Allgather of a measurement helper failed: %s\n", world_rank, msg)
+        MPI_Abort(MPI_COMM_WORLD, 4)
+    $my double r = all[0]
+    $for i=1:n
+        $if how == AGREE_MAX && all[i] > r
+            r = all[i]
+        $elif how == AGREE_SUM
+            r += all[i]
+    free(all)
+    # AGREE_ROOT: the value of rank 0
+    return r
+
+# A helper collective that must not fail (it is not the measured call).
+fncode: helper_ok(int rc, const char *what)
+    $if rc != MPI_SUCCESS
+        $my char msg[MPI_MAX_ERROR_STRING], int len
+        MPI_Error_string(rc, msg, &len)
+        fprintf(stderr, "mpisrv: rank %d: %s failed: %s\n", world_rank, what, msg)
+        MPI_Abort(MPI_COMM_WORLD, 4)
+
+# The max and min over the members of c of each batch time, on comm rank 0.
+# MPI_Gather, not MPI_Reduce: a CVAR that forces the measured reduce
+# algorithm must not reach the helper (see agree).
+fncode: batch_extremes(const double *e, double *emax, double *emin, int n, MPI_Comm c, int crank)
+    $my int csize
+    MPI_Comm_size(c, &csize)
+    $my double *all
+    all = crank == 0 ? malloc(sizeof(double) * n * csize) : NULL
+    helper_ok(MPI_Gather(e, n, MPI_DOUBLE, all, n, MPI_DOUBLE, 0, c), "MPI_Gather")
+    $if crank != 0
+        return
+    $for j=0:n
+        emax[j] = emin[j] = all[j]
+        $for i=1:csize
+            $my double v = all[i * n + j]
+            emax[j] = v > emax[j] ? v : emax[j]
+            emin[j] = v < emin[j] ? v : emin[j]
+    free(all)
+
+# Broadcast a pattern once and count wrong bytes over all ranks.
+fncode: check_bcast(const struct req *rq, MPI_Comm c, int crank): int
+    $my long n = rq->m
+    $my unsigned char *b = (unsigned char *) sbuf
+    $for long i = 0; i < n; i++
+        b[i] = crank == rq->root ? (unsigned char) (i * 131 + rq->seq + 7) : 0
+    $my int rc
+    rc = MPI_Bcast(b, n, MPI_BYTE, rq->root, c)
+    $if rc != MPI_SUCCESS && !call_err
+        call_err = rc
+    $my int bad = 0
+    $for long i = 0; i < n; i++
+        $if b[i] != (unsigned char) (i * 131 + rq->seq + 7)
+            bad++
+    return (int) agree(c, bad, AGREE_SUM)
+
+# Whether a call has failed on any member; comm rank 0 gets the message. The
+# failure is agreed on with agree(), which the CVARs of the measured operation
+# do not affect.
+fncode: any_failed(MPI_Comm c, int crank, struct result *res): int
+    $my int failed
+    failed = call_err != MPI_SUCCESS
+    failed = (int) agree(c, failed, AGREE_MAX)
+    $if failed && crank == 0
+        res->failed = 1
+        $if call_err
+            $my int len
+            MPI_Error_string(call_err, res->msg, &len)
+        $else
+            snprintf(res->msg, sizeof(res->msg), "the call failed on another member")
+    return failed
+
+fncode: measure(const struct req *rq, MPI_Comm c, struct result *res)
+    $my int crank
+    MPI_Comm_rank(c, &crank)
+    $my long count = is_reduction(rq->op) ? rq->m / (long) sizeof(int) : rq->m
+    $my double w0 = MPI_Wtime()
+
+    call_err = MPI_SUCCESS
+    res->failed = 0
+    res->msg[0] = '\0'
+    res->k = 0
+    res->spread = 0
+    res->m = is_reduction(rq->op) ? count * (long) sizeof(int) : count
+    res->check_err = rq->check && rq->op == OP_BCAST ? check_bcast(rq, c, crank) : -1
+    # first-call exclusion
+    run(rq, c, crank, count, 1)
+    $if any_failed(c, crank, res) || rq->probe
+        res->wall_us = (MPI_Wtime() - w0) * 1e6
+        return
+    $call spin_up
+    $my int k = 1
+    # calibration
+    $while 1
+        $my double t
+        t = run(rq, c, crank, count, k)
+        t = agree(c, t, AGREE_MAX)
+        $if t * 1e6 >= rq->target_us / 2 || k >= (1 << 20)
+            break
+        k *= 2
+    # warmup
+    run(rq, c, crank, count, k)
+
+    $my double e[MAX_BATCHES], double emax[MAX_BATCHES], double emin[MAX_BATCHES]
+    MPI_Barrier(c)
+    $my double t0 = MPI_Wtime()
+    $for j=0:rq->batches
+        $my double b
+        b = run(rq, c, crank, count, k)
+        e[j] = rq->sync_call ? (j ? e[j - 1] : 0.0) + b : MPI_Wtime() - t0
+    batch_extremes(e, emax, emin, rq->batches, c, crank)
+    $if any_failed(c, crank, res)
+        return
+    $if crank == 0
+        $my double div
+        div = rq->op == OP_PINGPONG ? 2.0 * k : k
+        $for j=0:rq->batches
+            res->t_us[j] = (emax[j] - (j ? emax[j - 1] : 0.0)) / div * 1e6
+        $my int last = rq->batches - 1
+        res->spread = (emax[last] - emin[last]) / emax[last]
+        res->k = k
+        res->m = is_reduction(rq->op) ? count * (long) sizeof(int) : count
+        res->wall_us = (MPI_Wtime() - w0) * 1e6
+
+    # MPISRV_SPINUP_US: run the operation before calibration
+    subcode: spin_up
+        res->spun_up = spinup_us > 0
+        $if res->spun_up && idle_mode == IDLE_SPLIT
+            # only if some member was asleep
+            $my int cold = !hot
+            cold = (int) agree(c, cold, AGREE_MAX)
+            res->spun_up = cold
+        $if res->spun_up
+            # time-based spin-up, decided by comm rank 0
+            $my double s0 = MPI_Wtime()
+            $my int more = 1
+            $while more
+                run(rq, c, crank, count, 1)
+                more = (MPI_Wtime() - s0) * 1e6 < spinup_us
+                more = (int) agree(c, more, AGREE_ROOT)

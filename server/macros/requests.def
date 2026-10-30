@@ -1,0 +1,156 @@
+# ---- requests ----------------------------------------------------------
+# A request is one line of key=value tokens. Rank 0 parses and validates it
+# into a struct req, which is then broadcast to all ranks as bytes.
+
+subcode: _autoload
+    $include stdio, stdlib, string
+    $define(TAG_LEN) 64
+    $define(MAX_CVARS) 4
+    $define(CVAR_LEN) 64
+    $enum(op) OP_NONE, OP_INFO, OP_QUIT, OP_PINGPONG, OP_ALLREDUCE, OP_BCAST, OP_REDUCE, OP_IREDUCE, OP_IALLREDUCE
+    $global const char *op_names[] = { "none", "info", "quit", "pingpong", "allreduce", "bcast", "reduce", "ireduce", "iallreduce" }
+    $struct(req) int op, int seq, long m, int p, int ppn
+    $struct(req) int place, int node_off, int node_stride, int pair[2]   # place: PLACE_*
+    $struct(req) int root, int batches, double target_us, int cold, int check
+    # sync_call: sync=call, a barrier before every call; probe: probe=1, the untimed call only
+    $struct(req) int sync_call, int probe, char tag[TAG_LEN]
+    # cvar.NAME=VALUE tokens, applied for this request only
+    $struct(req) int ncvar, char cvar_name[MAX_CVARS][CVAR_LEN], char cvar_val[MAX_CVARS][CVAR_LEN]
+
+# the reductions sum MPI_INTs; m is in bytes, a multiple of sizeof(int)
+fncode: is_reduction(enum op op): int
+    return op == OP_ALLREDUCE || op == OP_REDUCE || op == OP_IREDUCE || op == OP_IALLREDUCE
+
+fncode: tag_ok(const char *s): int
+    $for ; *s; s++
+        $if !(('a' <= *s && *s <= 'z') || ('A' <= *s && *s <= 'Z') || ('0' <= *s && *s <= '9') || strchr("_.:-/", *s))
+            return 0
+    return 1
+
+# Parse a request line on rank 0. Returns NULL or an error message.
+fncode: parse(char *line, struct req *rq): const char *
+    memset(rq, 0, sizeof(*rq))
+    rq->op = OP_NONE
+    rq->p = world_size
+    rq->ppn = -1
+    rq->place = PLACE_NIC
+    rq->node_stride = 1
+    rq->pair[1] = 1
+    rq->batches = 3
+    rq->target_us = 1000.0
+
+    static char err[256];
+    $for char *tok = strtok(line, " \t\r\n"); tok; tok = strtok(NULL, " \t\r\n")
+        $my char *val
+        val = strchr(tok, '=')
+        $if !val
+            snprintf(err, sizeof(err), "token without '=': %.64s", tok)
+            return err
+        *val++ = '\0'
+        $if !strcmp(tok, "op")
+            $for int i = 1; i < (int) (sizeof(op_names) / sizeof(op_names[0])); i++
+                $if !strcmp(val, op_names[i])
+                    rq->op = i
+            $if rq->op == OP_NONE
+                snprintf(err, sizeof(err), "unknown op: %.64s", val)
+                return err
+        $elif !strcmp(tok, "m")
+            rq->m = atol(val)
+        $elif !strcmp(tok, "p")
+            rq->p = atoi(val)
+        $elif !strcmp(tok, "ppn")
+            rq->ppn = atoi(val)
+        $elif !strcmp(tok, "place")
+            rq->place = -1
+            $for i=0:3
+                $if !strcmp(val, place_names[i])
+                    rq->place = i
+            $if rq->place < 0
+                return "place must be nic, spread or compact"
+        $elif !strcmp(tok, "nodes")
+            $if sscanf(val, "%d:%d", &rq->node_off, &rq->node_stride) < 1
+                return "nodes must be OFF or OFF:STRIDE"
+        $elif !strcmp(tok, "pair")
+            $if sscanf(val, "%d,%d", &rq->pair[0], &rq->pair[1]) != 2
+                return "pair must be a,b"
+        $elif !strcmp(tok, "root")
+            rq->root = atoi(val)
+        $elif !strcmp(tok, "probe")
+            rq->probe = atoi(val) != 0
+        $elif !strcmp(tok, "batches")
+            rq->batches = atoi(val)
+        $elif !strcmp(tok, "target_us")
+            rq->target_us = atof(val)
+        $elif !strcmp(tok, "cache")
+            $if strcmp(val, "hot") && strcmp(val, "cold")
+                return "cache must be hot or cold"
+            rq->cold = !strcmp(val, "cold")
+        $elif !strcmp(tok, "check")
+            rq->check = atoi(val)
+        $elif !strcmp(tok, "sync")
+            $if strcmp(val, "batch") && strcmp(val, "call")
+                return "sync must be batch or call"
+            rq->sync_call = !strcmp(val, "call")
+        $elif !strncmp(tok, "cvar.", 5)
+            $call parse_cvar
+        $elif !strcmp(tok, "tag")
+            $if strlen(val) >= TAG_LEN || !tag_ok(val)
+                return "tag must be < 64 chars of [A-Za-z0-9_.:-/]"
+            strcpy(rq->tag, val)
+        $else
+            snprintf(err, sizeof(err), "unknown key: %.64s", tok)
+            return err
+    $call check_request
+    return NULL
+
+    # cvar.NAME=VALUE: validated with the MPI_T handle (cvars.def)
+    subcode: parse_cvar
+        $my const char *cerr = NULL
+        $my int buf[CVAR_LEN]
+        $if !cvar_switch
+            return "cvar.* needs an MPICH that applies CVAR writes at run time (MPISRV_CVAR_SWITCH=1)"
+        $if rq->ncvar == MAX_CVARS
+            return "at most 4 cvar.* per request"
+        $for k=0:rq->ncvar
+            $if !strcmp(rq->cvar_name[k], tok + 5)
+                return "cvar given twice"
+        $my struct cvar *c
+        c = find_cvar(tok + 5, &cerr)
+        $if c
+            cerr = cvar_value(c, val, buf)
+        $if cerr
+            snprintf(err, sizeof(err), "%s: %.64s=%.64s", cerr, tok + 5, val)
+            return err
+        strcpy(rq->cvar_name[rq->ncvar], tok + 5)
+        strcpy(rq->cvar_val[rq->ncvar++], val)
+
+    # defaults that depend on other keys, and the checks across keys
+    subcode: check_request
+        $if rq->op == OP_NONE
+            return "missing op"
+        $if rq->ppn < 0
+            rq->ppn = rq->p < min_ppn ? rq->p : min_ppn
+        $if rq->m < 0 || rq->m > max_m
+            snprintf(err, sizeof(err), "m must be in [0, %ld]", max_m)
+            return err
+        $if rq->batches < 1 || rq->batches > MAX_BATCHES
+            return "batches must be in [1, 1000]"
+        $if rq->target_us <= 0
+            return "target_us must be > 0"
+        $if rq->check && mem_device
+            return "check=1 needs host buffers (the server runs with --mem device)"
+        $if rq->cold && !cold_ok
+            return "cache=cold needs the server started with --cold"
+        $if rq->op == OP_PINGPONG
+            $my int a = rq->pair[0], int b = rq->pair[1]
+            $if a == b || a < 0 || b < 0 || a >= world_size || b >= world_size
+                return "pair must be two different world ranks"
+        $if is_reduction(rq->op) || rq->op == OP_BCAST
+            $if rq->p < 1 || rq->p > world_size || rq->ppn < 1 || rq->p % rq->ppn
+                return "need 1 <= p <= world size and p a multiple of ppn"
+            $if rq->node_off < 0 || rq->node_stride < 1 || rq->ppn > min_ppn || rq->node_off + (rq->p / rq->ppn - 1) * rq->node_stride >= num_nodes
+                return "layout does not fit: check p/ppn, nodes=OFF:STRIDE and ppn <= ranks per node"
+            $if rq->root < 0 || rq->root >= rq->p
+                return "root must be in [0, p)"
+            $if rq->place == PLACE_NIC && !nic_groups_ok
+                return "place=nic: a group of MPISRV_NIC_MOD local ranks spans two sockets"

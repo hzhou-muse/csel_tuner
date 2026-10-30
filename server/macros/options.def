@@ -1,0 +1,52 @@
+# ---- options -----------------------------------------------------------
+# The command line (max-m, --plan/--out/--deadline/--resume, --cold, --mem)
+# and the MPISRV_* environment.
+
+subcode: _autoload
+    $include stdio, stdlib, string
+    $global long max_m, int cold_ok
+    $global int mem_device                # --mem device: buffers in GPU memory
+    $global const char *plan = NULL, const char *outpath = NULL
+    $global double deadline = 0, int resume = 0
+
+subcode: parse_options
+    max_m = 1L << 24
+    $for int i = 1; i < argc; i++
+        # argv[++i] and i++: with a semicolon, i is declared in the loop header
+        $if !strcmp(argv[i], "--plan") && i + 1 < argc
+            plan = argv[++i];
+        $elif !strcmp(argv[i], "--out") && i + 1 < argc
+            outpath = argv[++i];
+        $elif !strcmp(argv[i], "--deadline") && i + 1 < argc
+            deadline = atof(argv[++i]);
+        $elif !strcmp(argv[i], "--resume")
+            resume = 1
+        $elif !strcmp(argv[i], "--cold")
+            cold_ok = 1
+        $elif !strcmp(argv[i], "--mem") && i + 1 < argc && !strcmp(argv[i + 1], "host")
+            mem_device = 0
+            i++;
+        $elif !strcmp(argv[i], "--mem") && i + 1 < argc && !strcmp(argv[i + 1], "device")
+            mem_device = 1
+            i++;
+        $elif argv[i][0] >= '0' && argv[i][0] <= '9'
+            max_m = atol(argv[i])
+        $else
+            $if world_rank == 0
+                fprintf(stderr, "mpisrv: unknown argument %s\n", argv[i])
+            MPI_Abort(MPI_COMM_WORLD, 2)
+    $if mem_device && cold_ok
+        $if world_rank == 0
+            fprintf(stderr, "mpisrv: --cold needs host buffers (not --mem device)\n")
+        MPI_Abort(MPI_COMM_WORLD, 2)
+
+subcode: parse_env
+    cvar_switch = getenv("MPISRV_CVAR_SWITCH") && atoi(getenv("MPISRV_CVAR_SWITCH"))
+    $if getenv("MPISRV_IDLE_NS")
+        idle_ns = atol(getenv("MPISRV_IDLE_NS"))
+    $my const char *im
+    im = getenv("MPISRV_IDLE")
+    $if im
+        idle_mode = !strcmp(im, "sleep") ? IDLE_SLEEP : !strcmp(im, "busy") ? IDLE_BUSY : !strcmp(im, "split") ? IDLE_SPLIT : IDLE_SPIN
+    $if getenv("MPISRV_SPINUP_US")
+        spinup_us = atof(getenv("MPISRV_SPINUP_US"))

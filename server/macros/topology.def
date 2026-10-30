@@ -1,0 +1,147 @@
+# ---- topology ----------------------------------------------------------
+# Nodes, local ranks, sockets and NIC groups of the job, and the topology
+# warnings (topo_warn) printed at startup and in the info record.
+
+subcode: _autoload
+    $include sched, stdio, stdlib, string
+    $global int my_node, int my_local     # node index and rank within the node
+    $global int num_nodes, int min_ppn
+    $global int nic_mod = 1               # MPISRV_NIC_MOD, for place=nic
+    $global int close_nics, int nics_available    # from MPI_INFO_ENV; -1 unknown, -2 differ by rank
+    $global int nic_groups_ok             # every group of nic_mod local ranks on one socket
+    $global char topo_warn[1024]
+
+# Per world rank: node index (init_topology), local rank (init_topology),
+# socket (init_site; -1: not bound within one socket). Freed before
+# MPI_Finalize.
+subcode: rank_tables
+    $global int *node_of, int *local_of, int *socket_of
+    node_of = malloc(sizeof(int) * world_size)
+    local_of = malloc(sizeof(int) * world_size)
+    socket_of = malloc(sizeof(int) * world_size)
+    $(block:before_mpi_finalize)
+        free(node_of)
+        free(local_of)
+        free(socket_of)
+
+fncode: init_topology
+    $my MPI_Comm node
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node)
+    MPI_Comm_rank(node, &my_local)
+    # number nodes by their lowest world rank
+    $my int leader = world_rank
+    MPI_Allreduce(MPI_IN_PLACE, &leader, 1, MPI_INT, MPI_MIN, node)
+    MPI_Comm_free(&node)
+
+    $my int *leaders = malloc(sizeof(int) * world_size)
+    $call rank_tables
+    MPI_Allgather(&leader, 1, MPI_INT, leaders, 1, MPI_INT, MPI_COMM_WORLD)
+    MPI_Allgather(&my_local, 1, MPI_INT, local_of, 1, MPI_INT, MPI_COMM_WORLD)
+    $my int *index = malloc(sizeof(int) * world_size)
+    num_nodes = 0
+    $for r=0:world_size
+        $if leaders[r] == r
+            index[r] = num_nodes++
+    $for r=0:world_size
+        node_of[r] = index[leaders[r]]
+    my_node = node_of[world_rank]
+    min_ppn = world_size
+    $for n=0:num_nodes
+        $my int cnt = 0
+        $for r=0:world_size
+            $if node_of[r] == n
+                cnt++
+        $if cnt < min_ppn
+            min_ppn = cnt
+    free(index)
+    free(leaders)
+
+# Socket of the CPUs this rank may run on, -1 if they span sockets.
+fncode: my_socket: int
+    $my cpu_set_t set
+    $if sched_getaffinity(0, sizeof(set), &set)
+        return -1
+    $my int sock = -2
+    $for cpu=0:CPU_SETSIZE
+        $if !CPU_ISSET(cpu, &set)
+            continue
+        $my char path[128]
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpu)
+        $my int s = -1
+        $my FILE *f
+        f = fopen(path, "r")
+        $if f
+            $if fscanf(f, "%d", &s) != 1
+                s = -1
+            fclose(f)
+        $if s < 0 || (sock != -2 && s != sock)
+            return -1
+        sock = s
+    return sock < 0 ? -1 : sock
+
+fncode: info_env_int(const char *key): int
+    $my char val[32]
+    $my int len = sizeof(val)
+    $my int flag = 0
+    MPI_Info_get_string(MPI_INFO_ENV, key, &len, val, &flag)
+    return flag ? atoi(val) : -1
+
+fncode: warn(const char *msg)
+    $my size_t n = strlen(topo_warn)
+    snprintf(topo_warn + n, sizeof(topo_warn) - n, "%s%s", n ? "; " : "", msg)
+
+# Site topology (MPISRV_NIC_MOD, MPISRV_SOCKETS), checked against the core
+# binding and the NIC counts MPICH reports. After init_topology.
+fncode: init_site
+    $my int mine[2]
+    mine[0] = my_socket()
+    mine[1] = info_env_int("num_close_nics")
+    $my int *all = malloc(sizeof(int) * 2 * world_size)
+    MPI_Allgather(mine, 2, MPI_INT, all, 2, MPI_INT, MPI_COMM_WORLD)
+    close_nics = all[1]
+    $my int bound = 1
+    $for r=0:world_size
+        socket_of[r] = all[2 * r]
+        bound &= socket_of[r] >= 0
+        $if all[2 * r + 1] != close_nics
+            close_nics = -2
+    free(all)
+    nics_available = info_env_int("num_nics_available")
+
+    $my char msg[160]
+    $my const char *env
+    env = getenv("MPISRV_NIC_MOD")
+    $if env
+        nic_mod = atoi(env)
+    $if nic_mod < 1 || min_ppn % nic_mod
+        snprintf(msg, sizeof(msg), "MPISRV_NIC_MOD=%d does not divide %d ranks per node, using 1", nic_mod, min_ppn)
+        warn(msg)
+        nic_mod = 1
+    # a single-node job may open only one NIC (MPICH then reports
+    # num_close_nics = 1) and never uses the network: nothing to check
+    $if num_nodes > 1 && close_nics == -2
+        warn("ranks report different num_close_nics")
+    $elif num_nodes > 1 && env && close_nics > 0 && close_nics != nic_mod
+        snprintf(msg, sizeof(msg), "MPICH num_close_nics=%d but MPISRV_NIC_MOD=%d", close_nics, nic_mod)
+        warn(msg)
+    $if !bound
+        warn("ranks not bound within one socket: sockets unknown")
+    env = getenv("MPISRV_SOCKETS")
+    $if env && bound && min_ppn >= atoi(env)
+        $for n=0:num_nodes
+            $my int seen[64] = { 0 }, int cnt = 0
+            $for r=0:world_size
+                $if node_of[r] == n && socket_of[r] < 64 && !seen[socket_of[r]]++
+                    cnt++
+            $if cnt != atoi(env)
+                snprintf(msg, sizeof(msg), "node %d: ranks on %d sockets, MPISRV_SOCKETS=%s", n, cnt, env)
+                warn(msg)
+                break
+    # group of local rank l: local ranks l - l % nic_mod ... on the same node
+    nic_groups_ok = 1
+    $for int r = 0; r < world_size && bound; r++
+        $for q=0:world_size
+            $if node_of[q] == node_of[r] && local_of[q] == local_of[r] - local_of[r] % nic_mod && socket_of[q] != socket_of[r]
+                nic_groups_ok = 0
+    $if world_rank == 0 && topo_warn[0]
+        fprintf(stderr, "mpisrv: topology: %s\n", topo_warn)

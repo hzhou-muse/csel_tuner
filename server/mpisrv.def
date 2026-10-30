@@ -1,0 +1,196 @@
+# MPI benchmark server: a long-lived job that serves measurement requests.
+#
+# Usage: mpiexec -n P mpisrv [max-m] [--plan FILE --out FILE [--deadline SEC]
+#                                     [--resume]] [--cold] [--mem host|device]
+#
+# Interactive mode (default): rank 0 reads one request per line from stdin
+# and writes one JSON reply per line to stdout. Batch mode (--plan): rank 0
+# reads the requests from FILE and writes the replies to --out; it first
+# writes an info record, stops cleanly when --deadline seconds have passed,
+# and with --resume skips the requests already answered in --out. Every
+# reply carries "seq", the request's index in the plan (blank lines and
+# lines starting with '#' are not requests).
+#
+# Requests are space-separated key=value tokens:
+#
+#   op=pingpong m=8113 pair=0,1 batches=3
+#   op=bcast m=65536 p=256 ppn=8 root=0 place=nic nodes=0:1 check=1
+#   op=allreduce m=65536 p=8 ppn=4 batches=3 target_us=1000 cache=hot
+#   op=reduce m=65536 p=8 ppn=4 root=0 (also ireduce with root, iallreduce)
+#   op=info | op=quit
+#
+# Each request runs on a sub-communicator: the two ranks of `pair`, or p
+# ranks, ppn from each of p/ppn nodes. Nodes are MPI_COMM_TYPE_SHARED
+# domains numbered by their lowest world rank; `nodes=OFF:STRIDE` uses nodes
+# OFF, OFF+STRIDE, ... On each node `place=spread` takes ppn local ranks
+# evenly spaced over the node's n ranks (local ranks floor(j * n / ppn),
+# j < ppn; ppn need not divide n), `place=compact` the first ppn.
+# `place=nic` (default) is spread with each rank moved within its aligned
+# group of M local ranks so that the j-th rank has local rank = j (mod M),
+# M = MPISRV_NIC_MOD (default 1 = spread; M must divide n). MPICH picks a
+# rank's NIC by local rank mod the number of NICs close to it, so with M =
+# that number this gives the sub-communicator the NIC spread of a real
+# ppn-rank job; with spread, strides that are multiples of M put every rank
+# of a socket on one NIC (e.g. ppn 24 of 96 with 4 NICs per socket). Each
+# group of M local ranks must be bound to one socket. Other ranks wait for
+# the next request.
+#
+# Node topology comes from the site config, not from this code:
+# MPISRV_NIC_MOD (NICs per socket) and MPISRV_SOCKETS (sockets per node).
+# At startup they are checked against MPICH's MPI_INFO_ENV keys
+# num_close_nics / num_nics_available and against each rank's core binding
+# (socket from sysfs); the info record reports both and lists mismatches in
+# "topology_warnings".
+#
+# A measurement is: one untimed call, calibration of k calls per batch to
+# reach target_us/2, one warmup batch, one barrier, then `batches` batches of
+# k calls back to back. Batch j's latency is the synchronized latency
+# (max_i e_ij - max_i e_i,j-1) / k, where e_ij is rank i's time from its
+# barrier exit to the end of batch j. Ping-pong reports half the round trip.
+# sync=call instead puts a barrier before every call and times each call on
+# its own: batch j's value is the max over ranks of the rank's mean call time
+# in that batch (barriers excluded), i.e. latency without pipelining between
+# consecutive calls.
+# cvar.<NAME>=<value> (up to 4 per request) writes an MPI_T control variable
+# on every rank before the request and restores it after, e.g.
+# cvar.MPIR_CVAR_BCAST_INTRA_ALGORITHM=binomial; enum values go by name (MPI_T
+# enum items, or for older MPICH the description's value list) or number. It
+# needs an MPICH whose algorithm CVARs take effect when written at run time
+# (MPICH main since commit de0b8e6921), which the site config asserts with
+# MPISRV_CVAR_SWITCH=1; without it cvar.* requests are refused.
+# check=1 (bcast) first broadcasts a pattern and verifies it on every rank;
+# its reply also lists the local ranks used on the first node (node0_locals).
+# probe=1 runs only the untimed call (and the check): whether the operation
+# runs on this layout with these CVARs. Its reply has k=0 and no times.
+# Sub-communicators return errors (MPI_ERRORS_RETURN): when a call fails on
+# any member (e.g. a forced algorithm whose restriction fails, with
+# MPIR_CVAR_COLLECTIVE_FALLBACK=error), the measurement stops and the reply
+# is {"status":"error","seq":..,"layout":..,"cvars":..,"msg":"<MPI error>"}.
+# See docs/design.md.
+#
+# --mem device puts the send and receive buffers in GPU memory (gpu.c, built
+# with make GPU=ze|cuda|fake), one device per rank: each rank must see exactly
+# one, which the launch arranges (launch/gpu_bind.sh, which reports a rank it
+# cannot bind in MPISRV_BIND_ERROR: every rank then fails); ranks of a node that
+# share a device are listed in "topology_warnings". The buffers are allocated
+# once, so caches keyed by buffer (IPC handles, NIC registrations) are warm
+# after the first call; --cold and check=1 need host buffers.
+#
+# Environment: MPISRV_IDLE selects how ranks wait for the next request:
+#   spin  (default) MPI_Test every MPISRV_IDLE_NS ns (default 50000), with a
+#         pause-instruction loop in between: no MPI progress, no syscalls,
+#         and the core stays at speed. Rank 0 also spins while polling stdin.
+#   sleep same, but nanosleep in between. Cores drop to low clock speed and
+#         need tens of ms of work to recover (docs/design.md, section 3.4).
+#   busy  blocking MPI_Bcast (MPICH busy-polls its progress engine).
+#   split the members of the last request spin, all other ranks sleep (at
+#         start every rank sleeps), so idle cores do not take the measured
+#         cores' turbo budget. With MPISRV_SPINUP_US, the spin-up runs only
+#         when some member was sleeping.
+# MPISRV_SPINUP_US: before calibration, members run the operation for at
+# least this long; the reply's "spun_up" says whether it ran.
+# MPISRV_DEBUG: members print themselves to stderr.
+
+module: c
+include: macros/options.def
+include: macros/topology.def
+include: macros/layout.def
+include: macros/buffers.def
+include: macros/requests.def
+include: macros/cvars.def
+include: macros/idle.def
+include: macros/measure.def
+include: macros/colls.def
+include: macros/replies.def
+include: macros/batch.def
+
+page: mpisrv, srv_frame
+    $call parse_options
+    $call parse_env
+    &call init_and_finalize
+        $my struct req rq
+        $my struct result res
+        $while next_request(&rq)
+            $if rq.op == OP_INFO
+                reply_info(rq.seq)
+                continue
+            serve(&rq, &res)
+
+    subcode: init_and_finalize
+        init_topology()
+        init_site()
+        init_buffers()
+        $call open_io
+        BLOCK
+        $call close_io
+        free_buffers()
+
+
+# The next valid request on all ranks; 0 to quit (deadline, end of input,
+# op=quit). Rank 0 answers bad requests itself; only valid ones are broadcast.
+fncode: next_request(struct req *rq): int
+    static int seq = -1;
+    $if world_rank == 0
+        $my char line[4096]
+        $while 1
+            $call check_deadline, seq
+            $if !read_line(line, sizeof(line))
+                rq->op = OP_QUIT
+                break
+            $my char *s
+            s = line + strspn(line, " \t\r\n")
+            $if !*s || *s == '#'
+                continue
+            seq++
+            $if done && seq < (1 << 20) && done[seq]
+                continue
+            $my const char *err
+            err = parse(line, rq)
+            rq->seq = seq
+            $if !err
+                break
+            reply_error(seq, err)
+    bcast_request(rq)
+    return rq->op != OP_QUIT
+
+# One measurement request on all ranks: the members measure, everybody
+# switches the request's cvars, comm rank 0's result goes to rank 0.
+fncode: serve(struct req *rq, struct result *res)
+    apply_cvars(rq, 0)
+    $my MPI_Comm c
+    c = get_comm(rq)
+    # world rank of comm rank 0
+    $my int croot
+    croot = comm_root(rq)
+    $if getenv("MPISRV_DEBUG") && c != MPI_COMM_NULL
+        fprintf(stderr, "member seq=%d world=%d node=%d local=%d\n", rq->seq, world_rank, my_node, my_local)
+    $if c != MPI_COMM_NULL
+        measure(rq, c, res)
+    hot = c != MPI_COMM_NULL
+    apply_cvars(rq, 1)
+    $if croot != 0
+        $if world_rank == croot
+            MPI_Send(res, sizeof(*res), MPI_BYTE, 0, 1, MPI_COMM_WORLD)
+        $elif world_rank == 0
+            MPI_Recv(res, sizeof(*res), MPI_BYTE, croot, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE)
+    $if world_rank == 0
+        reply_result(rq, res)
+
+subcode: _autoload
+    # _GNU_SOURCE: sched_getaffinity; CC=mpicc
+    $uselib _GNU_SOURCE, mpi
+    $include mpi.h, stdio, stdlib, string
+    $global int world_rank, int world_size
+
+subcode: srv_frame
+    $function main
+        MPI_Init(&argc, &argv)
+        $my int provided
+        MPI_T_init_thread(MPI_THREAD_SINGLE, &provided)
+        MPI_Comm_rank(MPI_COMM_WORLD, &world_rank)
+        MPI_Comm_size(MPI_COMM_WORLD, &world_size)
+        DUMP_STUB after_mpi_init
+        $call main
+        DUMP_STUB before_mpi_finalize
+        MPI_T_finalize()
+        MPI_Finalize()

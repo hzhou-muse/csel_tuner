@@ -1,0 +1,114 @@
+# ---- replies (rank 0) --------------------------------------------------
+# One JSON object per line on out: errors, the info record, results.
+
+subcode: _autoload
+    $include stdio, stdlib, string, unistd
+    $define(HOST_LEN) 64
+
+fncode: put_string(const char *s)
+    $for ; *s; s++
+        fputc(*s == '"' || *s == '\\' ? '\'' : (*s == '\n' ? ' ' : *s), out)
+
+fncode: reply_error(int seq, const char *msg)
+    fprintf(out, "{\"status\":\"error\",\"seq\":%d,\"msg\":\"", seq)
+    put_string(msg)
+    fprintf(out, "\"}\n")
+    fflush(out)
+
+# Collective: hostnames of all nodes, the library, and the MPI/fabric env.
+fncode: reply_info(int seq)
+    $my char host[HOST_LEN] = { 0 }, char *hosts = NULL
+    gethostname(host, HOST_LEN - 1)
+    $if world_rank == 0
+        hosts = malloc((size_t) HOST_LEN * world_size)
+    MPI_Gather(host, HOST_LEN, MPI_CHAR, hosts, HOST_LEN, MPI_CHAR, 0, MPI_COMM_WORLD)
+    $if world_rank != 0
+        return
+
+    $my char ver[MPI_MAX_LIBRARY_VERSION_STRING], int len
+    MPI_Get_library_version(ver, &len)
+    $my char *nl
+    nl = strchr(ver, '\n')
+    $if nl
+        *nl = '\0'
+    fprintf(out, "{\"status\":\"ok\",\"op\":\"info\",\"seq\":%d,\"world_size\":%d,\"nodes\":%d,\"min_ppn\":%d,\"nic_mod\":%d,\"num_close_nics\":%d,\"num_nics_available\":%d,\"max_m\":%ld,\"cvar_switch\":%d,\"mem\":\"%s\",\"gpu\":\"%s\",\"library\":\"", seq, world_size, num_nodes, min_ppn, nic_mod, close_nics, nics_available, max_m, cvar_switch, mem_device ? "device" : "host", mem_device ? gpu_runtime() : "")
+    put_string(ver)
+    fprintf(out, "\",\"hosts\":[")
+    $for int n = 0, first = 1; n < num_nodes; n++
+        $for r=0:world_size
+            $if node_of[r] == n && local_of[r] == 0
+                fprintf(out, "%s\"", first ? "" : ",")
+                put_string(hosts + (size_t) r * HOST_LEN)
+                fprintf(out, "\"")
+                # first is declared in the loop header: assign with a semicolon
+                first = 0;
+                break
+    fprintf(out, "],\"node_size\":[")
+    $for n=0:num_nodes
+        $my int cnt = 0
+        $for r=0:world_size
+            cnt += node_of[r] == n
+        fprintf(out, "%s%d", n ? "," : "", cnt)
+    fprintf(out, "],\"node0_sockets\":[")
+    $for int r = 0, n = 0; r < world_size; r++
+        $if node_of[r] == 0
+            fprintf(out, "%s%d", n++ ? "," : "", socket_of[r])
+    fprintf(out, "],\"topology_warnings\":\"")
+    put_string(topo_warn)
+    fprintf(out, "\",\"env\":{")
+    extern char **environ;
+    $my int first = 1
+    $for char **e = environ; *e; e++
+        $if !strncmp(*e, "MPIR_CVAR_", 10) || !strncmp(*e, "MPICH_", 6) || !strncmp(*e, "FI_", 3) || !strncmp(*e, "MPISRV_", 7)
+            $my char *eq
+            eq = strchr(*e, '=')
+            $if !eq
+                continue
+            fprintf(out, "%s\"%.*s\":\"", first ? "" : ",", (int) (eq - *e), *e)
+            put_string(eq + 1)
+            fprintf(out, "\"")
+            first = 0
+    fprintf(out, "}}\n")
+    fflush(out)
+    free(hosts)
+
+fncode: reply_result(const struct req *rq, const struct result *res)
+    fprintf(out, "{\"status\":\"%s\",\"seq\":%d,\"op\":\"%s\",\"m\":%ld,", res->failed ? "error" : "ok", rq->seq, op_names[rq->op], res->m)
+    $if rq->op == OP_PINGPONG
+        fprintf(out, "\"pair\":[%d,%d],", rq->pair[0], rq->pair[1])
+    $else
+        fprintf(out, "\"p\":%d,\"ppn\":%d,\"place\":\"%s\",\"nodes\":\"%d:%d\",", rq->p, rq->ppn, place_names[rq->place], rq->node_off, rq->node_stride)
+    $if rq->op == OP_BCAST || rq->op == OP_REDUCE || rq->op == OP_IREDUCE
+        fprintf(out, "\"root\":%d,", rq->root)
+    $if res->check_err >= 0 && !res->failed
+        fprintf(out, "\"check\":\"%s\",\"check_err\":%d,", res->check_err ? "fail" : "ok", res->check_err)
+        # placement record: local ranks used on the first node
+        fprintf(out, "\"node0_locals\":[")
+        $for int r = 0, n = 0; r < world_size; r++
+            $if node_of[r] == rq->node_off && is_member(r, rq)
+                fprintf(out, "%s%d", n++ ? "," : "", local_of[r])
+        fprintf(out, "],")
+    $if spinup_us > 0
+        fprintf(out, "\"spun_up\":%d,", res->spun_up)
+    $if rq->ncvar
+        fprintf(out, "\"cvars\":{")
+        $for k=0:rq->ncvar
+            fprintf(out, "%s\"", k ? "," : "")
+            put_string(rq->cvar_name[k])
+            fprintf(out, "\":\"")
+            put_string(rq->cvar_val[k])
+            fprintf(out, "\"")
+        fprintf(out, "},")
+    $if res->failed
+        fprintf(out, "\"msg\":\"")
+        put_string(res->msg)
+        fprintf(out, "\",\"wall_us\":%.1f,\"tag\":\"%s\"}\n", res->wall_us, rq->tag)
+        fflush(out)
+        return
+    $if rq->probe
+        fprintf(out, "\"probe\":1,")
+    fprintf(out, "\"cache\":\"%s\",\"sync\":\"%s\",\"k\":%d,\"t_us\":[", rq->cold ? "cold" : "hot", rq->sync_call ? "call" : "batch", res->k)
+    $for int j = 0; j < (rq->probe ? 0 : rq->batches); j++
+        fprintf(out, "%s%.4f", j ? "," : "", res->t_us[j])
+    fprintf(out, "],\"t_rank_spread\":%.4f,\"wall_us\":%.1f,\"tag\":\"%s\"}\n", res->spread, res->wall_us, rq->tag)
+    fflush(out)
