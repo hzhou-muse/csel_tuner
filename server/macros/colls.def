@@ -16,6 +16,17 @@ include: colls/allgather.def
 include: colls/alltoall.def
 include: colls/gather.def
 include: colls/scatter.def
+include: colls/scan.def
+include: colls/exscan.def
+include: colls/ibcast.def
+include: colls/ibarrier.def
+include: colls/ireduce_scatter_block.def
+include: colls/iallgather.def
+include: colls/ialltoall.def
+include: colls/igather.def
+include: colls/iscatter.def
+include: colls/iscan.def
+include: colls/iexscan.def
 
 subcode: _autoload
     $include string

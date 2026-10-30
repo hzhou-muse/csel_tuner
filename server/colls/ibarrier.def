@@ -1,0 +1,18 @@
+# ---- ibarrier ----------------------------------------------------------
+# MPI_Ibarrier, waited on at once: like barrier, no data and no extra barrier.
+
+subcode: _autoload
+    $global const struct coll coll_ibarrier = { .name = "ibarrier", .layout = LAYOUT_COMM, .elem = 1, .self_sync = 1, .no_data = 1, .time_div = 1, .call = call_ibarrier }
+    $list call_ibarrier
+
+subcode:: coll_cases
+    $case !strcmp(name, coll_ibarrier.name)
+        return &coll_ibarrier
+
+fncode: call_ibarrier(const struct req *rq, MPI_Comm c, int crank, char *s, char *r, long count): int
+    $my MPI_Request req
+    $my int rc
+    rc = MPI_Ibarrier(c, &req)
+    $if rc == MPI_SUCCESS
+        rc = MPI_Wait(&req, MPI_STATUS_IGNORE)
+    return rc

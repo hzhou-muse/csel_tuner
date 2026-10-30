@@ -59,7 +59,7 @@ op=bcast m=65536 p=256 ppn=8 batches=5 sync=call cvar.MPIR_CVAR_BCAST_INTRA_ALGO
 
 | Key | Meaning | Default |
 |---|---|---|
-| `op` | `bcast`, `allreduce`, `reduce`, `ireduce`, `iallreduce` (the reductions sum `MPI_INT`s; the nonblocking ones are waited on at once), `barrier` (`m=0`), `reduce_scatter_block`, `allgather`, `alltoall`, `gather`, `scatter` (`m` is the per-member block: `MPI_INT`s for reduce_scatter_block, bytes otherwise; the p-block buffers must fit `max-m`), `pingpong`, `info`, `quit`; one file per operation in `server/colls/` | — |
+| `op` | `bcast`, `allreduce`, `reduce`, `ireduce`, `iallreduce` (the reductions sum `MPI_INT`s; the nonblocking ones are waited on at once), `barrier` (`m=0`), `reduce_scatter_block`, `allgather`, `alltoall`, `gather`, `scatter`, `scan`, `exscan`, and the nonblocking `ibcast`, `ibarrier`, `ireduce_scatter_block`, `iallgather`, `ialltoall`, `igather`, `iscatter`, `iscan`, `iexscan` (waited on at once) (`m` is the per-member block: `MPI_INT`s for reduce_scatter_block, bytes otherwise; the p-block buffers must fit `max-m`), `pingpong`, `info`, `quit`; one file per operation in `server/colls/` | — |
 | `m` | message size in bytes | — |
 | `p`, `ppn` | sub-communicator size and ranks per node | the whole job |
 | `place` | which local ranks of a node: `nic` (§3.3), `spread`, `compact` | `nic` |
