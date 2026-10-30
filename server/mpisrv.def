@@ -102,13 +102,7 @@ include: macros/idle.def
 include: macros/measure.def
 include: macros/replies.def
 include: macros/batch.def
-include: colls/colls.def
-include: colls/pingpong.def
-include: colls/bcast.def
-include: colls/allreduce.def
-include: colls/reduce.def
-include: colls/ireduce.def
-include: colls/iallreduce.def
+include: macros/colls.def
 
 page: mpisrv, srv_frame
     $call parse_options

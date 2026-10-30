@@ -1,8 +1,15 @@
 # ---- collectives -------------------------------------------------------
 # What the shared code needs to know about a measured operation. Each
-# operation is one file in colls/ that defines its struct coll and adds
-# itself to coll_find(); requests name it (op=NAME), and nothing outside
-# its file refers to a particular operation.
+# operation is one file in colls/, included below, that defines its struct
+# coll and adds itself to coll_find(); requests name it (op=NAME), and
+# nothing outside its file refers to a particular operation.
+
+include: colls/pingpong.def
+include: colls/bcast.def
+include: colls/allreduce.def
+include: colls/reduce.def
+include: colls/ireduce.def
+include: colls/iallreduce.def
 
 subcode: _autoload
     $include string
