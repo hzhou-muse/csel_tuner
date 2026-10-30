@@ -164,10 +164,15 @@ bin/collmodel --op bcast --algs all \
 - Needs an MPICH whose `release_gather` condition has no side effects
   (pmodels/mpich#8048); with an older one the precheck of `release_gather`
   depends on how often it was evaluated.
-- The model file is `collmodel/4` (design.md §12): every measurement with
+- The model file is `collmodel/5` (design.md §12): units, each one
+  collective measured one way and named by its tags (`coll`, `variant` such
+  as `inplace`, `datatype`, `counts`, `launch`), with every measurement and
   its job, the precheck results, the catalog's conditions and each layout's
   mask (`data`), and each algorithm's curve at each layout it was sampled
-  at (`fit`).
+  at (`fit`). A run puts its unit into `--out` and keeps the file's other
+  units; `collmodel --merge A.json --merge B.json --out C.json` combines
+  files; `colltree --unit coll=allreduce,inplace=0` picks units from a file
+  with several. collmodel/4 files are read as one unit.
 
 A PBS job on Aurora that stops cleanly before its walltime and continues a
 run an earlier job did not finish:
@@ -471,7 +476,8 @@ tuning file, of the tree's and the model's own choices, whether MPICH
 applied the file, and whether the default beats every candidate algorithm
 somewhere (then the candidates miss one, e.g. `release_gather`). Regret is
 against the fastest of every algorithm measured and MPICH's default, split
-into single-node and multi-node layouts. `--model` takes a collmodel/4
+into single-node and multi-node layouts. `--model` takes a collmodel/4 (or a
+one-unit collmodel/5)
 file and `--tuning` a file with one or several subtrees. With a
 compositional algorithm in the model, run `truth/` with
 `MPIR_CVAR_COLL_SELECTION_JSON_FILE` set to the tuning file too, so that

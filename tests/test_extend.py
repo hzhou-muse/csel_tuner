@@ -94,9 +94,9 @@ def test_add_layouts_and_resume():
         r = run("--model", m1, "--algs", "circ_graph", "--layouts", lays, "--log", cut_log, "--resume",
                 "--out", cut)
         assert "from the journal" in r.stdout
-        same = lambda p: (json.load(open(p))["fit"],
+        same = lambda p: (json.load(open(p))["units"][0]["fit"],
                           sorted(json.dumps({k: v for k, v in x.items() if k != "job"}, sort_keys=True)
-                                 for x in json.load(open(p))["data"]["measurements"]))
+                                 for x in json.load(open(p))["units"][0]["data"]["measurements"]))
         assert same(m2) == same(cut)
         r = run("--model", m1, "--algs", "circ_graph", "--out", m1, check=False)
         assert r.returncode != 0 and "must not be the --model file" in r.stderr

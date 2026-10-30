@@ -80,7 +80,7 @@ def run(*args, check=True):
 def model(path):
     """What must not depend on the cut: the fit, the measurements (without their
     job, a resumed run has two) and the prechecks."""
-    d = json.load(open(path))
+    d = json.load(open(path))["units"][0]
     strip = lambda rs: sorted(json.dumps({k: v for k, v in r.items() if k != "job"}, sort_keys=True) for r in rs)
     return d["fit"], strip(d["data"]["measurements"]), strip(d["data"]["prechecks"])
 
@@ -129,7 +129,7 @@ def test_resume_with_fewer_algorithms():
         assert "dropped: " + FIXED[2] in r.stderr
         reused = int(re.search(r"\((\d+) from the journal\)", r.stdout).group(1))
         assert 0 < reused <= kept
-        assert {m["alg"] for m in json.load(open(cut))["data"]["measurements"]} <= set(FIXED[:2])
+        assert {m["alg"] for m in json.load(open(cut))["units"][0]["data"]["measurements"]} <= set(FIXED[:2])
         r = run("--algs", algs3, "--log", cut_log, "--out", cut, "--resume", check=False)
         assert r.returncode != 0 and "adds " + FIXED[2] in r.stderr
 

@@ -25,8 +25,10 @@ def test_v2_then_tree():
         subprocess.run([sys.executable, os.path.join(REPO, "bin", "collmodel"), "--replay", "--out", model,
                         "--algs", ",".join(FIXED[:3]), "--budget-node-h", "0.3"],
                        check=True, stdout=subprocess.DEVNULL)
-        m = json.load(open(model))
-        assert m["format"] == "collmodel/4" and len(m["fit"]["curves"]) == 3 and m["data"]["measurements"]
+        f = json.load(open(model))
+        m = f["units"][0]
+        assert f["format"] == "collmodel/5" and len(f["units"]) == 1 and len(m["fit"]["curves"]) == 3 \
+            and m["data"]["measurements"]
         subprocess.run([sys.executable, os.path.join(REPO, "bin", "colltree"), model, "--out", tuning],
                        check=True, stdout=subprocess.DEVNULL)
         t = json.load(open(tuning))

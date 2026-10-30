@@ -120,7 +120,7 @@ def switch(a):
 
 
 def load_model(path):
-    """The model file (collmodel/4; older ones convert with bin/collmodel --import)."""
+    """The model file's one unit (collmodel/5 or /4; older ones convert with bin/collmodel --import)."""
     from csel_tuner.model import Model
     try:
         return Model.load(path)
@@ -279,7 +279,7 @@ def main():
     v = sub.add_parser("validate")
     for k in ("truth", "default", "tuned", "tuning"):
         v.add_argument("--" + k, required=True)
-    v.add_argument("--model", required=True, help="model file (collmodel/4)")
+    v.add_argument("--model", required=True, help="model file of one unit (collmodel/5 or /4)")
     v.add_argument("--tuning-node-aware")
     v.add_argument("--json")
     a = ap.parse_args()

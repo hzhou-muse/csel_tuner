@@ -2,9 +2,11 @@
 """Build models T(N, ppn, m) of a collective's algorithms.
 
 One algorithm (--alg, builder v1, csel_tuner/single.py; model file
-collmodel/1) or several, sampled for selection into a model file
-(collmodel/4, csel_tuner/model.py: the measurements and the fit derived
+collmodel/1) or several, sampled for selection into a unit of a model file
+(collmodel/5, csel_tuner/model.py: the measurements and the fit derived
 from them; needs the per-request algorithm switch, MPISRV_CVAR_SWITCH=1).
+The unit is named by its tags (--op, --inplace, --counts, --mem); --out
+keeps its other units, and --merge combines model files.
 
 Create a model, live through the benchmark server, one launch of the whole
 allocation (launch/config.sh with the site file launch/sites/<site>.sh):
@@ -126,7 +128,7 @@ import numpy as np  # noqa: E402
 from csel_tuner.algos import GENERAL, Catalog  # noqa: E402
 from csel_tuner.kinds import classify  # noqa: E402
 from csel_tuner.layouts import axis_values, size_grid  # noqa: E402
-from csel_tuner.model import Model, file_hash  # noqa: E402
+from csel_tuner.model import FORMAT, FORMAT_V4, Model, ModelFile, default_tags, file_hash, tag_key, tag_str  # noqa: E402,E501
 from csel_tuner.multi import Builder2, MultiSampler, known_sampler  # noqa: E402
 from csel_tuner.restrict import fixed_point, mem_known, plan_sets, precheck, set_name  # noqa: E402
 from csel_tuner.single import Builder, initial_layouts  # noqa: E402
@@ -842,6 +844,52 @@ def extend(a, model, measure, probe, inner_hash, clock, nodes, on_layout, stop_c
     return run
 
 
+# ---- the output file -----------------------------------------------------------
+
+_out_files = {}
+
+
+def save_unit(path, unit):
+    """Put the unit into the model file at path, keeping the file's other units (an existing
+    collmodel/4 or /5 file; any other file there is replaced)."""
+    f = _out_files.get(path)
+    if f is None:
+        f = ModelFile()
+        try:
+            if json.load(open(path)).get("format") in (FORMAT, FORMAT_V4):
+                f = ModelFile.load(path)
+        except (OSError, ValueError):
+            pass
+        old = f.get(unit.tags)
+        if old is not None:
+            print(f"{path}: replacing its unit {tag_str(unit.tags)}", file=sys.stderr)
+        _out_files[path] = f
+    f.put(unit)
+    f.save(path)
+
+
+def merge(a):
+    """--merge: the units of several model files into one; a unit in two files must be the same."""
+    out, seen = ModelFile(), {}
+    for path in a.merge:
+        try:
+            units = ModelFile.load(path).units
+        except (OSError, ValueError) as e:
+            sys.exit(f"--merge {path}: {e}")
+        for u in units:
+            k = tag_key(u.tags)
+            if k in seen:
+                first, d = seen[k]
+                if d != json.dumps(u.to_dict(), sort_keys=True):
+                    sys.exit(f"--merge {path}: unit {tag_str(u.tags)} is also in {first}, with other data "
+                             "(measure a unit in one file, or pick one of the two)")
+                continue
+            seen[k] = (path, json.dumps(u.to_dict(), sort_keys=True))
+            out.put(u)
+    out.save(a.out)
+    print(f"{a.out}: {len(out.units)} units: " + "; ".join(tag_str(u.tags) for u in out.units))
+
+
 # ---- import of collmodel/3 ---------------------------------------------------
 
 def import_v3(a):
@@ -929,7 +977,7 @@ def import_v3(a):
         for (name, lay), (_, c) in pick.items():
             model.set_curve(name, lay, c)
         model.runs.append({"mode": "import", "from": path, "journal": log or None, "meta": d.get("meta")})
-    model.save(a.out)
+    save_unit(a.out, model)
     print(f"{a.out}: {len(model.algorithms)} algorithms, {len(model.measured_layouts())} layouts, "
           f"{len(model.measurements)} measurements, {len(model.jobs)} jobs")
 
@@ -950,14 +998,19 @@ def parse_args(argv):
                    "algorithm in --catalog")
     ap.add_argument("--exclude-algs", default="", metavar="A,B", help="leave these catalog algorithms out of "
                     "--algs all (e.g. one that hangs)")
-    ap.add_argument("--out", required=True, help="model file to write (JSON)")
-    ap.add_argument("--model", metavar="MODEL", help="add to this model file (collmodel/4): the algorithms of "
+    ap.add_argument("--out", required=True, help="model file to write (collmodel/5): this run's unit goes "
+                    "into it, replacing a unit with the same tags; its other units stay")
+    ap.add_argument("--model", metavar="MODEL", help="add to this run's unit (the one with its tags: --op, "
+                    "--inplace, --counts, --mem) in this model file (collmodel/4 or /5): the algorithms of "
                     "--algs that it does not have, and the layouts of --layouts")
     ap.add_argument("--layouts", metavar="NxPPN,...", help="with --model: measure every algorithm at these "
                     "layouts too")
     ap.add_argument("--anchors", type=int, default=3, help="with --model: layouts at which to remeasure a few "
                     "points of the best algorithms, for the drift between jobs (0: none)")
     ap.add_argument("--drift-tol", type=float, default=1.10, help="warn when an anchor moved more than this")
+    ap.add_argument("--merge", action="append", default=[], metavar="MODEL",
+                    help="combine the units of these model files into --out (a unit in two files must be the "
+                    "same)")
     ap.add_argument("--import", dest="import_", action="append", default=[], metavar="MODEL3[:JOURNAL]",
                     help="convert collmodel/3 files (stage 1, then stage 2) with their journals into --out")
     ap.add_argument("--catalog", metavar="PATH", help="the build's src/mpi/coll/coll_algorithms.txt: "
@@ -1008,7 +1061,7 @@ def parse_args(argv):
                         "or multi-node layouts with several ranks per node (hier); e.g. release_gather=auto@single "
                         "(MPICH's default on one node)")
     a = ap.parse_args(argv)
-    if a.import_:
+    if a.import_ or a.merge:
         return a
     if not (a.alg or a.algs or (a.model and a.layouts)):
         ap.error("one of --alg or --algs is required (or --model with --layouts)")
@@ -1047,11 +1100,23 @@ def on_sigterm(signum, frame):
 
 def main(argv=None):
     a = parse_args(argv)
+    if a.merge:
+        return merge(a)
     if a.import_:
         return import_v3(a)
     t_start = time.time()
     signal.signal(signal.SIGTERM, on_sigterm)
-    base = Model.load(a.model) if a.model else None
+    # this run's unit
+    tags = default_tags(a.op, a.mem, a.inplace, a.counts)
+    base = None
+    if a.model:
+        try:
+            base = ModelFile.load(a.model).get(tags)
+        except (OSError, ValueError) as e:
+            sys.exit(f"--model {a.model}: {e}")
+        if base is None:
+            sys.exit(f"--model {a.model}: no unit {tag_str(tags)} (its units: "
+                     + "; ".join(tag_str(u.tags) for u in ModelFile.load(a.model).units) + ")")
     base_hash = hashlib.sha256(open(a.model, "rb").read()).hexdigest()[:16] if a.model else None
     inner_text = open(a.inner_selection).read() if a.inner_selection else None
     inner_hash = file_hash(inner_text) if inner_text else None
@@ -1069,7 +1134,7 @@ def main(argv=None):
                "compositional": a.compositional, "exclude_algs": a.exclude_algs, "probe_m": a.probe_m,
                "base": base_hash, "inner": inner_hash,
                "layouts": a.layouts, "anchors": a.anchors if a.model else None, "mem": a.mem,
-               "counts": a.counts, "inplace": a.inplace}
+               "counts": a.counts, "inplace": a.inplace, "tags": tags}
         if journal.jobs:
             first = journal.jobs[0]
             err, dropped = resume_check(journal.jobs, job)
@@ -1091,17 +1156,14 @@ def main(argv=None):
         if not v1:
             if base is not None:
                 model = base
-                if model.op != a.op:
-                    sys.exit(f"--model {a.model}: a model of {model.op}, not {a.op}")
-                if model.mem != a.mem:
-                    sys.exit(f"--model {a.model}: a model of {model.mem} buffers, not {a.mem} (--mem)")
                 if model.sizes != [int(x) for x in sizes][:len(model.sizes)] or set(layouts) != set(model.layouts):
                     sys.exit(f"--model {a.model}: its layouts or sizes differ from this allocation's (add to a "
                              "model on an allocation of the same size)")
             else:
                 cat, bits = catalog_algs(a)
                 model = Model(a.op, sizes, layouts, {"N": [1, nodes], "ppn": [1, ppn_max],
-                                                     "m": [int(sizes[0]), int(sizes[-1])]}, bits, mem=a.mem)
+                                                     "m": [int(sizes[0]), int(sizes[-1])]}, bits, mem=a.mem,
+                              tags=tags)
             # this run's jobs in the model: the journal's earlier ones, then this one
             a._jobs_before = len(model.jobs)
             for j in journal.jobs:
@@ -1136,7 +1198,7 @@ def main(argv=None):
                 return write_atomic(a.out, model_v1(a, built[0][3], sizes, nodes, ppn_max, meta, jobs, False, cost))
             if base is None:
                 store_curves(model, built)
-            model.save(a.out)
+            save_unit(a.out, model)
 
         def on_layout(*_):
             now = time.time()
@@ -1233,7 +1295,7 @@ def main(argv=None):
     run["jobs"] = list(range(a._jobs_before, len(model.jobs)))
     model.runs.append(run)
     try:
-        model.save(a.out)
+        save_unit(a.out, model)
     except Exception as e:
         sys.exit(f"no model written ({type(e).__name__}: {e}); the journal {a.log} keeps the measurements for --resume")
     print(f"{a.out}: {len(model.measured_layouts())} layouts, {run['n_measurements']} measurements in this run "

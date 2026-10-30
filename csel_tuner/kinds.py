@@ -2,6 +2,8 @@
 
     kinds, notes = classify(bits)          # {restriction: "input" | "launch" | "set"}, [warnings]
     variants("reduce", bits)               # [{"inplace": 0, "builtin_op": 1, "commutative": 1}, ...]
+    run_variant("reduce", inplace=True)    # the assignment mpisrv measures
+    datatype("allreduce")                  # "int": mpisrv's element type for the collective
     measured(v), launch_known(bits, mem)
 
 The catalog lists the restrictions but not their kinds: how a tuning tool
@@ -26,6 +28,8 @@ warning: it may be a new input condition that needs a recipe.
 """
 
 REDUCTIONS = ["reduce", "allreduce", "reduce_scatter", "reduce_scatter_block", "scan", "exscan"]
+# the v-operations: their blocks follow mpisrv's counts= pattern (a tag of their models)
+VCOUNTS = ["allgatherv", "alltoallv", "gatherv", "scatterv", "reduce_scatter"]
 INPLACE = ["gather", "gatherv", "scatter", "scatterv", "allgather", "allgatherv", "alltoall", "alltoallv",
            "alltoallw"] + REDUCTIONS
 
@@ -103,3 +107,18 @@ def launch_known(bits, mem):
             else:
                 f |= 1 << bits.index(r)
     return t, f
+
+
+def run_variant(coll, inplace=False):
+    """The input-condition assignment a request of mpisrv has: the reductions sum MPI_INTs with
+    MPI_SUM (builtin and commutative), and inplace=1 or not where MPI allows MPI_IN_PLACE."""
+    return {r: int(inplace) if r == "inplace" else 1 for r, (colls, _) in RECIPES.items() if coll in colls}
+
+
+def is_v(coll):
+    return coll in _with_nb(VCOUNTS)
+
+
+def datatype(coll):
+    """mpisrv's element type: MPI_INT for the reductions, bytes for the rest."""
+    return "int" if coll in _with_nb(REDUCTIONS) else "byte"

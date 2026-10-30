@@ -80,8 +80,12 @@ def test_model_mem_roundtrip():
         path = os.path.join(tmp, "d.json")
         device_model().save(path)
         assert Model.load(path).mem == "device"
-        d = json.load(open(path))
-        del d["mem"]                    # a file from before the field: host
+        # a collmodel/4 file: its mem field, and host from before the field existed
+        d = dict(json.load(open(path))["units"][0], format="collmodel/4", op="bcast", mem="device")
+        del d["tags"]
+        json.dump(d, open(path, "w"))
+        assert Model.load(path).mem == "device"
+        del d["mem"]
         json.dump(d, open(path, "w"))
         assert Model.load(path).mem == "host"
 
@@ -136,7 +140,7 @@ def test_merge_errors():
         device_model().save(d)
         device_model(["hierarchical", "other", "gpu_coll"]).save(d2)
         for argv, msg in [([d, "--out", t], "no model of host buffers"),
-                          ([h, h, "--out", t], "a second model of host buffers"),
+                          ([h, h, "--out", t], "a second unit of host buffers"),
                           ([h, d2, "--out", t], "has no gpu restriction")]:
             try:
                 colltree(argv)

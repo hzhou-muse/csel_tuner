@@ -331,7 +331,33 @@ predicted regret of choosing a at point i):
 `log2_t` is the measured layout's curve on the size grid; prediction at
 other layouts follows §5 (`LayoutModel.from_json`).
 
-**collmodel/4** (several algorithms, `csel_tuner/model.py`; §12.1):
+**collmodel/5** (several algorithms, `csel_tuner/model.py`; §12.1): a list
+of units, each one model of one collective measured one way, named by its
+**tags**:
+
+| Tag | Meaning |
+|---|---|
+| `coll` | the collective (`--op`) |
+| `variant` | the input-condition assignment the requests had (`kinds.run_variant`): `inplace` where MPI allows `MPI_IN_PLACE`, `builtin_op`/`commutative` (always 1: mpisrv sums with `MPI_SUM`) for the reductions |
+| `datatype` | mpisrv's element type: `int` for the reductions, `byte` otherwise |
+| `counts` | v-operations only: the blocks' pattern (`--counts`) |
+| `launch` | the buffers' memory, `host` or `device` (`--mem`) |
+
+```json
+{"format": "collmodel/5", "created": "...",
+ "units": [{"tags": {"coll": "allreduce", "variant": {"builtin_op": 1, "commutative": 1, "inplace": 0},
+                     "datatype": "int", "launch": "host"},
+            "sizes": [...], ...the rest as in a collmodel/4 file, below, without format, op and mem...}]}
+```
+
+A unit is self-contained (its jobs, inner files and runs are its own), so
+units copy between files unchanged: a collmodel run puts its unit into
+`--out` and keeps the file's other units, `collmodel --merge` combines
+files, `collmodel --model` and `colltree --unit` select units by their tags.
+A collmodel/4 file reads as one unit; new tags get defaults (a unit written
+before a tag existed has its default value).
+
+**collmodel/4**, one unit per file:
 
 ```json
 {"format": "collmodel/4", "op": "bcast", "sizes": [...], "domain": {...}, "layouts": [[1, 2], ...],
@@ -624,7 +650,7 @@ measure when outside both:
 
 ### 12.1 The model file: data and fit
 
-One file (collmodel/4) with two sections:
+One unit of a file (collmodel/5, §12) has two sections:
 
 - **`data`**, the source of truth: every measurement as a record (op,
   algorithm, N, ppn, m, the repetitions `t_us`, `wall_us`, the job, the

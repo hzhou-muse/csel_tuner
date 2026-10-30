@@ -4,7 +4,7 @@
     t = prune_to(t, tol=0.005)
     json_tree(t, ...)                         # a CSEL subtree, e.g. "name=bcast-intra-auto"
 
-Input is the v2 model (multi.OptimumModel, or a collmodel/4 file): the
+Input is the v2 model (multi.OptimumModel, or a unit of a collmodel/5 file): the
 predicted time of every algorithm at every point of a grid, all allowed
 layouts x all sizes. The tree is fitted to minimize regret, not
 misclassification: with R[i, a] = predicted log2 T[i, a] - min_b log2 T[i, b],

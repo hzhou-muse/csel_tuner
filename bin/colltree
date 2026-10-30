@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Turn model files (collmodel/4, from bin/collmodel) into an MPICH
+"""Turn model files (collmodel/5 or /4, from bin/collmodel; --unit selects units) into an MPICH
 collective-selection JSON (builder v3, csel_tuner/tree.py).
 
     bin/colltree bcast.json [bcast_gpu.json] --out bcast_tuning.json [--tol 0.005] [--node-aware]
@@ -63,7 +63,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 import numpy as np  # noqa: E402
 
-from csel_tuner.model import Model  # noqa: E402
+from csel_tuner.model import ModelFile, parse_sel, tag_str  # noqa: E402
 from csel_tuner.restrict import GPU, role_layout, set_name, set_prefix  # noqa: E402
 from csel_tuner.single import is_pof2  # noqa: E402
 from csel_tuner.tree import fit_tree, json_choice, json_tree, prune_to, select  # noqa: E402
@@ -267,7 +267,10 @@ def stale(model, S, out, x_of, tol):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("model", nargs="+", help="model files (collmodel/4): one of host buffers, optionally one "
+    ap.add_argument("--unit", metavar="KEY=VALUE,...", help="the units to use from the model files, by their "
+                    "tags (coll, launch, datatype, counts) or variant conditions (inplace, ...), e.g. "
+                    "coll=allgather,inplace=0; default: every unit of each file")
+    ap.add_argument("model", nargs="+", help="model files (collmodel/5 or /4): one of host buffers, optionally one "
                     "of device buffers")
     ap.add_argument("--out", required=True, help="selection JSON to write")
     ap.add_argument("--tol", type=float, default=0.005, help="allowed predicted geomean regret over the full tree")
@@ -290,21 +293,32 @@ def main(argv=None):
                     help="also write the subtrees of FILE's other ops into --out (a tuning file for the inner "
                     "calls of another op, or the final file of several ops)")
     a = ap.parse_args(argv)
-    models = []
+    try:
+        sel = parse_sel(a.unit)
+    except ValueError as e:
+        sys.exit(f"--unit: {e}")
+    models, paths = [], []
     for path in a.model:
         try:
-            models.append(Model.load(path))
-        except ValueError as e:
+            f = ModelFile.load(path)
+        except (OSError, ValueError) as e:
             sys.exit(str(e))
+        units = f.select(sel)
+        if not units:
+            sys.exit(f"{path}: no unit selected by --unit {a.unit or ''} (its units: "
+                     + "; ".join(tag_str(u.tags) for u in f.units) + ")")
+        models += units
+        paths += [path] * len(units)
     by_mem = {}
-    for path, m in zip(a.model, models):
+    for path, m in zip(paths, models):
         if m.mem in by_mem:
-            sys.exit(f"{path}: a second model of {m.mem} buffers ({by_mem[m.mem][0]})")
+            sys.exit(f"{path}: a second unit of {m.mem} buffers ({tag_str(m.tags)}; the first: "
+                     f"{tag_str(by_mem[m.mem][1].tags)} in {by_mem[m.mem][0]}); select one with --unit")
         by_mem[m.mem] = (path, m)
     if "host" not in by_mem:
         sys.exit("no model of host buffers (the run-time fallback)")
     op = models[0].op
-    for path, m in zip(a.model, models):
+    for path, m in zip(paths, models):
         if m.op != op:
             sys.exit(f"{path}: a model of {m.op}, not {op}")
     if "device" in by_mem:
