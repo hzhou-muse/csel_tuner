@@ -10,6 +10,7 @@ include: colls/allreduce.def
 include: colls/reduce.def
 include: colls/ireduce.def
 include: colls/iallreduce.def
+include: colls/barrier.def
 
 subcode: _autoload
     $include string
@@ -17,8 +18,12 @@ subcode: _autoload
     # layout: LAYOUT_PAIR (two ranks, pair=a,b) or LAYOUT_COMM (p ranks);
     # elem: bytes per element (m is in bytes, a multiple of elem);
     # time_div: the reported time per call is the call time / time_div
-    # (2: ping-pong reports half the round trip); rooted: takes root=
-    $struct(coll) const char *name, int layout, long elem, double time_div, int rooted
+    # (2: ping-pong reports half the round trip); rooted: takes root=;
+    # self_sync: the call synchronizes the members itself (barrier), so the
+    # measurement adds no barrier before the batches or before each call;
+    # no_data: no buffers, m must be 0. Fields left out of a collective's
+    # initializer are 0.
+    $struct(coll) const char *name, int layout, long elem, double time_div, int rooted, int self_sync, int no_data
     # call: one call on buffers s and r of count elements, returns the MPI
     # error code; check: verify the result once and return the number of
     # wrong elements over all ranks (NULL: check=1 is ignored)

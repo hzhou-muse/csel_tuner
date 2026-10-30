@@ -100,6 +100,7 @@ include: macros/requests.def
 include: macros/cvars.def
 include: macros/idle.def
 include: macros/measure.def
+include: macros/helpers.def
 include: macros/replies.def
 include: macros/batch.def
 include: macros/colls.def
@@ -156,9 +157,11 @@ fncode: next_request(struct req *rq): int
 # One measurement request on all ranks: the members measure, everybody
 # switches the request's cvars, comm rank 0's result goes to rank 0.
 fncode: serve(struct req *rq, struct result *res)
-    apply_cvars(rq, 0)
+    # the sub-communicator before the cvars: MPI_Comm_split runs internal
+    # collectives that a forced algorithm must not reach
     $my MPI_Comm c
     c = get_comm(rq)
+    apply_cvars(rq, 0)
     # world rank of comm rank 0
     $my int croot
     croot = comm_root(rq)

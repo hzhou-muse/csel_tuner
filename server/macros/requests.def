@@ -139,6 +139,8 @@ fncode: parse(char *line, struct req *rq): const char *
             return "missing op"
         $if rq->ppn < 0
             rq->ppn = rq->p < min_ppn ? rq->p : min_ppn
+        $if rq->op == OP_COLL && coll_find(rq->coll)->no_data && rq->m
+            return "m must be 0 for an op without data"
         $if rq->m < 0 || rq->m > max_m
             snprintf(err, sizeof(err), "m must be in [0, %ld]", max_m)
             return err

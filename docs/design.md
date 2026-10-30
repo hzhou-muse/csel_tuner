@@ -59,7 +59,7 @@ op=bcast m=65536 p=256 ppn=8 batches=5 sync=call cvar.MPIR_CVAR_BCAST_INTRA_ALGO
 
 | Key | Meaning | Default |
 |---|---|---|
-| `op` | `bcast`, `allreduce`, `reduce`, `ireduce`, `iallreduce` (the reductions sum `MPI_INT`s; the nonblocking ones are waited on at once), `pingpong`, `info`, `quit` | — |
+| `op` | `bcast`, `allreduce`, `reduce`, `ireduce`, `iallreduce` (the reductions sum `MPI_INT`s; the nonblocking ones are waited on at once), `barrier` (`m=0`), `pingpong`, `info`, `quit`; one file per operation in `server/colls/` | — |
 | `m` | message size in bytes | — |
 | `p`, `ppn` | sub-communicator size and ranks per node | the whole job |
 | `place` | which local ranks of a node: `nic` (§3.3), `spread`, `compact` | `nic` |
@@ -102,6 +102,13 @@ the common barrier exit to the last rank finishing, per call. With
 value is the slowest rank's mean call time: latency without pipelining
 between consecutive calls, which is what the builders use. `wall_us` is the
 request's full cost.
+
+`op=barrier` is itself the synchronization: no barrier is added before the
+batches or, with `sync=call`, before each call. The measurement's other
+communication (agreement on failures, spin-up, calibration and the check,
+and the batch-time extremes) is point-to-point on binomial trees, and the
+sub-communicator is created before the request's `cvar.*` are written, so a
+forced algorithm reaches only the measured call.
 
 ### 3.3 Rank placement: `place=nic`
 

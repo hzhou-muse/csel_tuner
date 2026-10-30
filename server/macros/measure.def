@@ -1,7 +1,7 @@
 # ---- measurement -------------------------------------------------------
 # One request on its sub-communicator: the untimed call, the optional bcast
 # check and spin-up, calibration of k, warmup, then the timed batches. Every
-# decision the members must take alike goes through agree().
+# decision the members must take alike goes through agree() (helpers.def).
 
 subcode: _autoload
     $include stdio, stdlib
@@ -11,7 +11,6 @@ subcode: _autoload
     $struct(result) int failed, char msg[MPI_MAX_ERROR_STRING], long m, int k, int check_err
     $struct(result) int spun_up, double wall_us, double spread, double t_us[MAX_BATCHES]
     $global int call_err                  # first error code of an MPI call in this measurement
-    $enum(agree_how) AGREE_MAX, AGREE_SUM, AGREE_ROOT
 
 # k calls of the operation; returns local elapsed seconds (with sync=call,
 # the sum of the calls' own times, barriers excluded)
@@ -21,7 +20,8 @@ fncode: run(const struct req *rq, const struct coll *cl, MPI_Comm c, int crank, 
     $for i=0:k
         $my long off = rq->cold ? (i * bytes) % max_m : 0
         $if rq->sync_call
-            MPI_Barrier(c)
+            $if !cl->self_sync
+                MPI_Barrier(c)
             t0 = MPI_Wtime()
         # the call uses s, r or both (colls/)
         $my char *s = sbuf + off, char *r = rbuf + off
@@ -32,62 +32,6 @@ fncode: run(const struct req *rq, const struct coll *cl, MPI_Comm c, int crank, 
         $if rq->sync_call
             sum += MPI_Wtime() - t0
     return rq->sync_call ? sum : MPI_Wtime() - t0
-
-# Agreement among the members of c during a measurement, for the decisions
-# that every rank must take alike (failure, spin-up, calibration, bcast check).
-# It uses MPI_Allgather, so a CVAR that forces the measured operation's
-# algorithm cannot reach it: with MPI_Allreduce or MPI_Bcast here, a forced
-# algorithm that does not support the helper's tiny count (reduce_scatter_
-# allgather with count < pof2) fails the call, and the ranks that missed the
-# result take different branches and issue different collectives (a hang).
-fncode: agree(MPI_Comm c, double v, int how): double
-    $my int n
-    MPI_Comm_size(c, &n)
-    $my double *all = malloc(n * sizeof(double))
-    $my int rc
-    rc = MPI_Allgather(&v, 1, MPI_DOUBLE, all, 1, MPI_DOUBLE, c)
-    $if rc != MPI_SUCCESS
-        # nothing left to agree on
-        $my char msg[MPI_MAX_ERROR_STRING], int len
-        MPI_Error_string(rc, msg, &len)
-        fprintf(stderr, "mpisrv: rank %d: MPI_Allgather of a measurement helper failed: %s\n", world_rank, msg)
-        MPI_Abort(MPI_COMM_WORLD, 4)
-    $my double r = all[0]
-    $for i=1:n
-        $if how == AGREE_MAX && all[i] > r
-            r = all[i]
-        $elif how == AGREE_SUM
-            r += all[i]
-    free(all)
-    # AGREE_ROOT: the value of rank 0
-    return r
-
-# A helper collective that must not fail (it is not the measured call).
-fncode: helper_ok(int rc, const char *what)
-    $if rc != MPI_SUCCESS
-        $my char msg[MPI_MAX_ERROR_STRING], int len
-        MPI_Error_string(rc, msg, &len)
-        fprintf(stderr, "mpisrv: rank %d: %s failed: %s\n", world_rank, what, msg)
-        MPI_Abort(MPI_COMM_WORLD, 4)
-
-# The max and min over the members of c of each batch time, on comm rank 0.
-# MPI_Gather, not MPI_Reduce: a CVAR that forces the measured reduce
-# algorithm must not reach the helper (see agree).
-fncode: batch_extremes(const double *e, double *emax, double *emin, int n, MPI_Comm c, int crank)
-    $my int csize
-    MPI_Comm_size(c, &csize)
-    $my double *all
-    all = crank == 0 ? malloc(sizeof(double) * n * csize) : NULL
-    helper_ok(MPI_Gather(e, n, MPI_DOUBLE, all, n, MPI_DOUBLE, 0, c), "MPI_Gather")
-    $if crank != 0
-        return
-    $for j=0:n
-        emax[j] = emin[j] = all[j]
-        $for i=1:csize
-            $my double v = all[i * n + j]
-            emax[j] = v > emax[j] ? v : emax[j]
-            emin[j] = v < emin[j] ? v : emin[j]
-    free(all)
 
 # Whether a call has failed on any member; comm rank 0 gets the message. The
 # failure is agreed on with agree(), which the CVARs of the measured operation
@@ -139,7 +83,8 @@ fncode: measure(const struct req *rq, MPI_Comm c, struct result *res)
     run(rq, cl, c, crank, count, k)
 
     $my double e[MAX_BATCHES], double emax[MAX_BATCHES], double emin[MAX_BATCHES]
-    MPI_Barrier(c)
+    $if !cl->self_sync
+        MPI_Barrier(c)
     $my double t0 = MPI_Wtime()
     $for j=0:rq->batches
         $my double b

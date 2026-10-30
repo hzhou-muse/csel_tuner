@@ -1,0 +1,78 @@
+# ---- measurement helpers -----------------------------------------------
+# The communication a measurement needs besides the measured call: agreement
+# on the decisions every member must take alike (failure, spin-up,
+# calibration, check) and the batch-time extremes. Point-to-point only, on
+# binomial trees, so no algorithm CVAR of a measured collective can reach
+# them: with a collective here, a forced algorithm that does not support the
+# helper's count (reduce_scatter_allgather with count < pof2) fails the
+# helper, and the ranks that missed the result take different branches and
+# issue different calls (a hang).
+
+subcode: _autoload
+    $define(HELPER_TAG) 7                 # pingpong uses tag 0 on the same communicator
+    # how: AGREE_MAX, AGREE_SUM, AGREE_ROOT (comm rank 0's value), or
+    # AGREE_MAXMIN (first half of the vector max, second half min)
+    $enum(agree_how) AGREE_MAX, AGREE_SUM, AGREE_ROOT, AGREE_MAXMIN
+
+# Agreement among the members of c on v: the max, the sum or comm rank 0's
+# value, on every member.
+fncode: agree(MPI_Comm c, double v, int how): double
+    helper_reduce(&v, 1, how, c)
+    helper_bcast(&v, 1, c)
+    return v
+
+# The max and min over the members of c of each of the n batch times, on
+# comm rank 0.
+fncode: batch_extremes(const double *e, double *emax, double *emin, int n, MPI_Comm c, int crank)
+    $my double *v = malloc(sizeof(double) * 2 * n)
+    $for j=0:n
+        v[j] = e[j]
+        v[n + j] = e[j]
+    helper_reduce(v, 2 * n, AGREE_MAXMIN, c)
+    $if crank == 0
+        $for j=0:n
+            emax[j] = v[j]
+            emin[j] = v[n + j]
+    free(v)
+
+# Combine v (len values) over the members of c onto comm rank 0, on a
+# binomial tree: in round mask, rank i with bit mask set sends to i - mask.
+fncode: helper_reduce(double *v, int len, int how, MPI_Comm c)
+    $my int n, int me
+    MPI_Comm_size(c, &n)
+    MPI_Comm_rank(c, &me)
+    $my double *x = malloc(sizeof(double) * len)
+    $for int mask = 1; mask < n; mask <<= 1
+        $if me & mask
+            helper_ok(MPI_Send(v, len, MPI_DOUBLE, me - mask, HELPER_TAG, c), "a measurement helper's MPI_Send")
+            break;
+        $if me + mask < n
+            helper_ok(MPI_Recv(x, len, MPI_DOUBLE, me + mask, HELPER_TAG, c, MPI_STATUS_IGNORE), "a measurement helper's MPI_Recv")
+            $for i=0:len
+                $if how == AGREE_MAX || (how == AGREE_MAXMIN && 2 * i < len)
+                    v[i] = x[i] > v[i] ? x[i] : v[i]
+                $elif how == AGREE_MAXMIN
+                    v[i] = x[i] < v[i] ? x[i] : v[i]
+                $elif how == AGREE_SUM
+                    v[i] += x[i]
+    free(x)
+
+# Comm rank 0's v (len values) to every member of c, on a binomial tree:
+# in round mask, ranks below mask send to i + mask.
+fncode: helper_bcast(double *v, int len, MPI_Comm c)
+    $my int n, int me
+    MPI_Comm_size(c, &n)
+    MPI_Comm_rank(c, &me)
+    $for int mask = 1; mask < n; mask <<= 1
+        $if me < mask && me + mask < n
+            helper_ok(MPI_Send(v, len, MPI_DOUBLE, me + mask, HELPER_TAG, c), "a measurement helper's MPI_Send")
+        $elif me >= mask && me < 2 * mask
+            helper_ok(MPI_Recv(v, len, MPI_DOUBLE, me - mask, HELPER_TAG, c, MPI_STATUS_IGNORE), "a measurement helper's MPI_Recv")
+
+# A helper call that must not fail (it is not the measured call).
+fncode: helper_ok(int rc, const char *what)
+    $if rc != MPI_SUCCESS
+        $my char msg[MPI_MAX_ERROR_STRING], int len
+        MPI_Error_string(rc, msg, &len)
+        fprintf(stderr, "mpisrv: rank %d: %s failed: %s\n", world_rank, what, msg)
+        MPI_Abort(MPI_COMM_WORLD, 4)
