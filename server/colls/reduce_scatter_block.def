@@ -1,0 +1,14 @@
+# ---- reduce_scatter_block ----------------------------------------------
+# MPI_Reduce_scatter_block (MPI_SUM) of MPI_INTs: each member sends p blocks
+# of m bytes and receives its reduced block of m bytes.
+
+subcode: _autoload
+    $global const struct coll coll_reduce_scatter_block = { .name = "reduce_scatter_block", .layout = LAYOUT_COMM, .elem = sizeof(int), .time_div = 1, .sbuf_p = 1, .call = call_reduce_scatter_block }
+    $list call_reduce_scatter_block
+
+subcode:: coll_cases
+    $case !strcmp(name, coll_reduce_scatter_block.name)
+        return &coll_reduce_scatter_block
+
+fncode: call_reduce_scatter_block(const struct req *rq, MPI_Comm c, int crank, char *s, char *r, long count): int
+    return MPI_Reduce_scatter_block(s, r, count, MPI_INT, MPI_SUM, c)

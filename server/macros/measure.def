@@ -15,7 +15,8 @@ subcode: _autoload
 # k calls of the operation; returns local elapsed seconds (with sync=call,
 # the sum of the calls' own times, barriers excluded)
 fncode: run(const struct req *rq, const struct coll *cl, MPI_Comm c, int crank, long count, int k): double
-    $my long bytes = count * cl->elem
+    # --cold: each call on the next buffer slice
+    $my long bytes = coll_buf_bytes(cl, rq)
     $my double t0 = MPI_Wtime(), double sum = 0
     $for i=0:k
         $my long off = rq->cold ? (i * bytes) % max_m : 0

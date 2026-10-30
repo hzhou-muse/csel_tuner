@@ -11,6 +11,7 @@ include: colls/reduce.def
 include: colls/ireduce.def
 include: colls/iallreduce.def
 include: colls/barrier.def
+include: colls/reduce_scatter_block.def
 
 subcode: _autoload
     $include string
@@ -21,9 +22,13 @@ subcode: _autoload
     # (2: ping-pong reports half the round trip); rooted: takes root=;
     # self_sync: the call synchronizes the members itself (barrier), so the
     # measurement adds no barrier before the batches or before each call;
-    # no_data: no buffers, m must be 0. Fields left out of a collective's
+    # no_data: no buffers, m must be 0; sbuf_p, rbuf_p: the send (receive)
+    # buffer holds p blocks of m bytes, one per member, instead of one (m is
+    # msg_size: the per-peer block for allgather, alltoall, gather, scatter
+    # and reduce_scatter_block). Fields left out of a collective's
     # initializer are 0.
     $struct(coll) const char *name, int layout, long elem, double time_div, int rooted, int self_sync, int no_data
+    $struct(coll) int sbuf_p, int rbuf_p
     # call: one call on buffers s and r of count elements, returns the MPI
     # error code; check: verify the result once and return the number of
     # wrong elements over all ranks (NULL: check=1 is ignored)
@@ -34,3 +39,12 @@ subcode: _autoload
 fncode: coll_find(const char *name): const struct coll *
     $call @coll_cases
     return NULL
+
+# The larger of the send and receive buffers of a request in bytes (m
+# rounded down to whole elements); each must fit the server's buffers
+# (max_m bytes).
+fncode: coll_buf_bytes(const struct coll *cl, const struct req *rq): long
+    $my long block = rq->m / cl->elem * cl->elem
+    $if cl->sbuf_p || cl->rbuf_p
+        return block * rq->p
+    return block

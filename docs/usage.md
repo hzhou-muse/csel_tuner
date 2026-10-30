@@ -273,7 +273,7 @@ Also `--log`, `--resume`, `--deadline`, `--checkpoint-every` (§6.5) and
 | `--prune` | 2.0 | v2: skip sizes predicted this much slower than the best; 0 = off |
 | `--batches` | 5 | timed batches per request |
 | `--sync` | `call` | `call`: a barrier before each call; `batch`: back to back |
-| `--max-m` | 64 MB | largest size; the server allocates buffers of this size per rank |
+| `--max-m` | 64 MB | largest size; the server allocates buffers of this size per rank, and refuses a request whose buffers exceed it (p·m for operations with p blocks, e.g. reduce_scatter_block) |
 | `--timeout` | 300 | seconds to wait for a reply before killing the job |
 | `--rewarm-gap` | 0.05 | seconds of driver idle time after which a batch starts with a warm-up request |
 | `--env KEY=VALUE` | | extra environment for the launch |

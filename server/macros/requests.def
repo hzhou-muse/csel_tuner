@@ -165,3 +165,6 @@ fncode: parse(char *line, struct req *rq): const char *
                 return "root must be in [0, p)"
             $if rq->place == PLACE_NIC && !nic_groups_ok
                 return "place=nic: a group of MPISRV_NIC_MOD local ranks spans two sockets"
+            $if coll_buf_bytes(coll_find(rq->coll), rq) > max_m
+                snprintf(err, sizeof(err), "m * p must be at most %ld (the server's buffer size) for op=%s", max_m, rq->coll)
+                return err
