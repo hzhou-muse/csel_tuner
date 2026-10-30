@@ -1,12 +1,12 @@
 # ---- alltoallv ---------------------------------------------------------
-# MPI_Alltoallv of the counts= blocks (bytes, mean m), rotated per sender: every member sends and receives p * m.
+# MPI_Alltoallv of the counts= blocks (bytes, mean m), members i and j exchange block (i + j) mod p: every member sends and receives p * m.
 
 subcode: _autoload
-    $global const struct coll coll_alltoallv = { .name = "alltoallv", .layout = LAYOUT_COMM, .elem = 1, .sbuf_p = 1, .rbuf_p = 1, .vcounts = 1, .time_div = 1, .call = call_alltoallv }
+    $global const struct coll coll_alltoallv = { .name = "alltoallv", .layout = LAYOUT_COMM, .elem = 1, .sbuf_p = 1, .rbuf_p = 1, .vcounts = 1, .time_div = 1, .inplace_ok = 1, .call = call_alltoallv }
     $list call_alltoallv
 
 subcode:: coll_list
     coll_add(&coll_alltoallv)
 
 fncode: call_alltoallv(const struct req *rq, MPI_Comm c, int crank, char *s, char *r, long count): int
-    return MPI_Alltoallv(s, vc_scounts, vc_sdispls, MPI_BYTE, r, vc_rcounts, vc_rdispls, MPI_BYTE, c)
+    return MPI_Alltoallv(inplace_send(rq, s), vc_scounts, vc_sdispls, MPI_BYTE, r, vc_rcounts, vc_rdispls, MPI_BYTE, c)

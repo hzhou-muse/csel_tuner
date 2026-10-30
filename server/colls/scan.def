@@ -2,11 +2,11 @@
 # MPI_Scan (MPI_SUM) of m/sizeof(int) MPI_INTs.
 
 subcode: _autoload
-    $global const struct coll coll_scan = { .name = "scan", .layout = LAYOUT_COMM, .elem = sizeof(int), .time_div = 1, .call = call_scan }
+    $global const struct coll coll_scan = { .name = "scan", .layout = LAYOUT_COMM, .elem = sizeof(int), .time_div = 1, .inplace_ok = 1, .call = call_scan }
     $list call_scan
 
 subcode:: coll_list
     coll_add(&coll_scan)
 
 fncode: call_scan(const struct req *rq, MPI_Comm c, int crank, char *s, char *r, long count): int
-    return MPI_Scan(s, r, count, MPI_INT, MPI_SUM, c)
+    return MPI_Scan(inplace_send(rq, s), r, count, MPI_INT, MPI_SUM, c)

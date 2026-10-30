@@ -57,7 +57,10 @@ subcode: _autoload
     $struct(coll) const char *name, int layout, long elem, double time_div, int rooted, int self_sync, int no_data
     # vcounts: a v-operation, its counts from counts= (vcounts.def), built
     # before the measurement
-    $struct(coll) int sbuf_p, int rbuf_p, int vcounts
+    # inplace_ok: takes inplace=1 (MPI_IN_PLACE where MPI allows it; the
+    # call passes its buffers through inplace_send, inplace_root_send or
+    # inplace_root_recv)
+    $struct(coll) int sbuf_p, int rbuf_p, int vcounts, int inplace_ok
     # call: one call on buffers s and r of count elements, returns the MPI
     # error code; check: verify the result once and return the number of
     # wrong elements over all ranks (NULL: check=1 is ignored)
@@ -90,3 +93,16 @@ fncode: coll_buf_bytes(const struct coll *cl, const struct req *rq): long
     $if cl->sbuf_p || cl->rbuf_p
         return block * rq->p
     return block
+
+# inplace=1: MPI_IN_PLACE as the send buffer on every member (allreduce,
+# scan, exscan, reduce_scatter(_block), allgather(v), alltoall(v)), as the
+# root's send buffer (reduce, gather(v)), or as the root's receive buffer
+# (scatter(v)); the data is then in r.
+fncode: inplace_send(const struct req *rq, char *s): void *
+    return rq->inplace ? MPI_IN_PLACE : (void *) s
+
+fncode: inplace_root_send(const struct req *rq, int crank, char *s): void *
+    return rq->inplace && crank == rq->root ? MPI_IN_PLACE : (void *) s
+
+fncode: inplace_root_recv(const struct req *rq, int crank, char *r): void *
+    return rq->inplace && crank == rq->root ? MPI_IN_PLACE : (void *) r

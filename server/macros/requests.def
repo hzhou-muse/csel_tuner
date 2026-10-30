@@ -17,6 +17,8 @@ subcode: _autoload
     $struct(req) int sync_call, int probe, char tag[TAG_LEN]
     # counts: counts=, the COUNTS_* pattern of a v-operation (vcounts.def)
     $struct(req) int counts
+    # inplace: inplace=1, MPI_IN_PLACE where the operation allows it
+    $struct(req) int inplace
     # cvar.NAME=VALUE tokens, applied for this request only
     $struct(req) int ncvar, char cvar_name[MAX_CVARS][CVAR_LEN], char cvar_val[MAX_CVARS][CVAR_LEN]
 
@@ -76,6 +78,8 @@ fncode: parse(char *line, struct req *rq): const char *
             rq->counts = parse_counts(val)
             $if rq->counts < 0
                 return "counts must be uniform, linear or onebig"
+        $elif !strcmp(tok, "inplace")
+            rq->inplace = atoi(val) != 0
         $elif !strcmp(tok, "probe")
             rq->probe = atoi(val) != 0
         $elif !strcmp(tok, "batches")
@@ -147,6 +151,8 @@ fncode: parse(char *line, struct req *rq): const char *
             rq->ppn = rq->p < min_ppn ? rq->p : min_ppn
         $if rq->op == OP_COLL && rq->counts != COUNTS_UNIFORM && !coll_find(rq->coll)->vcounts
             return "counts= is for the v-operations"
+        $if rq->op == OP_COLL && rq->inplace && !coll_find(rq->coll)->inplace_ok
+            return "inplace=1: this op takes no MPI_IN_PLACE"
         $if rq->op == OP_COLL && coll_find(rq->coll)->no_data && rq->m
             return "m must be 0 for an op without data"
         $if rq->m < 0 || rq->m > max_m

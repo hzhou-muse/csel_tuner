@@ -61,7 +61,8 @@ op=bcast m=65536 p=256 ppn=8 batches=5 sync=call cvar.MPIR_CVAR_BCAST_INTRA_ALGO
 |---|---|---|
 | `op` | `bcast`, `allreduce`, `reduce`, `ireduce`, `iallreduce` (the reductions sum `MPI_INT`s; the nonblocking ones are waited on at once), `barrier` (`m=0`), `reduce_scatter_block`, `allgather`, `alltoall`, `gather`, `scatter`, `scan`, `exscan`, and the nonblocking `ibcast`, `ibarrier`, `ireduce_scatter_block`, `iallgather`, `ialltoall`, `igather`, `iscatter`, `iscan`, `iexscan` (waited on at once), the v-operations `allgatherv`, `alltoallv`, `gatherv`, `scatterv`, `reduce_scatter` and their nonblocking forms (blocks from `counts=`) (`m` is the per-member block: `MPI_INT`s for reduce_scatter_block, bytes otherwise; the p-block buffers must fit `max-m`), `pingpong`, `info`, `quit`; one file per operation in `server/colls/` | — |
 | `m` | message size in bytes | — |
-| `counts` | v-operations: `uniform` (every block `m`), `linear` (block i ∝ i+1), `onebig` (member 0 holds half); `m` is the mean block, so the blocks total p·m; alltoallv sends the pattern rotated to start at the sender | `uniform` |
+| `counts` | v-operations: `uniform` (every block `m`), `linear` (block i ∝ i+1), `onebig` (member 0 holds half); `m` is the mean block, so the blocks total p·m; in alltoallv members i and j exchange block (i+j) mod p both ways (symmetric, as in-place needs) | `uniform` |
+| `inplace` | `1`: `MPI_IN_PLACE` where MPI allows it: the send buffer of allreduce, scan, exscan, reduce_scatter(_block), allgather(v), alltoall(v), the root's send buffer of reduce and gather(v), the root's receive buffer of scatter(v) (and the nonblocking forms); refused for the others | `0` |
 | `p`, `ppn` | sub-communicator size and ranks per node | the whole job |
 | `place` | which local ranks of a node: `nic` (§3.3), `spread`, `compact` | `nic` |
 | `nodes` | `OFF[:STRIDE]`: which nodes | `0:1` |

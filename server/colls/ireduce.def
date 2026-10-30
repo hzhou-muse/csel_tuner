@@ -2,7 +2,7 @@
 # MPI_Ireduce (MPI_SUM) of m/sizeof(int) MPI_INTs to root, waited on at once.
 
 subcode: _autoload
-    $global const struct coll coll_ireduce = { .name = "ireduce", .layout = LAYOUT_COMM, .elem = sizeof(int), .time_div = 1, .rooted = 1, .call = call_ireduce, .check = NULL }
+    $global const struct coll coll_ireduce = { .name = "ireduce", .layout = LAYOUT_COMM, .elem = sizeof(int), .time_div = 1, .rooted = 1, .inplace_ok = 1, .call = call_ireduce, .check = NULL }
     $list call_ireduce
 
 subcode:: coll_list
@@ -11,7 +11,7 @@ subcode:: coll_list
 fncode: call_ireduce(const struct req *rq, MPI_Comm c, int crank, char *s, char *r, long count): int
     $my MPI_Request req
     $my int rc
-    rc = MPI_Ireduce(s, r, count, MPI_INT, MPI_SUM, rq->root, c, &req)
+    rc = MPI_Ireduce(inplace_root_send(rq, crank, s), r, count, MPI_INT, MPI_SUM, rq->root, c, &req)
     $if rc == MPI_SUCCESS
         rc = MPI_Wait(&req, MPI_STATUS_IGNORE)
     return rc

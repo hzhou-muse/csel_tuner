@@ -2,11 +2,11 @@
 # MPI_Allreduce (MPI_SUM) of m/sizeof(int) MPI_INTs.
 
 subcode: _autoload
-    $global const struct coll coll_allreduce = { .name = "allreduce", .layout = LAYOUT_COMM, .elem = sizeof(int), .time_div = 1, .rooted = 0, .call = call_allreduce, .check = NULL }
+    $global const struct coll coll_allreduce = { .name = "allreduce", .layout = LAYOUT_COMM, .elem = sizeof(int), .time_div = 1, .rooted = 0, .inplace_ok = 1, .call = call_allreduce, .check = NULL }
     $list call_allreduce
 
 subcode:: coll_list
     coll_add(&coll_allreduce)
 
 fncode: call_allreduce(const struct req *rq, MPI_Comm c, int crank, char *s, char *r, long count): int
-    return MPI_Allreduce(s, r, count, MPI_INT, MPI_SUM, c)
+    return MPI_Allreduce(inplace_send(rq, s), r, count, MPI_INT, MPI_SUM, c)

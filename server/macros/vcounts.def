@@ -5,8 +5,10 @@
 #   uniform  every block m;
 #   linear   block i proportional to i + 1 (the largest about 2m);
 #   onebig   member 0 holds half the total, the others share the rest.
-# Integer remainders go to the last member. alltoallv sends the pattern
-# rotated to start at the sender, so every member sends and receives p * m.
+# Integer remainders go to the last member. In alltoallv members i and j
+# exchange block (i + j) mod p of the pattern in both directions: the
+# counts are symmetric, as MPI_IN_PLACE requires, and every member sends
+# and receives p * m.
 
 subcode: _autoload
     $enum(counts) COUNTS_UNIFORM, COUNTS_LINEAR, COUNTS_ONEBIG
@@ -53,8 +55,8 @@ fncode: vcounts_build(int pattern, long count, int p, int me)
     vc_counts[p - 1] += (int) (total - sum)
     $call prefix, vc_displs, vc_counts
     $for j=0:p
-        vc_scounts[j] = vc_counts[(j - me + p) % p]
-        vc_rcounts[j] = vc_counts[(me - j + p) % p]
+        vc_scounts[j] = vc_counts[(me + j) % p]
+        vc_rcounts[j] = vc_counts[(me + j) % p]
     $call prefix, vc_sdispls, vc_scounts
     $call prefix, vc_rdispls, vc_rcounts
 

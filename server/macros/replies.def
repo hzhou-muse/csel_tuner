@@ -58,7 +58,7 @@ fncode: reply_info(int seq)
     fprintf(out, "\",\"colls\":{")
     $for i=0:num_colls
         $my const struct coll *cl = coll_table[i]
-        fprintf(out, "%s\"%s\":{\"layout\":\"%s\",\"elem\":%ld,\"rooted\":%d,\"no_data\":%d,\"sbuf_p\":%d,\"rbuf_p\":%d,\"vcounts\":%d}", i ? "," : "", cl->name, cl->layout == LAYOUT_PAIR ? "pair" : "comm", cl->elem, cl->rooted, cl->no_data, cl->sbuf_p, cl->rbuf_p, cl->vcounts)
+        fprintf(out, "%s\"%s\":{\"layout\":\"%s\",\"elem\":%ld,\"rooted\":%d,\"no_data\":%d,\"sbuf_p\":%d,\"rbuf_p\":%d,\"vcounts\":%d,\"inplace_ok\":%d}", i ? "," : "", cl->name, cl->layout == LAYOUT_PAIR ? "pair" : "comm", cl->elem, cl->rooted, cl->no_data, cl->sbuf_p, cl->rbuf_p, cl->vcounts, cl->inplace_ok)
     fprintf(out, "},\"env\":{")
     extern char **environ;
     $my int first = 1
@@ -96,6 +96,8 @@ fncode: reply_result(const struct req *rq, const struct result *res)
         fprintf(out, "],")
     $if cl->vcounts
         fprintf(out, "\"counts\":\"%s\",", counts_names[rq->counts])
+    $if rq->inplace
+        fprintf(out, "\"inplace\":1,")
     $if spinup_us > 0
         fprintf(out, "\"spun_up\":%d,", res->spun_up)
     $if rq->ncvar

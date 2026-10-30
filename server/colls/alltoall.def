@@ -2,11 +2,11 @@
 # MPI_Alltoall of m bytes per pair of members: each member sends and receives p blocks.
 
 subcode: _autoload
-    $global const struct coll coll_alltoall = { .name = "alltoall", .layout = LAYOUT_COMM, .elem = 1, .time_div = 1, .sbuf_p = 1, .rbuf_p = 1, .call = call_alltoall }
+    $global const struct coll coll_alltoall = { .name = "alltoall", .layout = LAYOUT_COMM, .elem = 1, .time_div = 1, .sbuf_p = 1, .rbuf_p = 1, .inplace_ok = 1, .call = call_alltoall }
     $list call_alltoall
 
 subcode:: coll_list
     coll_add(&coll_alltoall)
 
 fncode: call_alltoall(const struct req *rq, MPI_Comm c, int crank, char *s, char *r, long count): int
-    return MPI_Alltoall(s, count, MPI_BYTE, r, count, MPI_BYTE, c)
+    return MPI_Alltoall(inplace_send(rq, s), count, MPI_BYTE, r, count, MPI_BYTE, c)
