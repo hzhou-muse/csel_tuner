@@ -1,7 +1,7 @@
 # ---- collectives -------------------------------------------------------
 # What the shared code needs to know about a measured operation. Each
 # operation is one file in colls/, included below, that defines its struct
-# coll and adds itself to coll_find(); requests name it (op=NAME), and
+# coll and registers it (coll_add); requests name it (op=NAME), and
 # nothing outside its file refers to a particular operation.
 
 include: colls/pingpong.def
@@ -40,7 +40,9 @@ include: colls/ireduce_scatter.def
 
 subcode: _autoload
     $include string
+    $include stdio
     $define(COLL_NAME_LEN) 32
+    $define(MAX_COLLS) 64
     # layout: LAYOUT_PAIR (two ranks, pair=a,b) or LAYOUT_COMM (p ranks);
     # elem: bytes per element (m is in bytes, a multiple of elem);
     # time_div: the reported time per call is the call time / time_div
@@ -61,10 +63,23 @@ subcode: _autoload
     # wrong elements over all ranks (NULL: check=1 is ignored)
     $struct(coll) int (*call)(const struct req *rq, MPI_Comm c, int crank, char *s, char *r, long count)
     $struct(coll) int (*check)(const struct req *rq, MPI_Comm c, int crank)
+    # the operations, registered by their files at startup
+    $global const struct coll *coll_table[MAX_COLLS], int num_colls
+    $(block:after_mpi_init)
+        $call @coll_list
+
+# Register an operation (from its file's subcode:: coll_list).
+fncode: coll_add(const struct coll *cl)
+    $if num_colls == MAX_COLLS
+        fprintf(stderr, "mpisrv: more than %d operations\n", MAX_COLLS)
+        MPI_Abort(MPI_COMM_WORLD, 1)
+    coll_table[num_colls++] = cl
 
 # The operation called name, or NULL.
 fncode: coll_find(const char *name): const struct coll *
-    $call @coll_cases
+    $for i=0:num_colls
+        $if !strcmp(name, coll_table[i]->name)
+            return coll_table[i]
     return NULL
 
 # The larger of the send and receive buffers of a request in bytes (m

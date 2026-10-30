@@ -5,9 +5,8 @@ subcode: _autoload
     $global const struct coll coll_ialltoall = { .name = "ialltoall", .layout = LAYOUT_COMM, .elem = 1, .sbuf_p = 1, .rbuf_p = 1, .time_div = 1, .call = call_ialltoall }
     $list call_ialltoall
 
-subcode:: coll_cases
-    $case !strcmp(name, coll_ialltoall.name)
-        return &coll_ialltoall
+subcode:: coll_list
+    coll_add(&coll_ialltoall)
 
 fncode: call_ialltoall(const struct req *rq, MPI_Comm c, int crank, char *s, char *r, long count): int
     $my MPI_Request req

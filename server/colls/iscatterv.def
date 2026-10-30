@@ -5,9 +5,8 @@ subcode: _autoload
     $global const struct coll coll_iscatterv = { .name = "iscatterv", .layout = LAYOUT_COMM, .elem = 1, .rooted = 1, .sbuf_p = 1, .vcounts = 1, .time_div = 1, .call = call_iscatterv }
     $list call_iscatterv
 
-subcode:: coll_cases
-    $case !strcmp(name, coll_iscatterv.name)
-        return &coll_iscatterv
+subcode:: coll_list
+    coll_add(&coll_iscatterv)
 
 fncode: call_iscatterv(const struct req *rq, MPI_Comm c, int crank, char *s, char *r, long count): int
     $my MPI_Request req

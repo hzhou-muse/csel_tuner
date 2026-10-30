@@ -5,9 +5,8 @@ subcode: _autoload
     $global const struct coll coll_ibcast = { .name = "ibcast", .layout = LAYOUT_COMM, .elem = 1, .rooted = 1, .time_div = 1, .call = call_ibcast }
     $list call_ibcast
 
-subcode:: coll_cases
-    $case !strcmp(name, coll_ibcast.name)
-        return &coll_ibcast
+subcode:: coll_list
+    coll_add(&coll_ibcast)
 
 fncode: call_ibcast(const struct req *rq, MPI_Comm c, int crank, char *s, char *r, long count): int
     $my MPI_Request req

@@ -55,7 +55,11 @@ fncode: reply_info(int seq)
             fprintf(out, "%s%d", n++ ? "," : "", socket_of[r])
     fprintf(out, "],\"topology_warnings\":\"")
     put_string(topo_warn)
-    fprintf(out, "\",\"env\":{")
+    fprintf(out, "\",\"colls\":{")
+    $for i=0:num_colls
+        $my const struct coll *cl = coll_table[i]
+        fprintf(out, "%s\"%s\":{\"layout\":\"%s\",\"elem\":%ld,\"rooted\":%d,\"no_data\":%d,\"sbuf_p\":%d,\"rbuf_p\":%d,\"vcounts\":%d}", i ? "," : "", cl->name, cl->layout == LAYOUT_PAIR ? "pair" : "comm", cl->elem, cl->rooted, cl->no_data, cl->sbuf_p, cl->rbuf_p, cl->vcounts)
+    fprintf(out, "},\"env\":{")
     extern char **environ;
     $my int first = 1
     $for char **e = environ; *e; e++

@@ -72,8 +72,11 @@ op=bcast m=65536 p=256 ppn=8 batches=5 sync=call cvar.MPIR_CVAR_BCAST_INTRA_ALGO
 | `root`, `cache`, `pair`, `tag` | root rank; hot/cold buffer; ping-pong ranks; free text echoed | |
 
 `op=info` returns the job: nodes, ranks per node, hosts, the MPICH version,
-the MPI-related environment, the topology checks, `cvar_switch`, and `mem`
-and `gpu` (the buffers' memory and the GPU runtime).
+the MPI-related environment, the topology checks, `cvar_switch`, `mem`
+and `gpu` (the buffers' memory and the GPU runtime), and `colls`: every
+operation with its properties (`layout` pair or comm, `elem` bytes per
+element, `rooted`, `no_data`, `sbuf_p`/`rbuf_p` for buffers of p blocks,
+`vcounts`), which collmodel reads instead of keeping its own table.
 
 **Device buffers.** With `mpisrv --mem device`, `sbuf` and `rbuf` are
 allocated once on the rank's GPU. The runtime is chosen at build time and

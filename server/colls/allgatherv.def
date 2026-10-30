@@ -5,9 +5,8 @@ subcode: _autoload
     $global const struct coll coll_allgatherv = { .name = "allgatherv", .layout = LAYOUT_COMM, .elem = 1, .rbuf_p = 1, .vcounts = 1, .time_div = 1, .call = call_allgatherv }
     $list call_allgatherv
 
-subcode:: coll_cases
-    $case !strcmp(name, coll_allgatherv.name)
-        return &coll_allgatherv
+subcode:: coll_list
+    coll_add(&coll_allgatherv)
 
 fncode: call_allgatherv(const struct req *rq, MPI_Comm c, int crank, char *s, char *r, long count): int
     return MPI_Allgatherv(s, vc_counts[crank], MPI_BYTE, r, vc_counts, vc_displs, MPI_BYTE, c)

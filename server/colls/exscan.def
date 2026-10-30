@@ -5,9 +5,8 @@ subcode: _autoload
     $global const struct coll coll_exscan = { .name = "exscan", .layout = LAYOUT_COMM, .elem = sizeof(int), .time_div = 1, .call = call_exscan }
     $list call_exscan
 
-subcode:: coll_cases
-    $case !strcmp(name, coll_exscan.name)
-        return &coll_exscan
+subcode:: coll_list
+    coll_add(&coll_exscan)
 
 fncode: call_exscan(const struct req *rq, MPI_Comm c, int crank, char *s, char *r, long count): int
     return MPI_Exscan(s, r, count, MPI_INT, MPI_SUM, c)

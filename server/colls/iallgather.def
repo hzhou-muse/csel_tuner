@@ -5,9 +5,8 @@ subcode: _autoload
     $global const struct coll coll_iallgather = { .name = "iallgather", .layout = LAYOUT_COMM, .elem = 1, .rbuf_p = 1, .time_div = 1, .call = call_iallgather }
     $list call_iallgather
 
-subcode:: coll_cases
-    $case !strcmp(name, coll_iallgather.name)
-        return &coll_iallgather
+subcode:: coll_list
+    coll_add(&coll_iallgather)
 
 fncode: call_iallgather(const struct req *rq, MPI_Comm c, int crank, char *s, char *r, long count): int
     $my MPI_Request req
