@@ -123,7 +123,8 @@ sys.path.insert(0, REPO)
 
 import numpy as np  # noqa: E402
 
-from csel_tuner.algos import Catalog  # noqa: E402
+from csel_tuner.algos import GENERAL, Catalog  # noqa: E402
+from csel_tuner.kinds import classify  # noqa: E402
 from csel_tuner.layouts import axis_values, size_grid  # noqa: E402
 from csel_tuner.model import Model, file_hash  # noqa: E402
 from csel_tuner.multi import Builder2, MultiSampler, known_sampler  # noqa: E402
@@ -520,22 +521,32 @@ def catalog_algs(a):
         return None, []
     cat = Catalog.load(a.catalog)
     cat.check(a.op)
+    for n in classify(cat.restriction_bits())[1]:
+        print("catalog: " + n, file=sys.stderr)
     skip = [x for x in a.exclude_algs.split(",") if x]
     return [x for x in cat.algorithms(a.op) if x.name not in skip], cat.restriction_bits()
 
 
 def alg_info(x, bits):
     return {"leaf": x.leaf, "restrictions": x.restrictions, "mask": x.mask(bits),
-            "inner": ["@".join(i) for i in x.inner]}
+            "inner": [str(i) for i in x.inner]}
+
+
+def missing_inner(x, text):
+    """The sections of a compositional algorithm's inner calls that the tuning file (its text) has
+    no tree for (name=<section>-auto), e.g. ibcast-intra for nb."""
+    names = set(json.loads(text)) if text else set()
+    return sorted({i.section for i in x.inner if "name=%s-auto" % i.section not in names})
 
 
 def compositional_names(a, algs):
     """The algorithms left for later: --compositional, default those with an inner key
-    (for files without the key: those restricted to hierarchical)."""
+    (for files without the key: those restricted to hierarchical; nb and buffer_swap have it always)."""
     if a.compositional is not None:
         return [x for x in a.compositional.split(",") if x]
-    has_inner = any(x.inner for x in algs)
-    return [x.name for x in algs if (x.inner if has_inner else "hierarchical" in x.restrictions)]
+    has_inner = any(x.inner for x in algs if x.name not in GENERAL)
+    return [x.name for x in algs if (x.inner if has_inner or x.name in GENERAL
+                                     else "hierarchical" in x.restrictions)]
 
 
 def restriction_sets(a, model, algs, probe):
@@ -703,9 +714,15 @@ def extend(a, model, measure, probe, inner_hash, clock, nodes, on_layout, stop_c
         sys.exit("the model has restriction sets: give --catalog to add to it")
     else:
         by_name = {}
+    inner_text = open(a.inner_selection).read() if a.inner_selection else None
     if a.algs == ["all"]:       # the catalog's algorithms the model lacks (compositional ones need their file)
         want = [x.name for x in algs if x.name not in m.algorithms and x.name not in m.left_out
                 and (not x.inner or a.inner_selection or a.replay)]
+        if not a.replay:
+            for name in [x for x in want if by_name[x].inner and missing_inner(by_name[x], inner_text)]:
+                print(f"{name}: not added, --inner-selection has no tree for "
+                      f"{', '.join(missing_inner(by_name[name], inner_text))}", file=sys.stderr)
+                want.remove(name)
     else:
         want = list(a.algs)
     for name in want:
@@ -715,6 +732,10 @@ def extend(a, model, measure, probe, inner_hash, clock, nodes, on_layout, stop_c
     if comp and not a.inner_selection and not a.replay:
         sys.exit(f"--algs: {', '.join(comp)} compositional: give --inner-selection (the tuning file of its "
                  "inner calls)")
+    miss = {x: missing_inner(by_name[x], inner_text) for x in comp if not a.replay}
+    for name in [x for x in comp if miss.get(x)]:
+        sys.exit(f"--algs: {name}: --inner-selection has no tree for its inner calls into "
+                 f"{', '.join(miss[name])} (name=<section>-auto); tune those first")
     sample = set()
     for name in want:
         if name not in m.algorithms:

@@ -151,8 +151,9 @@ python3 $CSEL_TUNER/groundtruth/gen_plans.py --set validate --out plans/validate
   release_gather set the single-node ones, the smp set those with several
   nodes and several ranks per node; compute them for the allocation with
   `python3 -c "import sys; sys.path.insert(0, '<repo>'); from csel_tuner.layouts import axis_values as a; N, P = <nodes>, <ppn>; L = [(n, q) for n in a(N) for q in a(P) if n * q > 1]; print(len(L), sum(n == 1 for n, _ in L), sum(n > 1 and q > 1 for n, q in L))"`), any
-  `precheck:` lines (an unrestricted algorithm other than `nb` failing is
-  unexpected), the `compositional (add them later ...)` line, the per-set
+  `precheck:` lines (an unrestricted algorithm failing is unexpected), any
+  `catalog:` lines (a restriction without a kind), the
+  `compositional (add them later ...)` line, the per-set
   lines and the total line (layouts, measurements, node-h, stop).
 - **add:** the `set` lines (a compositional or restricted algorithm adds a
   set, e.g. `bcast-intra-20` with smp), the `anchors:` line (ratio geomean

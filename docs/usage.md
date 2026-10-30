@@ -138,13 +138,16 @@ bin/collmodel --op bcast --algs all \
 ```
 
 - `--catalog` is the `coll_algorithms.txt` of the MPICH build under
-  test. `--algs all` takes every algorithm of the op from it (plus `nb`);
-  `--algs a,b,...` with `--catalog` takes those.
+  test. `--algs all` takes every algorithm of the op from it (plus the
+  general `nb` and `buffer_swap`); `--algs a,b,...` with `--catalog` takes
+  those. The compositional ones (`smp`, `nb`, `buffer_swap`) are left for
+  later. Restrictions csel_tuner has no kind for are reported as
+  `catalog:` lines (design.md §11).
 - The run starts with a precheck: one probe call (`--probe-m`, 1 KB) of each
   algorithm at each allowed layout. The server runs with
   `MPIR_CVAR_COLLECTIVE_FALLBACK=error`, so an algorithm whose restriction
   fails returns an error. An unrestricted algorithm that fails anywhere is
-  left out (e.g. `nb` without a nonblocking selection that works here).
+  left out.
 - Then one builder per restriction set: `r0` (unrestricted algorithms) on
   every layout, then each other set on the layouts where exactly its
   conditions hold (e.g. `800`, `release_gather` on single-node layouts). Each
@@ -221,6 +224,11 @@ bin/collmodel --model bcast.json --algs smp --inner-selection bcast_tuning.json 
 bin/colltree bcast2.json --out bcast_tuning2.json
 ```
 
+- The file must have a tree (`name=<section>-auto`) for the section of
+  every inner call: `nb` needs the nonblocking op's (`ibcast-intra-auto`
+  for bcast), `buffer_swap` the op's own, allreduce smp those of reduce,
+  allreduce and bcast. Otherwise collmodel refuses the algorithm and names
+  the missing sections; with `--algs all` it leaves such algorithms out.
 - It stops before measuring if an inner call could itself run a
   compositional algorithm (the two-stage check); needs pmodels/mpich#8048.
 - The model keeps the file (by hash, with its content); smp's measurements
@@ -486,6 +494,7 @@ python3 tests/test_resume.py     # a cut journal resumes to the same model; same
 python3 tests/test_restrict.py   # catalog, precheck, sets, dispatch; the builds with sets need replay data
 python3 tests/test_extend.py     # adding an algorithm and layouts to a model, resume; needs replay data
 python3 tests/test_gpu.py        # memory-kind restrictions; colltree merging host and device models
+python3 tests/test_kinds.py      # restriction kinds, variants; inner trees in --inner-selection
 ```
 
 They also run under pytest.

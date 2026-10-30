@@ -16,8 +16,45 @@ when its mask is a subset of S, so whatever runs in S also runs in any
 larger set. MPICH files from before restrictions became positive-only use
 `!c` (e.g. `!inplace`); each such restriction is read as a condition of its
 own, numbered after the listed ones (a CSEL tree can test it as `!c`).
+
+A compositional algorithm lists the collectives it calls through the
+selection as `inner` (Inner: section, communicator, conditions). The general
+algorithms nb (MPIR_Coll_nb, the blocking call through its nonblocking form)
+and buffer_swap (MPIR_Coll_buffer_swap, device buffers swapped for host
+buffers) run for every blocking collective; their inner calls are written
+relative to the caller ($coll, comm, [k=v]) and are filled in per collective.
+Catalogs without those inner keys get the same calls (GENERAL).
 """
 import re
+
+INNER_RE = re.compile(r"([\w$-]+)@(\w+)(?:\[(\w+)=([01])\])?$")
+# the general algorithms of a blocking collective: model name -> (function, inner calls if the catalog has none)
+GENERAL = {"nb": ("MPIR_Coll_nb", "i$coll-intra@comm"),
+           "buffer_swap": ("MPIR_Coll_buffer_swap", "$coll-intra@comm[gpu=0]")}
+
+
+class Inner:
+    """An inner call: the section it selects from, the communicator (node_comm, node_roots_comm,
+    or comm: the caller's own) and the restrictions it sets, e.g. {"gpu": 0}."""
+
+    def __init__(self, section, comm, cond=None):
+        self.section, self.comm, self.cond = section, comm, cond or {}
+
+    @classmethod
+    def parse(cls, text, coll):
+        m = INNER_RE.match(text.replace(" ", ""))
+        if not m:
+            raise ValueError("inner %s is not <section>@<communicator>[k=v]" % text)
+        cond = {m.group(3): int(m.group(4))} if m.group(3) else {}
+        return cls(m.group(1).replace("$coll", coll), m.group(2), cond)
+
+    def __eq__(self, other):
+        return (self.section, self.comm, self.cond) == (other.section, other.comm, other.cond)
+
+    def __str__(self):
+        return "%s@%s%s" % (self.section, self.comm, "".join("[%s=%d]" % kv for kv in self.cond.items()))
+
+    __repr__ = __str__
 
 
 class Alg:
@@ -26,8 +63,8 @@ class Alg:
         self.restrictions = [r.strip() for r in keys.get("restrictions", "").split(",") if r.strip()]
         self.extra_params = [p.strip() for p in keys.get("extra_params", "").split(",") if p.strip()]
         self.cvar_params = [p.strip() for p in keys.get("cvar_params", "").split(",") if p.strip()]
-        # inner: the (section, communicator) pairs a compositional algorithm calls through the selection
-        self.inner = [tuple(x.strip().split("@", 1)) for x in keys.get("inner", "").split(",") if x.strip()]
+        # inner: the calls a compositional algorithm makes through the selection
+        self.inner = [Inner.parse(x, op) for x in keys.get("inner", "").split(",") if x.strip()]
         coll = op[0].upper() + op[1:]
         self.leaf = keys.get("func_name") or "MPIR_%s_intra_%s" % (coll, name)
 
@@ -86,22 +123,20 @@ class Catalog:
         return cls(sections, conditions, indexed or None)
 
     def algorithms(self, op, kind="intra", nb=True):
-        """The op's algorithms in file order; nb (MPIR_Coll_nb: the blocking call
-        through its nonblocking form) is implied by the file for blocking ops."""
+        """The op's algorithms in file order, then for a blocking op the general ones:
+        nb (implied for every blocking op) and buffer_swap (if the file lists it). Both are
+        compositional: nb on the op's nonblocking tree, buffer_swap on its host tree."""
         sec = "%s-%s" % (op, kind)
         if sec not in self.sections:
             raise KeyError("no section %s in coll_algorithms.txt" % sec)
         out = [Alg(op, n, k) for n, k in self.sections[sec]]
-        if nb and kind == "intra" and not op.startswith("i"):
-            out.append(Alg(op, "nb", {"func_name": "MPIR_Coll_nb"}))
-        if kind == "intra" and not op.startswith("i") and any(n == "MPIR_Coll_buffer_swap" for n, _ in
-                                                              self.sections.get("general", [])):
-            # swaps device buffers for host buffers and continues in the op's own selection
-            # (inner "self"), which the launch's tuning file decides: measure it compositionally
-            keys = dict(self.sections["general"][[n for n, _ in self.sections["general"]].index(
-                "MPIR_Coll_buffer_swap")][1])
-            out.append(Alg(op, "buffer_swap", dict(keys, func_name="MPIR_Coll_buffer_swap",
-                                                   inner="%s-intra@self" % op)))
+        if kind == "intra" and not op.startswith("i"):
+            general = dict(self.sections.get("general", []))
+            for name, (func, inner) in GENERAL.items():
+                if (name == "nb" and nb) or func in general:
+                    keys = dict(general.get(func, {}))
+                    keys.setdefault("inner", inner)
+                    out.append(Alg(op, name, dict(keys, func_name=func)))
         return out
 
     def restriction_bits(self):

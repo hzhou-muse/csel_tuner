@@ -530,8 +530,33 @@ With #8048 a forced algorithm whose restriction fails on an internal
 sub-communicator falls back to the selection even with
 `MPIR_CVAR_COLLECTIVE_FALLBACK=error`, so forcing smp measures smp with its
 inner calls selected by the loaded stage-1 file.
-`nb` depends on the nonblocking selection, which is not tuned; it is
-measured in stage 1 under MPICH's default nonblocking selection.
+The general algorithms are compositional too. Their inner calls are
+written relative to the caller (pmodels/mpich#8073: `$coll`, `comm`, and
+`[k=v]` setting a restriction on the inner call), and an older catalog gets
+the same calls: `nb` runs `i<op>-intra@comm`, the nonblocking op's tree, so
+it is added only once the nonblocking op is tuned; `buffer_swap` runs
+`<op>-intra@comm[gpu=0]`, the op's own tree on host buffers. collmodel
+refuses a compositional algorithm whose inner sections have no tree
+(`name=<section>-auto`) in the loaded file, rather than measure it under
+MPICH's default selection for them.
+
+**Kinds of restrictions.** The catalog lists restrictions without saying
+how a tuner treats them; that is csel_tuner's policy, in
+`csel_tuner/kinds.py`. An *input* condition is one a request can set (a
+recipe: `inplace` by `MPI_IN_PLACE`, `builtin_op` and `commutative` by
+`MPI_SUM`); each assignment of a collective's input conditions is a variant,
+a model of its own, and an input condition applies wherever MPI allows it,
+whether or not an algorithm restricts on it. Assignments that contradict an
+implication (`builtin_op` without `commutative`) are skipped; those without
+a recipe (user ops) are not measured. *Launch* conditions (`gpu`,
+`gpu_coll`) are decided by how the ranks are started. Everything else is a
+*set* condition: the layout conditions (`pof2`, `hierarchical`, ...) and the
+black-box ones (`MPIDI_CH4_release_gather`), found by the precheck and
+forming restriction sets inside a model; conditions the requests always
+satisfy (`displs_ordered`, `block_regular`) come out true wherever an
+algorithm uses them. A restriction that is in none of these tables is taken
+as a set condition and reported, since it may be a new input condition that
+needs a recipe.
 
 **Validation** scores against the best of all feasible algorithms and
 MPICH's default, per restriction set (e.g. single-node / multi-node).
@@ -730,8 +755,9 @@ measurements predicts.
   model samples the given algorithms at the measured layouts and the given
   `--layouts`, but does not continue the layout loop (risk and random
   checks, the regret estimate) on its own.
-- **Compositional algorithms across ops** (allreduce smp): neither the
-  two-stage check nor the staleness check covers inner calls of another op.
+- **Compositional algorithms across ops** (allreduce smp, nb): neither the
+  two-stage check nor the staleness check covers inner calls of another op;
+  collmodel only checks that the loaded file has their trees.
 - **Collectives:** only bcast is wired through the builders (`OPS` in
   `bin/collmodel`, leaf parameters in `bin/colltree`); mpisrv also measures
   allreduce and ping-pong.

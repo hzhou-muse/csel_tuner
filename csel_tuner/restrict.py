@@ -24,16 +24,15 @@ plus the unrestricted ones (for the "call=r0" choice). See docs/design.md,
 section 11.
 """
 
+from .kinds import launch_known
+
 GPU, GPU_COLL = "gpu", "gpu_coll"       # MPICH's restrictions for device buffers (gpu_coll implies gpu)
 
 
 def mem_known(bits, mem):
     """(mask known true, mask known false) of the conditions the buffers'
-    memory kind ("host" or "device") decides."""
-    bit = lambda name: 1 << bits.index(name) if name in bits else 0
-    if mem == "device":
-        return bit(GPU), 0
-    return 0, bit(GPU) | bit(GPU_COLL)
+    memory kind ("host" or "device") decides (kinds.LAUNCH)."""
+    return launch_known(bits, mem)
 
 
 def infer_mask(ok, algs, bits):
@@ -105,7 +104,8 @@ def set_name(op, mask, mem="host"):
 def role_layout(lay, comm):
     """The layout of an inner call on `comm` from a call at `lay`."""
     n, ppn = lay
-    return {"node_comm": (1, ppn), "node_roots_comm": (n, 1), "self": (n, ppn)}[comm]
+    # "self": the caller's comm in models written before "comm"
+    return {"node_comm": (1, ppn), "node_roots_comm": (n, 1), "comm": (n, ppn), "self": (n, ppn)}[comm]
 
 
 def fixed_point(algs2, feas2, op):
@@ -113,22 +113,24 @@ def fixed_point(algs2, feas2, op):
     file for their inner calls when no inner call can run a compositional
     algorithm of its own op: (problems, notes). Checked on the precheck: a
     compositional algorithm that ran at an inner call's layout."""
-    # buffer_swap (inner "self") does not count: its inner call has host buffers, where it is restricted away
-    names = {a.name for a in algs2 if any(c != "self" for _, c in a.inner)}
+    # the algorithms whose curves depend on this op's tree: an inner call into it without conditions
+    # (buffer_swap's call has host buffers, where buffer_swap itself is restricted away; nb's goes to
+    # the nonblocking op's tree)
+    names = {a.name for a in algs2 if any(x.section == op + "-intra" and not x.cond for x in a.inner)}
     problems, notes = [], []
     for a in algs2:
-        for section, comm in a.inner:
-            if section != op + "-intra":
-                notes.append("%s: inner %s@%s is another op; not checked here" % (a.name, section, comm))
+        for x in a.inner:
+            if x.section != op + "-intra":
+                notes.append("%s: inner %s is another op; not checked here" % (a.name, x))
                 continue
-            if comm == "self":      # buffer_swap: its inner call has host buffers, so `gpu` fails there
+            if x.cond:          # buffer_swap: its inner call has host buffers, so `gpu` fails there
                 continue
             for lay, ok in sorted(feas2.items()):
                 if a.name not in ok:
                     continue
-                role = role_layout(lay, comm)
+                role = role_layout(lay, x.comm)
                 hit = sorted(names & feas2.get(role, set()))
                 if hit:
                     problems.append("%s at N=%d ppn=%d: its %s call (N=%d ppn=%d) can run %s" % (
-                        a.name, lay[0], lay[1], comm, role[0], role[1], ",".join(hit)))
+                        a.name, lay[0], lay[1], x.comm, role[0], role[1], ",".join(hit)))
     return problems, notes

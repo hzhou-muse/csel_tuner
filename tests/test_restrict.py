@@ -74,12 +74,53 @@ def test_catalog():
     assert algs[3].leaf == "MPIDI_POSIX_mpi_bcast_release_gather" and algs[0].leaf == "MPIR_Bcast_intra_binomial"
     assert algs[4].leaf == "MPIR_Coll_nb"
     assert algs[2].extra_params == ["tree_type", "k", "is_non_blocking"]
-    assert algs[1].inner == [("bcast-intra", "node_comm"), ("bcast-intra", "node_roots_comm")]
+    assert [str(x) for x in algs[1].inner] == ["bcast-intra@node_comm", "bcast-intra@node_roots_comm"]
     assert cat.conditions["comm_size"] and not cat.conditions["inplace"]
     # an index that is not the next one is an error
     try:
         catalog(CATALOG.replace("    3  - hierarchical", "    5  - hierarchical"))
         assert False, "accepted a wrong index"
+    except ValueError:
+        pass
+
+
+GENERAL = """
+general:
+    MPIR_Coll_nb
+        inner: i$coll-intra@comm
+    MPIR_Coll_buffer_swap
+        restrictions: gpu
+        inner: $coll-intra@comm[gpu=0]
+"""
+
+
+def test_general_inner():
+    """nb and buffer_swap: their inner calls filled in for the collective, from the catalog's
+    general section, and the same calls for a catalog without them (nb only: buffer_swap needs
+    the general entry)."""
+    from csel_tuner.restrict import fixed_point
+    text = CATALOG.replace("    4  - MPIDI_CH4_release_gather: MPIDI_POSIX_check_release_gather #if defined(MPIDI_CH4_SHM_POSIX)",
+                           "    4  - MPIDI_CH4_release_gather: MPIDI_POSIX_check_release_gather #if defined(MPIDI_CH4_SHM_POSIX)\n"
+                           "    5  - gpu:                      MPIR_Csel_is_gpu")
+    cat = catalog(text.replace("# ----\nbcast-intra", GENERAL + "# ----\nbcast-intra"))
+    algs = {a.name: a for a in cat.algorithms("bcast")}
+    assert [str(x) for x in algs["nb"].inner] == ["ibcast-intra@comm"]
+    assert [str(x) for x in algs["buffer_swap"].inner] == ["bcast-intra@comm[gpu=0]"]
+    assert algs["buffer_swap"].restrictions == ["gpu"] and algs["buffer_swap"].leaf == "MPIR_Coll_buffer_swap"
+    assert algs["buffer_swap"].inner[0].cond == {"gpu": 0} and algs["nb"].leaf == "MPIR_Coll_nb"
+    assert [a.name for a in catalog().algorithms("bcast")][-1] == "nb"
+    assert [str(x) for x in catalog().algorithms("bcast")[-1].inner] == ["ibcast-intra@comm"]
+    # neither nb (another op's tree) nor buffer_swap (host buffers) can make smp's inner calls stale
+    feas = {(2, 4): {"smp", "nb", "buffer_swap", "binomial"}, (1, 4): {"nb", "buffer_swap", "binomial"},
+            (2, 1): {"nb", "buffer_swap", "binomial"}}
+    problems, notes = fixed_point([algs["smp"], algs["nb"], algs["buffer_swap"]], feas, "bcast")
+    assert problems == [] and any("nb: inner ibcast-intra@comm is another op" in n for n in notes), notes
+    feas[(1, 4)].add("smp")
+    assert fixed_point([algs["smp"], algs["nb"]], feas, "bcast")[0]
+    try:
+        catalog(text.replace("# ----\nbcast-intra", GENERAL.replace("[gpu=0]", "[gpu]") + "# ----\nbcast-intra")
+                ).algorithms("bcast")
+        assert False, "accepted a malformed inner"
     except ValueError:
         pass
 
@@ -210,7 +251,8 @@ def test_two_set_replay():
                         "--budget-node-h", "0.5", "--out", model], check=True, capture_output=True)
         from csel_tuner.model import Model
         d = Model.load(model)
-        assert sorted(d.sets()) == [0, 16] and d.left_out == ["nb"] and "smp" not in d.algorithms
+        # nb and smp are compositional: added later with the tuning file of their inner calls
+        assert sorted(d.sets()) == [0, 16] and d.left_out == [] and not {"nb", "smp"} & set(d.algorithms)
         assert all(l[0] == 1 for l in d.sets()[16]) and set(d.curves["release_gather"]) <= set(d.sets()[16])
         subprocess.run([sys.executable, os.path.join(REPO, "bin", "colltree"), model, "--out", tuning],
                        check=True, capture_output=True)
@@ -269,6 +311,7 @@ def test_compositional_add_replay():
 
 if __name__ == "__main__":
     test_catalog()
+    test_general_inner()
     test_precheck_and_sets()
     test_old_style_negated_restriction()
     test_infer_complementary()
