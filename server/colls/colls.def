@@ -1,0 +1,24 @@
+# ---- collectives -------------------------------------------------------
+# What the shared code needs to know about a measured operation. Each
+# operation is one file in colls/ that defines its struct coll and adds
+# itself to coll_find(); requests name it (op=NAME), and nothing outside
+# its file refers to a particular operation.
+
+subcode: _autoload
+    $include string
+    $define(COLL_NAME_LEN) 32
+    # layout: LAYOUT_PAIR (two ranks, pair=a,b) or LAYOUT_COMM (p ranks);
+    # elem: bytes per element (m is in bytes, a multiple of elem);
+    # time_div: the reported time per call is the call time / time_div
+    # (2: ping-pong reports half the round trip); rooted: takes root=
+    $struct(coll) const char *name, int layout, long elem, double time_div, int rooted
+    # call: one call on buffers s and r of count elements, returns the MPI
+    # error code; check: verify the result once and return the number of
+    # wrong elements over all ranks (NULL: check=1 is ignored)
+    $struct(coll) int (*call)(const struct req *rq, MPI_Comm c, int crank, char *s, char *r, long count)
+    $struct(coll) int (*check)(const struct req *rq, MPI_Comm c, int crank)
+
+# The operation called name, or NULL.
+fncode: coll_find(const char *name): const struct coll *
+    $call @coll_cases
+    return NULL

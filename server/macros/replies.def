@@ -73,12 +73,14 @@ fncode: reply_info(int seq)
     free(hosts)
 
 fncode: reply_result(const struct req *rq, const struct result *res)
-    fprintf(out, "{\"status\":\"%s\",\"seq\":%d,\"op\":\"%s\",\"m\":%ld,", res->failed ? "error" : "ok", rq->seq, op_names[rq->op], res->m)
-    $if rq->op == OP_PINGPONG
+    $my const struct coll *cl
+    cl = coll_find(rq->coll)
+    fprintf(out, "{\"status\":\"%s\",\"seq\":%d,\"op\":\"%s\",\"m\":%ld,", res->failed ? "error" : "ok", rq->seq, cl->name, res->m)
+    $if rq->layout == LAYOUT_PAIR
         fprintf(out, "\"pair\":[%d,%d],", rq->pair[0], rq->pair[1])
     $else
         fprintf(out, "\"p\":%d,\"ppn\":%d,\"place\":\"%s\",\"nodes\":\"%d:%d\",", rq->p, rq->ppn, place_names[rq->place], rq->node_off, rq->node_stride)
-    $if rq->op == OP_BCAST || rq->op == OP_REDUCE || rq->op == OP_IREDUCE
+    $if cl->rooted
         fprintf(out, "\"root\":%d,", rq->root)
     $if res->check_err >= 0 && !res->failed
         fprintf(out, "\"check\":\"%s\",\"check_err\":%d,", res->check_err ? "fail" : "ok", res->check_err)

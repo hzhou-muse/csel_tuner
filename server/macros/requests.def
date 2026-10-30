@@ -7,19 +7,16 @@ subcode: _autoload
     $define(TAG_LEN) 64
     $define(MAX_CVARS) 4
     $define(CVAR_LEN) 64
-    $enum(op) OP_NONE, OP_INFO, OP_QUIT, OP_PINGPONG, OP_ALLREDUCE, OP_BCAST, OP_REDUCE, OP_IREDUCE, OP_IALLREDUCE
-    $global const char *op_names[] = { "none", "info", "quit", "pingpong", "allreduce", "bcast", "reduce", "ireduce", "iallreduce" }
-    $struct(req) int op, int seq, long m, int p, int ppn
+    # OP_COLL: a measurement of the operation named coll (colls/), whose
+    # layout kind (LAYOUT_*) parse copies into layout
+    $enum(op) OP_NONE, OP_INFO, OP_QUIT, OP_COLL
+    $struct(req) int op, char coll[COLL_NAME_LEN], int layout, int seq, long m, int p, int ppn
     $struct(req) int place, int node_off, int node_stride, int pair[2]   # place: PLACE_*
     $struct(req) int root, int batches, double target_us, int cold, int check
     # sync_call: sync=call, a barrier before every call; probe: probe=1, the untimed call only
     $struct(req) int sync_call, int probe, char tag[TAG_LEN]
     # cvar.NAME=VALUE tokens, applied for this request only
     $struct(req) int ncvar, char cvar_name[MAX_CVARS][CVAR_LEN], char cvar_val[MAX_CVARS][CVAR_LEN]
-
-# the reductions sum MPI_INTs; m is in bytes, a multiple of sizeof(int)
-fncode: is_reduction(enum op op): int
-    return op == OP_ALLREDUCE || op == OP_REDUCE || op == OP_IREDUCE || op == OP_IALLREDUCE
 
 fncode: tag_ok(const char *s): int
     $for ; *s; s++
@@ -48,9 +45,7 @@ fncode: parse(char *line, struct req *rq): const char *
             return err
         *val++ = '\0'
         $if !strcmp(tok, "op")
-            $for int i = 1; i < (int) (sizeof(op_names) / sizeof(op_names[0])); i++
-                $if !strcmp(val, op_names[i])
-                    rq->op = i
+            $call parse_op
             $if rq->op == OP_NONE
                 snprintf(err, sizeof(err), "unknown op: %.64s", val)
                 return err
@@ -103,6 +98,20 @@ fncode: parse(char *line, struct req *rq): const char *
     $call check_request
     return NULL
 
+    # op=info, op=quit, or an operation of colls/; an unknown name leaves
+    # rq->op as it was
+    subcode: parse_op
+        $my const struct coll *cl
+        cl = coll_find(val)
+        $if !strcmp(val, "info")
+            rq->op = OP_INFO
+        $elif !strcmp(val, "quit")
+            rq->op = OP_QUIT
+        $elif cl
+            rq->op = OP_COLL
+            strcpy(rq->coll, cl->name)
+            rq->layout = cl->layout
+
     # cvar.NAME=VALUE: validated with the MPI_T handle (cvars.def)
     subcode: parse_cvar
         $my const char *cerr = NULL
@@ -141,11 +150,11 @@ fncode: parse(char *line, struct req *rq): const char *
             return "check=1 needs host buffers (the server runs with --mem device)"
         $if rq->cold && !cold_ok
             return "cache=cold needs the server started with --cold"
-        $if rq->op == OP_PINGPONG
+        $if rq->op == OP_COLL && rq->layout == LAYOUT_PAIR
             $my int a = rq->pair[0], int b = rq->pair[1]
             $if a == b || a < 0 || b < 0 || a >= world_size || b >= world_size
                 return "pair must be two different world ranks"
-        $if is_reduction(rq->op) || rq->op == OP_BCAST
+        $if rq->op == OP_COLL && rq->layout == LAYOUT_COMM
             $if rq->p < 1 || rq->p > world_size || rq->ppn < 1 || rq->p % rq->ppn
                 return "need 1 <= p <= world size and p a multiple of ppn"
             $if rq->node_off < 0 || rq->node_stride < 1 || rq->ppn > min_ppn || rq->node_off + (rq->p / rq->ppn - 1) * rq->node_stride >= num_nodes

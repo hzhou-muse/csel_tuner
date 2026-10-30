@@ -1,0 +1,18 @@
+# ---- iallreduce --------------------------------------------------------
+# MPI_Iallreduce (MPI_SUM) of m/sizeof(int) MPI_INTs, waited on at once.
+
+subcode: _autoload
+    $global const struct coll coll_iallreduce = { .name = "iallreduce", .layout = LAYOUT_COMM, .elem = sizeof(int), .time_div = 1, .rooted = 0, .call = call_iallreduce, .check = NULL }
+    $list call_iallreduce
+
+subcode:: coll_cases
+    $case !strcmp(name, coll_iallreduce.name)
+        return &coll_iallreduce
+
+fncode: call_iallreduce(const struct req *rq, MPI_Comm c, int crank, char *s, char *r, long count): int
+    $my MPI_Request req
+    $my int rc
+    rc = MPI_Iallreduce(s, r, count, MPI_INT, MPI_SUM, c, &req)
+    $if rc == MPI_SUCCESS
+        rc = MPI_Wait(&req, MPI_STATUS_IGNORE)
+    return rc

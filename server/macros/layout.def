@@ -5,6 +5,7 @@
 subcode: _autoload
     $define(MAX_COMMS) 512
     $enum(place) PLACE_COMPACT, PLACE_SPREAD, PLACE_NIC
+    $enum(layout) LAYOUT_COMM, LAYOUT_PAIR
     $global const char *place_names[] = { "compact", "spread", "nic" }
     $struct(comm_entry) struct req key, MPI_Comm comm  # key: layout fields only
 
@@ -21,7 +22,7 @@ fncode: place_local(int j, const struct req *rq): int
 
 # Whether world rank r belongs to the request's sub-communicator.
 fncode: is_member(int r, const struct req *rq): int
-    $if rq->op == OP_PINGPONG
+    $if rq->layout == LAYOUT_PAIR
         return r == rq->pair[0] || r == rq->pair[1]
     $my int rel = node_of[r] - rq->node_off
     $if rel < 0 || rel % rq->node_stride || rel / rq->node_stride >= rq->p / rq->ppn
@@ -33,7 +34,7 @@ fncode: is_member(int r, const struct req *rq): int
 
 # World rank of the sub-communicator's rank 0.
 fncode: comm_root(const struct req *rq): int
-    $if rq->op == OP_PINGPONG
+    $if rq->layout == LAYOUT_PAIR
         return rq->pair[0]
     $for r=0:world_size
         $if is_member(r, rq)
@@ -41,9 +42,9 @@ fncode: comm_root(const struct req *rq): int
     return 0
 
 fncode: same_layout(const struct req *a, const struct req *b): int
-    $if (a->op == OP_PINGPONG) != (b->op == OP_PINGPONG)
+    $if (a->layout == LAYOUT_PAIR) != (b->layout == LAYOUT_PAIR)
         return 0
-    $if a->op == OP_PINGPONG
+    $if a->layout == LAYOUT_PAIR
         return a->pair[0] == b->pair[0] && a->pair[1] == b->pair[1]
     return a->p == b->p && a->ppn == b->ppn && a->place == b->place && a->node_off == b->node_off && a->node_stride == b->node_stride
 
@@ -58,7 +59,7 @@ fncode: get_comm(const struct req *rq): MPI_Comm
     $my int color = MPI_UNDEFINED, int key = world_rank
     $if is_member(world_rank, rq)
         color = 0
-        $if rq->op == OP_PINGPONG
+        $if rq->layout == LAYOUT_PAIR
             key = world_rank == rq->pair[0] ? 0 : 1
     $my MPI_Comm c
     MPI_Comm_split(MPI_COMM_WORLD, color, key, &c)

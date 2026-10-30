@@ -15,18 +15,18 @@ subcode: _autoload
 
 # k calls of the operation; returns local elapsed seconds (with sync=call,
 # the sum of the calls' own times, barriers excluded)
-fncode: run(const struct req *rq, MPI_Comm c, int crank, long count, int k): double
-    $my long bytes = is_reduction(rq->op) ? count * (long) sizeof(int) : count
+fncode: run(const struct req *rq, const struct coll *cl, MPI_Comm c, int crank, long count, int k): double
+    $my long bytes = count * cl->elem
     $my double t0 = MPI_Wtime(), double sum = 0
     $for i=0:k
         $my long off = rq->cold ? (i * bytes) % max_m : 0
         $if rq->sync_call
             MPI_Barrier(c)
             t0 = MPI_Wtime()
-        # ping-pong and bcast use one buffer, like bench/pingpong.c
+        # the call uses s, r or both (colls/)
         $my char *s = sbuf + off, char *r = rbuf + off
         $my int rc
-        rc = call_op(rq, c, crank, s, r, count)
+        rc = cl->call(rq, c, crank, s, r, count)
         $if rc != MPI_SUCCESS && !call_err
             call_err = rc
         $if rq->sync_call
@@ -89,22 +89,6 @@ fncode: batch_extremes(const double *e, double *emax, double *emin, int n, MPI_C
             emin[j] = v < emin[j] ? v : emin[j]
     free(all)
 
-# Broadcast a pattern once and count wrong bytes over all ranks.
-fncode: check_bcast(const struct req *rq, MPI_Comm c, int crank): int
-    $my long n = rq->m
-    $my unsigned char *b = (unsigned char *) sbuf
-    $for long i = 0; i < n; i++
-        b[i] = crank == rq->root ? (unsigned char) (i * 131 + rq->seq + 7) : 0
-    $my int rc
-    rc = MPI_Bcast(b, n, MPI_BYTE, rq->root, c)
-    $if rc != MPI_SUCCESS && !call_err
-        call_err = rc
-    $my int bad = 0
-    $for long i = 0; i < n; i++
-        $if b[i] != (unsigned char) (i * 131 + rq->seq + 7)
-            bad++
-    return (int) agree(c, bad, AGREE_SUM)
-
 # Whether a call has failed on any member; comm rank 0 gets the message. The
 # failure is agreed on with agree(), which the CVARs of the measured operation
 # do not affect.
@@ -124,7 +108,9 @@ fncode: any_failed(MPI_Comm c, int crank, struct result *res): int
 fncode: measure(const struct req *rq, MPI_Comm c, struct result *res)
     $my int crank
     MPI_Comm_rank(c, &crank)
-    $my long count = is_reduction(rq->op) ? rq->m / (long) sizeof(int) : rq->m
+    $my const struct coll *cl
+    cl = coll_find(rq->coll)
+    $my long count = rq->m / cl->elem
     $my double w0 = MPI_Wtime()
 
     call_err = MPI_SUCCESS
@@ -132,10 +118,10 @@ fncode: measure(const struct req *rq, MPI_Comm c, struct result *res)
     res->msg[0] = '\0'
     res->k = 0
     res->spread = 0
-    res->m = is_reduction(rq->op) ? count * (long) sizeof(int) : count
-    res->check_err = rq->check && rq->op == OP_BCAST ? check_bcast(rq, c, crank) : -1
+    res->m = count * cl->elem
+    res->check_err = rq->check && cl->check ? cl->check(rq, c, crank) : -1
     # first-call exclusion
-    run(rq, c, crank, count, 1)
+    run(rq, cl, c, crank, count, 1)
     $if any_failed(c, crank, res) || rq->probe
         res->wall_us = (MPI_Wtime() - w0) * 1e6
         return
@@ -144,33 +130,33 @@ fncode: measure(const struct req *rq, MPI_Comm c, struct result *res)
     # calibration
     $while 1
         $my double t
-        t = run(rq, c, crank, count, k)
+        t = run(rq, cl, c, crank, count, k)
         t = agree(c, t, AGREE_MAX)
         $if t * 1e6 >= rq->target_us / 2 || k >= (1 << 20)
             break
         k *= 2
     # warmup
-    run(rq, c, crank, count, k)
+    run(rq, cl, c, crank, count, k)
 
     $my double e[MAX_BATCHES], double emax[MAX_BATCHES], double emin[MAX_BATCHES]
     MPI_Barrier(c)
     $my double t0 = MPI_Wtime()
     $for j=0:rq->batches
         $my double b
-        b = run(rq, c, crank, count, k)
+        b = run(rq, cl, c, crank, count, k)
         e[j] = rq->sync_call ? (j ? e[j - 1] : 0.0) + b : MPI_Wtime() - t0
     batch_extremes(e, emax, emin, rq->batches, c, crank)
     $if any_failed(c, crank, res)
         return
     $if crank == 0
         $my double div
-        div = rq->op == OP_PINGPONG ? 2.0 * k : k
+        div = cl->time_div * k
         $for j=0:rq->batches
             res->t_us[j] = (emax[j] - (j ? emax[j - 1] : 0.0)) / div * 1e6
         $my int last = rq->batches - 1
         res->spread = (emax[last] - emin[last]) / emax[last]
         res->k = k
-        res->m = is_reduction(rq->op) ? count * (long) sizeof(int) : count
+        res->m = count * cl->elem
         res->wall_us = (MPI_Wtime() - w0) * 1e6
 
     # MPISRV_SPINUP_US: run the operation before calibration
@@ -186,6 +172,6 @@ fncode: measure(const struct req *rq, MPI_Comm c, struct result *res)
             $my double s0 = MPI_Wtime()
             $my int more = 1
             $while more
-                run(rq, c, crank, count, 1)
+                run(rq, cl, c, crank, count, 1)
                 more = (MPI_Wtime() - s0) * 1e6 < spinup_us
                 more = (int) agree(c, more, AGREE_ROOT)

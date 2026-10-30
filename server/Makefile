@@ -28,7 +28,7 @@ endif
 mpisrv: mpisrv.c gpu.c gpu.h
 	$(MPICC) $(CFLAGS) $(GPU_CFLAGS) -o $@ mpisrv.c gpu.c $(GPU_LIBS)
 
-mpisrv.c: mpisrv.def $(wildcard macros/*.def)
+mpisrv.c: mpisrv.def $(wildcard macros/*.def colls/*.def)
 	mydef_page mpisrv.def
 
 clean:

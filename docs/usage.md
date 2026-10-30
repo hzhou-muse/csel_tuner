@@ -22,7 +22,7 @@ and load the resulting tuning file into MPICH. For how it works, see
 | `bin/collmodel` | builds models: one algorithm (v1) or several (v2) |
 | `bin/colltree` | turns a v2 model into an MPICH tuning file (v3) |
 | `csel_tuner/` | the Python package (interpolation, server driver, builders) |
-| `server/` | the benchmark server (`mpisrv.def`, `macros/*.def`, `gpu.c`) and its Makefile |
+| `server/` | the benchmark server (`mpisrv.def`, `macros/*.def`, `colls/*.def` with one file per measured operation, `gpu.c`) and its Makefile |
 | `launch/` | `config.sh` (launch function) and `sites/<site>.sh` (node topology, MPICH path) |
 | `replay/` | replay of recorded measurements, for developing the builders (no data shipped) |
 | `groundtruth/` | batch-mode tools: dense ground-truth plans, a runner, checks |
@@ -37,7 +37,7 @@ make MPICC=/path/to/mpich/bin/mpicc
 
 This builds `server/mpisrv`, the default `--server` of `bin/collmodel`.
 The server is written in MyDef: `make` first generates `mpisrv.c` from
-`mpisrv.def` and `macros/*.def` with `mydef_page`, so the build machine needs
+`mpisrv.def`, `macros/*.def` and `colls/*.def` with `mydef_page`, so the build machine needs
 [MyDef](https://github.com/hzhou/MyDef) and its C module
 ([output_c](https://github.com/hzhou/output_c)). `gpu.c` is plain C.
 
