@@ -3,7 +3,7 @@
 # of m bytes and receives its reduced block of m bytes.
 
 subcode: _autoload
-    $global const struct coll coll_reduce_scatter_block = { .name = "reduce_scatter_block", .layout = LAYOUT_COMM, .elem = sizeof(int), .time_div = 1, .sbuf_p = 1, .inplace_ok = 1, .call = call_reduce_scatter_block }
+    $global const struct coll coll_reduce_scatter_block = { .name = "reduce_scatter_block", .layout = LAYOUT_COMM, .elem = sizeof(int), .time_div = 1, .sbuf_p = 1, .inplace_ok = 1, .check = check_sum_split, .call = call_reduce_scatter_block }
     $list call_reduce_scatter_block
 
 subcode:: coll_list

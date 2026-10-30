@@ -101,6 +101,7 @@ include: macros/cvars.def
 include: macros/idle.def
 include: macros/measure.def
 include: macros/helpers.def
+include: macros/check.def
 include: macros/replies.def
 include: macros/batch.def
 include: macros/colls.def

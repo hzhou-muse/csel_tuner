@@ -12,14 +12,16 @@ subcode:: coll_list
 fncode: call_bcast(const struct req *rq, MPI_Comm c, int crank, char *s, char *r, long count): int
     return MPI_Bcast(s, count, MPI_BYTE, rq->root, c)
 
-# Broadcast a pattern once and count wrong bytes over all ranks.
+# Broadcast a pattern once and count wrong bytes over all ranks (bcast and
+# ibcast).
 fncode: check_bcast(const struct req *rq, MPI_Comm c, int crank): int
     $my long n = rq->m
     $my unsigned char *b = (unsigned char *) sbuf
     $for long i = 0; i < n; i++
         b[i] = crank == rq->root ? (unsigned char) (i * 131 + rq->seq + 7) : 0
+    # through the collective's own call (bcast, ibcast), on sbuf
     $my int rc
-    rc = MPI_Bcast(b, n, MPI_BYTE, rq->root, c)
+    rc = coll_find(rq->coll)->call(rq, c, crank, sbuf, rbuf, n)
     $if rc != MPI_SUCCESS && !call_err
         call_err = rc
     $my int bad = 0

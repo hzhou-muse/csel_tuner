@@ -2,7 +2,7 @@
 # MPI_Iexscan (MPI_SUM) of m/sizeof(int) MPI_INTs, waited on at once.
 
 subcode: _autoload
-    $global const struct coll coll_iexscan = { .name = "iexscan", .layout = LAYOUT_COMM, .elem = sizeof(int), .time_div = 1, .inplace_ok = 1, .call = call_iexscan }
+    $global const struct coll coll_iexscan = { .name = "iexscan", .layout = LAYOUT_COMM, .elem = sizeof(int), .time_div = 1, .inplace_ok = 1, .check = check_exscan, .call = call_iexscan }
     $list call_iexscan
 
 subcode:: coll_list

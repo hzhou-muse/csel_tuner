@@ -68,7 +68,7 @@ op=bcast m=65536 p=256 ppn=8 batches=5 sync=call cvar.MPIR_CVAR_BCAST_INTRA_ALGO
 | `nodes` | `OFF[:STRIDE]`: which nodes | `0:1` |
 | `batches`, `target_us` | timed batches; calibration target per batch | 3, 1000 |
 | `sync` | `batch`: calls back to back; `call`: a barrier before each call, each timed alone | `batch` |
-| `check` | `1`: broadcast a pattern and verify it on every rank | `0` |
+| `check` | `1`: run the operation once on known data before the measurement and verify the result on every rank; `check_err` is the number of wrong elements over all ranks. Every operation with data (not barrier, ibarrier, pingpong), through the measured call, with `counts=` and `inplace=1` (`server/macros/check.def`) | `0` |
 | `cvar.<NAME>` | MPI_T control variable for this request only (§3.5), up to 4 | — |
 | `root`, `cache`, `pair`, `tag` | root rank; hot/cold buffer; ping-pong ranks; free text echoed | |
 

@@ -2,7 +2,7 @@
 # MPI_Ireduce (MPI_SUM) of m/sizeof(int) MPI_INTs to root, waited on at once.
 
 subcode: _autoload
-    $global const struct coll coll_ireduce = { .name = "ireduce", .layout = LAYOUT_COMM, .elem = sizeof(int), .time_div = 1, .rooted = 1, .inplace_ok = 1, .call = call_ireduce, .check = NULL }
+    $global const struct coll coll_ireduce = { .name = "ireduce", .layout = LAYOUT_COMM, .elem = sizeof(int), .time_div = 1, .rooted = 1, .inplace_ok = 1, .call = call_ireduce, .check = check_sum }
     $list call_ireduce
 
 subcode:: coll_list

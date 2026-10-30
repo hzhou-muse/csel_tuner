@@ -1,0 +1,206 @@
+# ---- check -------------------------------------------------------------
+# check=1: run the operation once on known data, before the measurement,
+# and count the wrong elements over all members (agree). The inputs follow
+# patterns of (source rank, destination rank, element), so every member
+# computes the expected output without communication. A collective's file
+# points its struct coll's check at the checker of its shape; the checker
+# runs the collective through cl->call, the measured code path, with the
+# request's counts= blocks and inplace=1.
+#   data movement, bytes:  check_byte(src, dst, i)
+#   reductions, MPI_INTs:  check_int(src, i) = src + 1 + i % 7, small
+#                          enough that sums over the members fit an int
+
+subcode: _autoload
+    $include string
+    $list check_copy_from_root, check_copy_to_root, check_copy_to_all, check_exchange
+    $list check_sum, check_sum_split, check_scan, check_exscan
+    $list check_byte, check_int, blk_count, blk_displ, xs_count, xs_displ, xr_count, xr_displ
+
+fncode: check_byte(int src, int dst, long i, int seq): unsigned char
+    return (unsigned char) (src * 31 + dst * 17 + i * 131 + seq + 7)
+
+fncode: check_int(int src, long i): int
+    return src + 1 + (int) (i % 7)
+
+# Member j's block (elements): uniform count, or the counts= pattern.
+fncode: blk_count(const struct coll *cl, long count, int j): long
+    return cl->vcounts ? vc_counts[j] : count
+
+fncode: blk_displ(const struct coll *cl, long count, int j): long
+    return cl->vcounts ? vc_displs[j] : count * j
+
+# alltoall(v): the block this member sends to (xs) or receives from (xr) j.
+fncode: xs_count(const struct coll *cl, long count, int j): long
+    return cl->vcounts ? vc_scounts[j] : count
+
+fncode: xs_displ(const struct coll *cl, long count, int j): long
+    return cl->vcounts ? vc_sdispls[j] : count * j
+
+fncode: xr_count(const struct coll *cl, long count, int j): long
+    return cl->vcounts ? vc_rcounts[j] : count
+
+fncode: xr_displ(const struct coll *cl, long count, int j): long
+    return cl->vcounts ? vc_rdispls[j] : count * j
+
+# scatter(v): the root's block j for member j.
+fncode: check_copy_from_root(const struct req *rq, MPI_Comm c, int crank): int
+    $call check_begin
+    $call check_bytes
+    $if crank == rq->root
+        $for j=0:p
+            $for long i = 0; i < blk_count(cl, count, j); i++
+                sb[blk_displ(cl, count, j) + i] = check_byte(rq->root, j, i, rq->seq)
+    memset(rb, 0, total)
+    $call check_call
+    # in place the root receives nothing
+    $if !(rq->inplace && crank == rq->root)
+        $for long i = 0; i < blk_count(cl, count, crank); i++
+            $if rb[i] != check_byte(rq->root, crank, i, rq->seq)
+                bad++
+    $call check_end
+
+# gather(v): every member's block at the root; in place the root's own
+# block is already in place in the receive buffer.
+fncode: check_copy_to_root(const struct req *rq, MPI_Comm c, int crank): int
+    $call check_begin
+    $call check_bytes
+    $for long i = 0; i < blk_count(cl, count, crank); i++
+        sb[i] = check_byte(crank, 0, i, rq->seq)
+    memset(rb, 0, total)
+    $if rq->inplace && crank == rq->root
+        memcpy(rb + blk_displ(cl, count, crank), sb, blk_count(cl, count, crank))
+    $call check_call
+    $if crank == rq->root
+        $call check_blocks
+    $call check_end
+
+# allgather(v): every member's block on every member; in place the own
+# block is already in place in the receive buffer.
+fncode: check_copy_to_all(const struct req *rq, MPI_Comm c, int crank): int
+    $call check_begin
+    $call check_bytes
+    $for long i = 0; i < blk_count(cl, count, crank); i++
+        sb[i] = check_byte(crank, 0, i, rq->seq)
+    memset(rb, 0, total)
+    $if rq->inplace
+        memcpy(rb + blk_displ(cl, count, crank), sb, blk_count(cl, count, crank))
+    $call check_call
+    $call check_blocks
+    $call check_end
+
+# alltoall(v): block j from member j is j's block for this member; in place
+# the outgoing blocks are in the receive buffer.
+fncode: check_exchange(const struct req *rq, MPI_Comm c, int crank): int
+    $call check_begin
+    $call check_bytes
+    $for j=0:p
+        $for long i = 0; i < xs_count(cl, count, j); i++
+            sb[xs_displ(cl, count, j) + i] = check_byte(crank, j, i, rq->seq)
+    memset(rb, 0, total)
+    $if rq->inplace
+        $for j=0:p
+            $for long i = 0; i < xr_count(cl, count, j); i++
+                rb[xr_displ(cl, count, j) + i] = check_byte(crank, j, i, rq->seq)
+    $call check_call
+    $for j=0:p
+        $for long i = 0; i < xr_count(cl, count, j); i++
+            $if rb[xr_displ(cl, count, j) + i] != check_byte(j, crank, i, rq->seq)
+                bad++
+    $call check_end
+
+# allreduce, reduce (at the root): the element-wise sum over the members.
+fncode: check_sum(const struct req *rq, MPI_Comm c, int crank): int
+    $call check_begin
+    $call check_ints
+    $my int *in
+    in = rq->inplace && (!cl->rooted || crank == rq->root) ? ri : si
+    $for long i = 0; i < count; i++
+        in[i] = check_int(crank, i)
+    $call check_call
+    $if !cl->rooted || crank == rq->root
+        $for long i = 0; i < count; i++
+            $if ri[i] != p * (p + 1) / 2 + p * (int) (i % 7)
+                bad++
+    $call check_end
+
+# reduce_scatter(_block): this member's block of the sum of all p blocks;
+# in place the whole input is in the receive buffer.
+fncode: check_sum_split(const struct req *rq, MPI_Comm c, int crank): int
+    $call check_begin
+    $call check_ints
+    $my long total = count * p
+    $my int *in
+    in = rq->inplace ? ri : si
+    $for long i = 0; i < total; i++
+        in[i] = check_int(crank, i)
+    $call check_call
+    $my long d
+    d = blk_displ(cl, count, crank)
+    $for long k = 0; k < blk_count(cl, count, crank); k++
+        $if ri[k] != p * (p + 1) / 2 + p * (int) ((d + k) % 7)
+            bad++
+    $call check_end
+
+# scan: the sum over members 0 ... crank.
+fncode: check_scan(const struct req *rq, MPI_Comm c, int crank): int
+    $call check_begin
+    $call check_ints
+    $call check_prefix_fill
+    $for long i = 0; i < count; i++
+        $if ri[i] != (crank + 1) * (crank + 2) / 2 + (crank + 1) * (int) (i % 7)
+            bad++
+    $call check_end
+
+# exscan: the sum over members 0 ... crank - 1 (undefined on member 0).
+fncode: check_exscan(const struct req *rq, MPI_Comm c, int crank): int
+    $call check_begin
+    $call check_ints
+    $call check_prefix_fill
+    $if crank > 0
+        $for long i = 0; i < count; i++
+            $if ri[i] != crank * (crank + 1) / 2 + crank * (int) (i % 7)
+                bad++
+    $call check_end
+
+# ---- the parts every checker shares ----
+# cl, count (elements per block), p, bad
+subcode: check_begin
+    $my const struct coll *cl
+    cl = coll_find(rq->coll)
+    $my long count = rq->m / cl->elem
+    $my int p, int bad = 0
+    MPI_Comm_size(c, &p)
+
+# data movement: total bytes over all blocks, the buffers as bytes
+subcode: check_bytes
+    $my long total = count * p
+    $my unsigned char *sb = (unsigned char *) sbuf
+    $my unsigned char *rb = (unsigned char *) rbuf
+
+# reductions: the buffers as MPI_INTs
+subcode: check_ints
+    $my int *si = (int *) sbuf
+    $my int *ri = (int *) rbuf
+
+subcode: check_call
+    $my int rc
+    rc = cl->call(rq, c, crank, sbuf, rbuf, count)
+    $if rc != MPI_SUCCESS && !call_err
+        call_err = rc
+
+subcode: check_end
+    return (int) agree(c, bad, AGREE_SUM)
+
+# block j of the receive buffer holds member j's block
+subcode: check_blocks
+    $for j=0:p
+        $for long i = 0; i < blk_count(cl, count, j); i++
+            $if rb[blk_displ(cl, count, j) + i] != check_byte(j, 0, i, rq->seq)
+                bad++
+
+subcode: check_prefix_fill
+    $my int *in
+    in = rq->inplace ? ri : si
+    $for long i = 0; i < count; i++
+        in[i] = check_int(crank, i)
+    $call check_call

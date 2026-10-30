@@ -2,7 +2,7 @@
 # MPI_Scan (MPI_SUM) of m/sizeof(int) MPI_INTs.
 
 subcode: _autoload
-    $global const struct coll coll_scan = { .name = "scan", .layout = LAYOUT_COMM, .elem = sizeof(int), .time_div = 1, .inplace_ok = 1, .call = call_scan }
+    $global const struct coll coll_scan = { .name = "scan", .layout = LAYOUT_COMM, .elem = sizeof(int), .time_div = 1, .inplace_ok = 1, .check = check_scan, .call = call_scan }
     $list call_scan
 
 subcode:: coll_list
