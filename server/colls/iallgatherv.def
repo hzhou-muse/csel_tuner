@@ -1,0 +1,18 @@
+# ---- iallgatherv -------------------------------------------------------
+# MPI_Iallgatherv of the counts= blocks (bytes, mean m), waited on at once.
+
+subcode: _autoload
+    $global const struct coll coll_iallgatherv = { .name = "iallgatherv", .layout = LAYOUT_COMM, .elem = 1, .rbuf_p = 1, .vcounts = 1, .time_div = 1, .call = call_iallgatherv }
+    $list call_iallgatherv
+
+subcode:: coll_cases
+    $case !strcmp(name, coll_iallgatherv.name)
+        return &coll_iallgatherv
+
+fncode: call_iallgatherv(const struct req *rq, MPI_Comm c, int crank, char *s, char *r, long count): int
+    $my MPI_Request req
+    $my int rc
+    rc = MPI_Iallgatherv(s, vc_counts[crank], MPI_BYTE, r, vc_counts, vc_displs, MPI_BYTE, c, &req)
+    $if rc == MPI_SUCCESS
+        rc = MPI_Wait(&req, MPI_STATUS_IGNORE)
+    return rc

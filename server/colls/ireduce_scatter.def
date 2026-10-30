@@ -1,0 +1,18 @@
+# ---- ireduce_scatter ---------------------------------------------------
+# MPI_Ireduce_scatter (MPI_SUM) of MPI_INTs over the counts= blocks (mean m bytes), waited on at once.
+
+subcode: _autoload
+    $global const struct coll coll_ireduce_scatter = { .name = "ireduce_scatter", .layout = LAYOUT_COMM, .elem = sizeof(int), .sbuf_p = 1, .vcounts = 1, .time_div = 1, .call = call_ireduce_scatter }
+    $list call_ireduce_scatter
+
+subcode:: coll_cases
+    $case !strcmp(name, coll_ireduce_scatter.name)
+        return &coll_ireduce_scatter
+
+fncode: call_ireduce_scatter(const struct req *rq, MPI_Comm c, int crank, char *s, char *r, long count): int
+    $my MPI_Request req
+    $my int rc
+    rc = MPI_Ireduce_scatter(s, r, vc_counts, MPI_INT, MPI_SUM, c, &req)
+    $if rc == MPI_SUCCESS
+        rc = MPI_Wait(&req, MPI_STATUS_IGNORE)
+    return rc

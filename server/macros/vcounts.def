@@ -1,0 +1,64 @@
+# ---- vcounts -----------------------------------------------------------
+# Per-member counts of the v-operations (allgatherv, alltoallv, gatherv,
+# scatterv, reduce_scatter), from the request's counts= pattern. m is the
+# mean block, so the blocks always total p * m bytes:
+#   uniform  every block m;
+#   linear   block i proportional to i + 1 (the largest about 2m);
+#   onebig   member 0 holds half the total, the others share the rest.
+# Integer remainders go to the last member. alltoallv sends the pattern
+# rotated to start at the sender, so every member sends and receives p * m.
+
+subcode: _autoload
+    $enum(counts) COUNTS_UNIFORM, COUNTS_LINEAR, COUNTS_ONEBIG
+    $global const char *counts_names[] = { "uniform", "linear", "onebig" }
+    # in elements, per comm rank: vc_counts/vc_displs the pattern (the
+    # blocks of an allgatherv, gatherv, scatterv or reduce_scatter);
+    # vc_scounts/vc_sdispls, vc_rcounts/vc_rdispls this member's alltoallv
+    $global int *vc_counts, int *vc_displs, int *vc_scounts, int *vc_sdispls, int *vc_rcounts, int *vc_rdispls
+    # the arrays are sized for the largest communicator, MPI_COMM_WORLD
+    $(block:after_mpi_init)
+        vc_counts = malloc(sizeof(int) * world_size)
+        vc_displs = malloc(sizeof(int) * world_size)
+        vc_scounts = malloc(sizeof(int) * world_size)
+        vc_sdispls = malloc(sizeof(int) * world_size)
+        vc_rcounts = malloc(sizeof(int) * world_size)
+        vc_rdispls = malloc(sizeof(int) * world_size)
+    $(block:before_mpi_finalize)
+        free(vc_counts)
+        free(vc_displs)
+        free(vc_scounts)
+        free(vc_sdispls)
+        free(vc_rcounts)
+        free(vc_rdispls)
+
+# The counts= value, or -1.
+fncode: parse_counts(const char *val): int
+    $for i=0:3
+        $if !strcmp(val, counts_names[i])
+            return i
+    return -1
+
+# Fill the arrays for p members with a mean block of count elements; me is
+# this member's comm rank. Before the measured calls, outside the timing.
+fncode: vcounts_build(int pattern, long count, int p, int me)
+    $my long total = count * p, long sum = 0
+    $for i=0:p
+        $if pattern == COUNTS_LINEAR
+            vc_counts[i] = (int) (2 * count * (i + 1) / (p + 1))
+        $elif pattern == COUNTS_ONEBIG && p > 1
+            vc_counts[i] = (int) (i == 0 ? total / 2 : (total - total / 2) / (p - 1))
+        $else
+            vc_counts[i] = (int) count
+        sum += vc_counts[i]
+    vc_counts[p - 1] += (int) (total - sum)
+    $call prefix, vc_displs, vc_counts
+    $for j=0:p
+        vc_scounts[j] = vc_counts[(j - me + p) % p]
+        vc_rcounts[j] = vc_counts[(me - j + p) % p]
+    $call prefix, vc_sdispls, vc_scounts
+    $call prefix, vc_rdispls, vc_rcounts
+
+    subcode: prefix(displs, counts)
+        $(displs)[0] = 0
+        $for i=1:p
+            $(displs)[i] = $(displs)[i - 1] + $(counts)[i - 1]

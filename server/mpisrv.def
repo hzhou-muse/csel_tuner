@@ -104,6 +104,7 @@ include: macros/helpers.def
 include: macros/replies.def
 include: macros/batch.def
 include: macros/colls.def
+include: macros/vcounts.def
 
 page: mpisrv, srv_frame
     $call parse_options

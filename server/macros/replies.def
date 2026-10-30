@@ -90,6 +90,8 @@ fncode: reply_result(const struct req *rq, const struct result *res)
             $if node_of[r] == rq->node_off && is_member(r, rq)
                 fprintf(out, "%s%d", n++ ? "," : "", local_of[r])
         fprintf(out, "],")
+    $if cl->vcounts
+        fprintf(out, "\"counts\":\"%s\",", counts_names[rq->counts])
     $if spinup_us > 0
         fprintf(out, "\"spun_up\":%d,", res->spun_up)
     $if rq->ncvar

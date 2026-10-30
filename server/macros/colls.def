@@ -27,6 +27,16 @@ include: colls/igather.def
 include: colls/iscatter.def
 include: colls/iscan.def
 include: colls/iexscan.def
+include: colls/allgatherv.def
+include: colls/alltoallv.def
+include: colls/gatherv.def
+include: colls/scatterv.def
+include: colls/reduce_scatter.def
+include: colls/iallgatherv.def
+include: colls/ialltoallv.def
+include: colls/igatherv.def
+include: colls/iscatterv.def
+include: colls/ireduce_scatter.def
 
 subcode: _autoload
     $include string
@@ -43,7 +53,9 @@ subcode: _autoload
     # and reduce_scatter_block). Fields left out of a collective's
     # initializer are 0.
     $struct(coll) const char *name, int layout, long elem, double time_div, int rooted, int self_sync, int no_data
-    $struct(coll) int sbuf_p, int rbuf_p
+    # vcounts: a v-operation, its counts from counts= (vcounts.def), built
+    # before the measurement
+    $struct(coll) int sbuf_p, int rbuf_p, int vcounts
     # call: one call on buffers s and r of count elements, returns the MPI
     # error code; check: verify the result once and return the number of
     # wrong elements over all ranks (NULL: check=1 is ignored)

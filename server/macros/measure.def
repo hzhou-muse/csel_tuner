@@ -64,6 +64,10 @@ fncode: measure(const struct req *rq, MPI_Comm c, struct result *res)
     res->k = 0
     res->spread = 0
     res->m = count * cl->elem
+    $if cl->vcounts
+        $my int csize
+        MPI_Comm_size(c, &csize)
+        vcounts_build(rq->counts, count, csize, crank)
     res->check_err = rq->check && cl->check ? cl->check(rq, c, crank) : -1
     # first-call exclusion
     run(rq, cl, c, crank, count, 1)
