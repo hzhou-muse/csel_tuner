@@ -61,6 +61,15 @@ def device_model(conditions=BITS):
         conditions)
 
 
+def gpu_model():
+    """Launch kind gpu (MPIR_CVAR_ENABLE_GPU_COLL=1): gpu and gpu_coll hold at every layout."""
+    m = device_model()
+    m = model("gpu", m.algorithms, {l: GPU | GPU_COLL for l in LAYOUTS}, {
+        "binomial": (10.0, 1e3, lambda l: True), "scatter": (30.0, 1e4, lambda l: True),
+        "buffer_swap": (40.0, 1e6, lambda l: True), "ipc_read": (0.5, 1e7, lambda l: l[0] == 1)})
+    return m
+
+
 def colltree(argv):
     from importlib.machinery import SourceFileLoader
     ct = SourceFileLoader("colltree", os.path.join(REPO, "bin", "colltree")).load_module()
@@ -184,6 +193,23 @@ def test_warmup_no_zero():
     assert min(warmup_sizes(1)) == 1
 
 
+def test_gpu_launch():
+    """A unit of launch kind gpu: both device conditions drop out of its masks, so its
+    subtree is one set, reached by the gpu condition."""
+    with tempfile.TemporaryDirectory() as tmp:
+        h, g, t = (os.path.join(tmp, x) for x in ("h.json", "g.json", "t.json"))
+        host_model().save(h)
+        gpu_model().save(g)
+        colltree([h, g, "--out", t, "--node-aware"])
+        out = json.load(open(t))
+        assert sorted(out) == ["name=bcast-intra-0", "name=bcast-intra-auto", "name=bcast-intra-gpu-0"], sorted(out)
+        assert out["name=bcast-intra-auto"] == {"gpu": "call=bcast-intra-gpu-0", "any": "call=bcast-intra-0"}
+        trees = {k[len("name="):]: v for k, v in out.items()}
+        x = {"p": 2, "m": 1, "N": 1, "ppn": 2, "pof2": 1.0,
+             "cond": {"hierarchical": False, "gpu": True, "gpu_coll": True}}
+        assert json_choice(trees["bcast-intra-auto"], x, trees, BITS) == "MPIDI_IPC_bcast_ipc_read"
+
+
 if __name__ == "__main__":
     test_mem_known()
     test_model_mem_roundtrip()
@@ -191,4 +217,5 @@ if __name__ == "__main__":
     test_merge_errors()
     test_precheck_known()
     test_warmup_no_zero()
+    test_gpu_launch()
     print("ok")

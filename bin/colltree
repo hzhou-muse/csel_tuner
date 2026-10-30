@@ -63,8 +63,9 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 import numpy as np  # noqa: E402
 
+from csel_tuner.kinds import is_device  # noqa: E402
 from csel_tuner.model import ModelFile, parse_sel, tag_str  # noqa: E402
-from csel_tuner.restrict import GPU, role_layout, set_name, set_prefix  # noqa: E402
+from csel_tuner.restrict import GPU, GPU_COLL, role_layout, set_name, set_prefix  # noqa: E402
 from csel_tuner.single import is_pof2  # noqa: E402
 from csel_tuner.tree import fit_tree, json_choice, json_tree, prune_to, select  # noqa: E402
 
@@ -309,12 +310,14 @@ def main(argv=None):
                      + "; ".join(tag_str(u.tags) for u in f.units) + ")")
         models += units
         paths += [path] * len(units)
+    # the host unit, and one of device buffers (launch kind gpu or device)
     by_mem = {}
     for path, m in zip(paths, models):
-        if m.mem in by_mem:
-            sys.exit(f"{path}: a second unit of {m.mem} buffers ({tag_str(m.tags)}; the first: "
-                     f"{tag_str(by_mem[m.mem][1].tags)} in {by_mem[m.mem][0]}); select one with --unit")
-        by_mem[m.mem] = (path, m)
+        slot = "device" if is_device(m.mem) else "host"
+        if slot in by_mem:
+            sys.exit(f"{path}: a second unit of {slot} buffers ({tag_str(m.tags)}; the first: "
+                     f"{tag_str(by_mem[slot][1].tags)} in {by_mem[slot][0]}); select one with --unit")
+        by_mem[slot] = (path, m)
     if "host" not in by_mem:
         sys.exit("no model of host buffers (the run-time fallback)")
     op = models[0].op
@@ -327,6 +330,9 @@ def main(argv=None):
             sys.exit(f"{path}: a model of device buffers, but its catalog has no {GPU} restriction "
                      "(MPICH cannot tell device buffers apart)")
         drop_bit(m, 1 << m.conditions.index(GPU))
+        # launch kind gpu: gpu_coll holds in the whole unit too (MPIR_CVAR_ENABLE_GPU_COLL=1)
+        if m.mem == "gpu" and GPU_COLL in m.conditions:
+            drop_bit(m, 1 << m.conditions.index(GPU_COLL))
     feats = ["N", "ppn", "p", "m", "pof2"] if a.node_aware else ["p", "m", "pof2"]
     params = {k: dict(v) for k, v in PARAMS.get(op, {}).items()}
     for kv in a.param:
@@ -391,7 +397,9 @@ def main(argv=None):
             n, q = lay
             mk = m.masks.get(lay, 0)
             cond = {b: bool(mk >> k & 1) for k, b in enumerate(m.conditions)}
-            cond[GPU] = m.mem == "device"   # left out of a device model's masks (drop_bit)
+            cond[GPU] = is_device(m.mem)    # left out of a device model's masks (drop_bit)
+            if m.mem == "gpu":
+                cond[GPU_COLL] = True
             return {"p": n * q, "m": size, "N": n, "ppn": q, "pof2": float(is_pof2(n * q)), "cond": cond}
         found, notes = stale(m, S, out, x_of, a.stale_tol)
         for n in notes:

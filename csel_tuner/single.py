@@ -99,7 +99,7 @@ class GridSampler:
         size, or None; init: grid indices of the coarse pass (default every
         `step`, both ends included)."""
         self.measure, self.sizes = measure, np.asarray(sizes)
-        self.lx = np.log2(self.sizes)
+        self.lx = np.log2(np.maximum(self.sizes, 1))     # barrier's one size is m=0
         self.prior = np.zeros(len(sizes)) if prior is None else np.asarray(prior)
         self.tau_acc, self.tau_jump, self.w_min, self.budget = tau_acc, tau_jump, w_min, budget
         self.vals = {}  # grid index -> list of log2 T

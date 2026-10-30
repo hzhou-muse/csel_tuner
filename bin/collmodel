@@ -5,8 +5,10 @@ One algorithm (--alg, builder v1, csel_tuner/single.py; model file
 collmodel/1) or several, sampled for selection into a unit of a model file
 (collmodel/5, csel_tuner/model.py: the measurements and the fit derived
 from them; needs the per-request algorithm switch, MPISRV_CVAR_SWITCH=1).
-The unit is named by its tags (--op, --inplace, --counts, --mem); --out
-keeps its other units, and --merge combines model files.
+The unit is named by its tags (--op, --inplace, --counts, --launch); --out
+keeps its other units, and --merge combines model files. --colls and
+--launch measure several units in one run, one after another, one server
+launch per launch kind, a journal per unit in the --log directory.
 
 Create a model, live through the benchmark server, one launch of the whole
 allocation (launch/config.sh with the site file launch/sites/<site>.sh):
@@ -85,8 +87,8 @@ The starting state is blank: the allocation (nodes, ranks per node) and the
 largest size come from the server's info reply. Allowed layouts are N and
 ppn in {1, 2, 3, 4, 6, 8, 12, 16, 24, ...} up to the allocation, plus the
 allocation's own N and ppn; sizes are 4 per octave from 1 B to max_m. The
-builder samples until its estimate meets the target or the node-hour budget
-is spent, then writes the model file.
+builder samples until its estimate meets the target, every layout is
+measured, or the --budget-h is spent, then writes the model file.
 
 Interruptions:
 - --log FILE keeps a journal: one JSON line per measurement, flushed after
@@ -109,9 +111,11 @@ Interruptions:
   model from the finished layouts.
 """
 import argparse
+import copy
 import datetime
 import hashlib
 import json
+import math
 import os
 import shlex
 import signal
@@ -126,7 +130,7 @@ sys.path.insert(0, REPO)
 import numpy as np  # noqa: E402
 
 from csel_tuner.algos import GENERAL, Catalog  # noqa: E402
-from csel_tuner.kinds import classify  # noqa: E402
+from csel_tuner.kinds import RECIPES, classify, is_device, is_v  # noqa: E402
 from csel_tuner.layouts import axis_values, size_grid  # noqa: E402
 from csel_tuner.model import FORMAT, FORMAT_V4, Model, ModelFile, default_tags, file_hash, tag_key, tag_str  # noqa: E402,E501
 from csel_tuner.multi import Builder2, MultiSampler, known_sampler  # noqa: E402
@@ -284,8 +288,9 @@ def resume_check(jobs, job):
     return None, dropped
 
 
-def live(a):
-    """(send, make_req, probe, layouts, sizes, nodes, ppn_max, max_m, meta, server)"""
+def live(a, shared=None):
+    """(send, make_req, probe, layouts, sizes, nodes, ppn_max, max_m, meta, server). shared: {"srv": the
+    server of this launch kind, started by the launch kind's first unit, reused by the others}."""
     from csel_tuner.server import Server, ServerError
     # a forced algorithm whose restriction fails must fail, not run the default
     env = {"MPIR_CVAR_COLLECTIVE_FALLBACK": "error"}
@@ -295,12 +300,17 @@ def live(a):
     several = len(a.algs) > 1 or bool(a.catalog) or bool(a.model)
     if a.switch != "request" and not several:
         env[OPS[a.op]] = a.algs[0]  # the launch's algorithm
-    srv = Server(launcher=shlex.split(a.launcher), env=env, max_m=a.max_m, timeout=a.timeout,
-                 warmup=(a.op,), server=a.server, args=["--mem", a.mem] if a.mem != "host" else [])
+    mem = "device" if is_device(a.launch) else "host"
+    srv = (shared or {}).get("srv")
+    if srv is None:
+        srv = Server(launcher=shlex.split(a.launcher), env=env, max_m=a.max_m, timeout=a.timeout,
+                     warmup=(), server=a.server, args=["--mem", mem] if mem != "host" else [])
+        if shared is not None:
+            shared["srv"] = srv
     info = srv.world
-    if info.get("mem", "host") != a.mem:
+    if info.get("mem", "host") != mem:
         srv.close()
-        sys.exit(f"--mem {a.mem}: the server reports {info.get('mem', 'host')} buffers")
+        sys.exit(f"launch {a.launch}: the server reports {info.get('mem', 'host')} buffers, not {mem}")
     by_request = a.switch == "request" or several or (a.switch == "auto" and info.get("cvar_switch") == 1)
     if by_request and info.get("cvar_switch") != 1:
         srv.close()
@@ -326,6 +336,9 @@ def live(a):
     if a.inplace and not coll.get("inplace_ok"):
         srv.close()
         sys.exit(f"--inplace: {a.op} takes no MPI_IN_PLACE")
+    # this unit's op, swept once now and again after a server restart
+    srv.warmup_ops = (a.op,)
+    srv.warmup(a.op)
     counts = {"counts": a.counts} if coll.get("vcounts") else {}
     if a.inplace:
         counts["inplace"] = 1
@@ -827,7 +840,7 @@ def extend(a, model, measure, probe, inner_hash, clock, nodes, on_layout, stop_c
             if why:
                 run["stop"] = why
                 break
-            if ext.clock_spent() >= a.budget_node_h:
+            if ext.clock_spent() >= a.budget:
                 run["stop"] = "budget"
                 break
             if lay in new_lays:
@@ -986,6 +999,11 @@ def import_v3(a):
 
 def parse_args(argv):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--colls", "--coll", metavar="COLL[:VARIANT],...", help="the units to measure, one after "
+                    "another: COLL alone (not in place, --counts), COLL:all (every in-place setting the "
+                    "collective takes), or COLL:K=V+K=V with inplace=0|1 and counts=uniform|linear|onebig; "
+                    "e.g. allreduce:all,alltoallv:counts=linear,bcast. With several units: --algs all, and --log "
+                    "is a directory with one journal per unit")
     ap.add_argument("--op", default="bcast", help="the collective to measure: an operation of the server "
                     "(its info record lists them), e.g. bcast, allreduce, allgather, alltoallv (default bcast)")
     ap.add_argument("--counts", default="uniform", choices=["uniform", "linear", "onebig"],
@@ -1020,7 +1038,11 @@ def parse_args(argv):
     ap.add_argument("--probe-m", type=int, default=1024, help="message size of the precheck calls")
     ap.add_argument("--inner-selection", metavar="JSON", help="the tuning file loaded in the launch "
                     "(MPIR_CVAR_COLL_SELECTION_JSON_FILE) for a compositional algorithm's inner calls")
-    ap.add_argument("--budget-node-h", type=float, default=2.0, help="stop after this many node-hours, all jobs")
+    ap.add_argument("--budget-h", type=float, help="per unit: stop after this many wall-clock hours, all jobs "
+                    "(default: none, the builder stops at its target, a plateau or when every layout is measured; "
+                    "--deadline and SIGTERM stop a job, --resume continues)")
+    ap.add_argument("--budget-node-h", type=float, help="per unit, in node-hours of the allocation (deprecated: "
+                    "--budget-h; replay experiments use it)")
     ap.add_argument("--tau-med", type=float, default=0.05, help="v1: stop when the estimated median error is below this")
     ap.add_argument("--tau-p90", type=float, default=0.20, help="v1: ... and the estimated p90 error is below this")
     ap.add_argument("--tau-gm", type=float, default=1.02, help="v2: stop when the estimated geomean regret is below this")
@@ -1045,9 +1067,12 @@ def parse_args(argv):
                    help="select the algorithm per request (cvar.*, needs the runtime CVAR switch) or for the "
                         "launch (environment); auto: per request when the server supports it")
     g.add_argument("--server", default=os.path.join(REPO, "server", "mpisrv"), help="mpisrv binary")
-    g.add_argument("--mem", default="host", choices=["host", "device"], help="the buffers' memory: device "
-                   "runs mpisrv --mem device (built with GPU=...), one GPU per rank; with --site, MEM=device "
-                   "(launch/config.sh). A model has one memory kind")
+    g.add_argument("--launch", metavar="KIND,...", help="launch kinds, one server launch each, its units one "
+                   "after another: host (host buffers), gpu (mpisrv --mem device, built with GPU=..., one GPU "
+                   "per rank, MPIR_CVAR_ENABLE_GPU_COLL=1), device (device buffers without GPU_COLL); with "
+                   "--site, LAUNCH=<kind> for launch/config.sh (default: --mem)")
+    g.add_argument("--mem", default="host", choices=["host", "device"], help="the launch kind when --launch is "
+                   "not given: host or device (the older device kind)")
     g.add_argument("--max-m", type=int, default=1 << 26)
     g.add_argument("--batches", type=int, default=5)
     g.add_argument("--sync", default="call", choices=["call", "batch"])
@@ -1075,14 +1100,29 @@ def parse_args(argv):
         ap.error("--layouts needs --model")
     if a.algs == ["all"] and not a.catalog:
         ap.error("--algs all needs --catalog")
+    # the units: (launch kind, coll, inplace, counts), launch kinds outermost
+    kinds = a.launch.split(",") if a.launch else [a.mem]
+    for k in kinds:
+        if k not in ("host", "gpu", "device"):
+            ap.error(f"--launch {k}: not host, gpu or device")
+    try:
+        specs = parse_colls(a.colls, a.counts) if a.colls else [(a.op, a.inplace, a.counts)]
+    except ValueError as e:
+        ap.error(f"--colls: {e}")
+    a.units = [(k,) + s for k in kinds for s in specs]
+    a.launch = kinds[0]
+    if len(a.units) > 1:
+        if a.algs != ["all"]:
+            ap.error("several units (--colls, --launch): --algs all (each collective's algorithms in --catalog)")
+        if a.switch == "launch":
+            ap.error("several units: algorithms per request (--switch request or auto)")
     if a.site:
         if not (a.nodes and a.ppn):
             ap.error("--site needs --nodes and --ppn")
         os.environ["SITE"] = a.site
-        os.environ["MEM"] = a.mem
         cfg = os.path.join(REPO, "launch", "config.sh")
         a.launcher = "bash -c 'source %s && launch %d %d \"$0\" \"$@\"'" % (cfg, a.nodes, a.ppn)
-    if a.replay and a.mem != "host":
+    if a.replay and a.units != [("host",) + a.units[0][1:]]:
         ap.error("--replay: the recorded data is of host buffers")
     if not a.replay and not a.launcher:
         ap.error("--site/--nodes/--ppn or --launcher is required unless --replay")
@@ -1098,16 +1138,100 @@ def on_sigterm(signum, frame):
     raise Terminated()
 
 
+def parse_colls(text, counts="uniform"):
+    """--colls -> [(coll, inplace, counts)]."""
+    inplace_colls = RECIPES["inplace"][0]
+    out = []
+    for item in filter(None, text.split(",")):
+        coll, _, spec = item.partition(":")
+        if spec == "all":
+            out += [(coll, ip, counts) for ip in ((False, True) if coll in inplace_colls else (False,))]
+            continue
+        ip, cnt = False, counts
+        for kv in filter(None, spec.split("+")):
+            k, eq, v = kv.partition("=")
+            if k == "inplace" and v in ("0", "1"):
+                ip = v == "1"
+                if ip and coll not in inplace_colls:
+                    raise ValueError(f"{item}: {coll} takes no MPI_IN_PLACE")
+            elif k == "counts" and v in ("uniform", "linear", "onebig"):
+                if not is_v(coll):
+                    raise ValueError(f"{item}: counts= is for the v-operations")
+                cnt = v
+            else:
+                raise ValueError(f"{item}: {kv} is not inplace=0|1 or counts=uniform|linear|onebig")
+        out.append((coll, ip, cnt))
+    if len(set(out)) < len(out):
+        raise ValueError("a unit given twice")
+    return out
+
+
+def unit_slug(tags):
+    return tag_str(tags).replace(" ", "_")
+
+
+def journal_done(path):
+    """Whether a unit's journal ends with its "done" record (the unit's model was written)."""
+    if not os.path.exists(path):
+        return False
+    with open(path) as f:
+        for line in f:
+            if line.startswith('{"time"') and '"done": true' in line:
+                return True
+    return False
+
+
 def main(argv=None):
     a = parse_args(argv)
     if a.merge:
         return merge(a)
     if a.import_:
         return import_v3(a)
-    t_start = time.time()
+    t_job = time.time()
     signal.signal(signal.SIGTERM, on_sigterm)
-    # this run's unit
-    tags = default_tags(a.op, a.mem, a.inplace, a.counts)
+    many = len(a.units) > 1
+    if many and a.log:
+        os.makedirs(a.log, exist_ok=True)
+    left, shared, kind = list(a.units), None, None
+    try:
+        for unit in a.units:
+            launch, op, inplace, counts = unit
+            tags = default_tags(op, launch, inplace, counts)
+            ua = copy.copy(a)
+            ua.op, ua.inplace, ua.counts, ua.launch = op, inplace, counts, launch
+            if many:
+                ua.log = os.path.join(a.log, unit_slug(tags) + ".log") if a.log else None
+                if a.resume and ua.log and journal_done(ua.log):
+                    print(f"unit {tag_str(tags)}: done in an earlier job ({ua.log})", file=sys.stderr)
+                    left.remove(unit)
+                    continue
+                ua.resume = bool(a.resume and ua.log and os.path.exists(ua.log))
+                print(f"unit {tag_str(tags)}", file=sys.stderr)
+            if launch != kind and not a.replay:
+                # one server per launch kind: the launch's environment for --site (launch/config.sh)
+                if shared and shared.get("srv"):
+                    shared["srv"].close(wait=30)
+                kind, shared = launch, {}
+                os.environ["LAUNCH"] = launch
+                os.environ["MEM"] = "device" if is_device(launch) else "host"
+            stop = run_unit(ua, tags, t_job, shared)
+            if stop in ("terminated", "deadline"):     # the unit is unfinished: --resume continues it
+                break
+            left.remove(unit)
+    except Terminated:
+        print("SIGTERM between units", file=sys.stderr)
+    finally:
+        if shared and shared.get("srv"):
+            # after SIGTERM there is little time, but a clean quit still lets MPI remove its shared memory
+            shared["srv"].close(wait=5 if left else 30)
+    if left and many:
+        print("units left for --resume (the first one unfinished if this job stopped in it): " + "; ".join(tag_str(default_tags(op, launch, inplace, counts))
+                                                      for launch, op, inplace, counts in left), file=sys.stderr)
+
+
+def run_unit(a, tags, t_job, shared):
+    """Measure one unit into --out; the builder's stop reason."""
+    t_start = time.time()
     base = None
     if a.model:
         try:
@@ -1127,13 +1251,16 @@ def main(argv=None):
     model, run = None, None
     try:
         send, make_req, probe, layouts, sizes, nodes, ppn_max, max_m, meta, srv = \
-            (replay if a.replay else live)(a)
+            replay(a) if a.replay else live(a, shared)
+        # the unit's budget in node-hours (--budget-h is wall hours; none: until the builder stops)
+        a.budget = a.budget_node_h if a.budget_node_h is not None else \
+            a.budget_h * nodes if a.budget_h is not None else math.inf
         job = {"start": round(t_start, 3), "mode": "replay" if a.replay else "live", "op": a.op, "algs": a.algs,
                "seed": a.seed, "batches": a.batches, "sync": a.sync, "prune": a.prune, "nodes": nodes,
                "ppn_max": ppn_max, "max_m": max_m, "hosts": meta.get("hosts"), "tool": VERSION,
                "compositional": a.compositional, "exclude_algs": a.exclude_algs, "probe_m": a.probe_m,
                "base": base_hash, "inner": inner_hash,
-               "layouts": a.layouts, "anchors": a.anchors if a.model else None, "mem": a.mem,
+               "layouts": a.layouts, "anchors": a.anchors if a.model else None, "mem": a.launch,
                "counts": a.counts, "inplace": a.inplace, "tags": tags}
         if journal.jobs:
             first = journal.jobs[0]
@@ -1162,7 +1289,7 @@ def main(argv=None):
             else:
                 cat, bits = catalog_algs(a)
                 model = Model(a.op, sizes, layouts, {"N": [1, nodes], "ppn": [1, ppn_max],
-                                                     "m": [int(sizes[0]), int(sizes[-1])]}, bits, mem=a.mem,
+                                                     "m": [int(sizes[0]), int(sizes[-1])]}, bits, mem=a.launch,
                               tags=tags)
             # this run's jobs in the model: the journal's earlier ones, then this one
             a._jobs_before = len(model.jobs)
@@ -1214,7 +1341,7 @@ def main(argv=None):
                     print(f"checkpoint skipped: {e}", file=sys.stderr)
 
         def stop_check():
-            if a.deadline and t_start + a.deadline - time.time() < 1.5 * state["slowest"] + 10:
+            if a.deadline and t_job + a.deadline - time.time() < 1.5 * state["slowest"] + 10:
                 return "deadline"
             return None
         prober = make_probe(journal, probe, make_req, a.probe_m, on_reply)
@@ -1234,7 +1361,8 @@ def main(argv=None):
                     print(f"set {set_name(a.op, mask)}: no algorithm runs there; skipped", file=sys.stderr)
             sets = [x for x in sets if x[2]]
             # each later set keeps a share of the budget in proportion to its layouts
-            share = [len(x[1]) / sum(len(y[1]) for y in sets) * a.budget_node_h for x in sets]
+            share = [len(x[1]) / sum(len(y[1]) for y in sets) * a.budget if math.isfinite(a.budget) else 0.0
+                     for x in sets]
             for i, (mask, lays, names) in enumerate(sets):
                 kw = dict(n_max=max(n for n, _ in lays), ppn_max=max(q for _, q in lays), seed=a.seed, clock=clock)
                 meas = measure if i == 0 else reusing(measure, make_req)
@@ -1247,7 +1375,7 @@ def main(argv=None):
                 built.append((mask, lays, names, b))
                 b.on_layout, b.stop_check = on_layout, stop_check
                 try:
-                    b.run(budget_node_h=a.budget_node_h - sum(share[i + 1:]), nodes_billed=nodes)
+                    b.run(budget_node_h=a.budget - sum(share[i + 1:]), nodes_billed=nodes)
                 except Terminated:
                     b.stop = "terminated"
                     drop_unfinished(b)
@@ -1259,9 +1387,8 @@ def main(argv=None):
     except Terminated:
         sys.exit("terminated before the builder started; the journal keeps what was measured")
     finally:
-        if srv:
+        if srv and shared is None:     # replay; a live server belongs to its launch kind (main)
             stopped = run["stop"] if run else built[-1][3].stop if built else "terminated"
-            # after SIGTERM there is little time, but a clean quit still lets MPI remove its shared memory
             srv.close(wait=30 if stopped != "terminated" else 5)
     jobs[-1]["end"] = round(time.time(), 3)
     if journal.salvage and not a.replay:
@@ -1276,7 +1403,7 @@ def main(argv=None):
         write_atomic(a.out, model_v1(a, b, sizes, nodes, ppn_max, meta, jobs, complete, cost))
         print(f"{a.out}: {len(b.samplers)} layouts, {b.n_meas} measurements ({journal.n_cached} from the "
               f"journal), {cost():.3f} node-h, stop: {b.stop}")
-        return
+        return b.stop
     model.jobs[-1]["end"] = jobs[-1]["end"]
     if base is None:
         if not built[0][3].samplers:
@@ -1301,6 +1428,10 @@ def main(argv=None):
     print(f"{a.out}: {len(model.measured_layouts())} layouts, {run['n_measurements']} measurements in this run "
           f"({journal.n_cached} from the journal), {cost():.3f} node-h, stop: {run['stop']}"
           + ("" if run.get("complete", True) else " (incomplete)"))
+    if run.get("complete", True):
+        journal.write({"done": True})
+        journal.flush()
+    return run["stop"]
 
 
 if __name__ == "__main__":

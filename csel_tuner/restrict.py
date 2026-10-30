@@ -92,7 +92,7 @@ def plan_sets(algs, bits, masks):
 
 def set_prefix(op, mem="host"):
     """The prefix of a model's subtree names: <op>-intra, <op>-intra-gpu for device buffers."""
-    return "%s-intra%s" % (op, "-gpu" if mem == "device" else "")
+    return "%s-intra%s" % (op, "-gpu" if mem in ("device", "gpu") else "")
 
 
 def set_name(op, mask, mem="host"):

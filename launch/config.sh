@@ -4,14 +4,23 @@
 # this file only holds what is the same on every system.
 here_cfg=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SITE=${SITE:-aurora}
-# MEM=device: mpisrv --mem device, one GPU per rank (the site file may set
-# other values for it, e.g. fewer ranks per node).
-MEM=${MEM:-host}
+# LAUNCH, the launch kind: host (host buffers), gpu (device buffers, one GPU
+# per rank, MPIR_CVAR_ENABLE_GPU_COLL=1) or device (device buffers without
+# GPU_COLL, the kind of MEM=device before launch kinds). MEM is the buffers'
+# memory it implies: mpisrv --mem device for gpu and device (the site file
+# may set other values for it, e.g. fewer ranks per node).
+LAUNCH=${LAUNCH:-${MEM:-host}}
+case $LAUNCH in
+    host) MEM=host ;;
+    gpu | device) MEM=device ;;
+    *) echo "config.sh: unknown LAUNCH=$LAUNCH (host, gpu or device)" >&2; return 1 ;;
+esac
 source "$here_cfg/sites/$SITE.sh"
 if [ "$MEM" = device ]; then
     # MPICH handles device buffers only with GPU support on; each rank sees
     # only its own GPU (gpu_bind.sh, in front of mpisrv in launch)
     export MPIR_CVAR_ENABLE_GPU=1 GPU_RUNTIME GPU_DEVICES GPU_TILES_PER_GPU
+    [ "$LAUNCH" = gpu ] && export MPIR_CVAR_ENABLE_GPU_COLL=1
     GPU_WRAPPER=${GPU_WRAPPER:-$here_cfg/gpu_bind.sh}
 else
     GPU_WRAPPER=

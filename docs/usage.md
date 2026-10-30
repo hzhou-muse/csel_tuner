@@ -126,8 +126,10 @@ bin/collmodel --op bcast \
   the allocation and ppn likewise up to its ranks per node, at sizes 4 per
   octave from 1 B.
 - It stops when its regret estimate meets the target (`--tau-gm 1.02`,
-  `--tau-p95 1.10`), when the estimate stops improving, or when the budget
-  (node-hours = elapsed time x nodes) is spent.
+  `--tau-p95 1.10`), when the estimate stops improving, when every layout is
+  measured, or, with `--budget-h`, when that many wall-clock hours of the
+  unit (all jobs) are spent. Without a budget the job's walltime bounds it:
+  `--deadline`, a SIGTERM, or Ctrl-C locally, and `--resume` continues (§6.5).
 - Needs the per-request algorithm switch; the server must report
   `cvar_switch=1` (`MPISRV_CVAR_SWITCH=1` in the site file).
 - `--log` keeps a journal of every measurement, which lets a later job
@@ -276,7 +278,10 @@ Also `--log`, `--resume`, `--deadline`, `--checkpoint-every` (§6.5) and
 | `--op` | `bcast` | the collective: any operation of the server (its info record lists them in `colls`: the blocking and nonblocking collectives, including the v-operations and barrier); for operations with p blocks per buffer (allgather, alltoall, gather, scatter, reduce_scatter(_block) and the v-operations) the size grid stops at max-m / (nodes × ppn) |
 | `--counts` | `uniform` | v-operations: the per-member blocks, `uniform`, `linear` or `onebig`, with `m` the mean block (mpisrv `counts=`) |
 | `--inplace` | off | measure with `MPI_IN_PLACE` (mpisrv `inplace=1`), for the operations that allow it |
-| `--budget-node-h` | 2 | stop after this many node-hours |
+| `--colls` | | several units in one run, one after another: `COLL`, `COLL:all` (every in-place setting the collective takes), or `COLL:K=V+K=V` with `inplace=0\|1`, `counts=uniform\|linear\|onebig`; e.g. `allreduce:all,alltoallv:counts=linear,barrier`. Needs `--algs all`; `--log` is then a directory with one journal per unit (alias `--coll`) |
+| `--launch` | `--mem` | launch kinds, one server launch each, its units one after another: `host`, `gpu` (device buffers, one GPU per rank, `MPIR_CVAR_ENABLE_GPU_COLL=1`), `device` (device buffers without `GPU_COLL`, the older `--mem device`); with `--site` it sets `LAUNCH` for `launch/config.sh`. The unit's `launch` tag |
+| `--budget-h` | none | per unit: stop after this many wall-clock hours, all jobs |
+| `--budget-node-h` | none | per unit, in node-hours (deprecated: `--budget-h`; replay experiments use it) |
 | `--prune` | 2.0 | v2: skip sizes predicted this much slower than the best; 0 = off |
 | `--batches` | 5 | timed batches per request |
 | `--sync` | `call` | `call`: a barrier before each call; `batch`: back to back |
@@ -295,7 +300,10 @@ A run can span several jobs and survive a kill:
 - **Resume (`--resume`, same `--log`).** The builder makes the same
   decisions from the same values, so requests the journal already answers
   are taken from it and measuring continues where the earlier job stopped.
-  Earlier jobs' time counts against `--budget-node-h`. A resume is refused
+  Earlier jobs' time counts against the budget. With several units
+  (`--colls`, `--launch`), a unit whose journal ends with its `done` record
+  is skipped, the unfinished one continues from its journal, and the rest
+  start; a job that stops lists the units left. A resume is refused
   if the algorithms, seed, batches, sync, pruning, the allocation's shape
   (nodes, ranks per node, largest size), the input model, the inner
   selection file or the added layouts differ; other nodes of the same shape

@@ -48,7 +48,9 @@ RECIPES = {
 # (if, then): an assignment with the first true and the second false is impossible
 IMPLIES = [("builtin_op", "commutative"), ("gpu_coll", "gpu")]
 # launch kind (the model's memory kind) -> the conditions it decides
-LAUNCH = {"host": {"gpu": 0, "gpu_coll": 0}, "device": {"gpu": 1}}
+# gpu: device buffers with MPIR_CVAR_ENABLE_GPU_COLL=1 (Q4); device: device buffers without it (the
+# launch of --mem device, before launch kinds)
+LAUNCH = {"host": {"gpu": 0, "gpu_coll": 0}, "gpu": {"gpu": 1, "gpu_coll": 1}, "device": {"gpu": 1}}
 LAUNCH_CONDITIONS = ["gpu", "gpu_coll"]
 # the set conditions of the current catalog, so that a new restriction is noticed
 KNOWN_SET = ["pof2", "hierarchical", "node_consecutive", "node_regular", "displs_ordered", "block_regular",
@@ -122,3 +124,8 @@ def is_v(coll):
 def datatype(coll):
     """mpisrv's element type: MPI_INT for the reductions, bytes for the rest."""
     return "int" if coll in _with_nb(REDUCTIONS) else "byte"
+
+
+def is_device(launch):
+    """Whether a launch kind measures device buffers (mpisrv --mem device)."""
+    return LAUNCH.get(launch, {}).get("gpu") == 1
