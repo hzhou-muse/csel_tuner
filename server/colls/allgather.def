@@ -1,0 +1,13 @@
+# ---- allgather ---------------------------------------------------------
+# MPI_Allgather of m bytes per member: each member receives p blocks.
+
+subcode: _autoload
+    $global const struct coll coll_allgather = { .name = "allgather", .layout = LAYOUT_COMM, .elem = 1, .time_div = 1, .rbuf_p = 1, .call = call_allgather }
+    $list call_allgather
+
+subcode:: coll_cases
+    $case !strcmp(name, coll_allgather.name)
+        return &coll_allgather
+
+fncode: call_allgather(const struct req *rq, MPI_Comm c, int crank, char *s, char *r, long count): int
+    return MPI_Allgather(s, count, MPI_BYTE, r, count, MPI_BYTE, c)

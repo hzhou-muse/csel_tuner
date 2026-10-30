@@ -12,6 +12,10 @@ include: colls/ireduce.def
 include: colls/iallreduce.def
 include: colls/barrier.def
 include: colls/reduce_scatter_block.def
+include: colls/allgather.def
+include: colls/alltoall.def
+include: colls/gather.def
+include: colls/scatter.def
 
 subcode: _autoload
     $include string

@@ -1,0 +1,13 @@
+# ---- scatter -----------------------------------------------------------
+# MPI_Scatter of m bytes per member from root (p blocks there).
+
+subcode: _autoload
+    $global const struct coll coll_scatter = { .name = "scatter", .layout = LAYOUT_COMM, .elem = 1, .time_div = 1, .rooted = 1, .sbuf_p = 1, .call = call_scatter }
+    $list call_scatter
+
+subcode:: coll_cases
+    $case !strcmp(name, coll_scatter.name)
+        return &coll_scatter
+
+fncode: call_scatter(const struct req *rq, MPI_Comm c, int crank, char *s, char *r, long count): int
+    return MPI_Scatter(s, count, MPI_BYTE, r, count, MPI_BYTE, rq->root, c)
