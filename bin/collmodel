@@ -583,10 +583,10 @@ def missing_inner(x, text):
 
 def compositional_names(a, algs):
     """The algorithms left for later: --compositional, default those with an inner key
-    (for files without the key: those restricted to hierarchical; nb and buffer_swap have it always)."""
+    (for catalogs without the key: those restricted to hierarchical; nb and buffer_swap have it always)."""
     if a.compositional is not None:
         return [x for x in a.compositional.split(",") if x]
-    has_inner = any(x.inner for x in algs if x.name not in GENERAL)
+    has_inner = Catalog.load(a.catalog).has_inner()
     return [x.name for x in algs if (x.inner if has_inner or x.name in GENERAL
                                      else "hierarchical" in x.restrictions)]
 

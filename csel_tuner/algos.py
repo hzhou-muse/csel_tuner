@@ -65,8 +65,13 @@ class Alg:
         self.cvar_params = [p.strip() for p in keys.get("cvar_params", "").split(",") if p.strip()]
         # inner: the calls a compositional algorithm makes through the selection
         self.inner = [Inner.parse(x, op) for x in keys.get("inner", "").split(",") if x.strip()]
-        coll = op[0].upper() + op[1:]
-        self.leaf = keys.get("func_name") or "MPIR_%s_intra_%s" % (coll, name)
+        # the CSEL leaf name, as MPICH's maint/gen_coll.py get_algo_funcname() forms it
+        coll, kind = op[0].upper() + op[1:], "allcomm" if "allcomm" in keys else "intra"
+        if op.startswith("i") and name.startswith("tsp_"):
+            leaf = "MPIR_TSP_%s_sched_%s_%s" % (coll, kind, name[4:])
+        else:
+            leaf = "MPIR_%s_%s_%s" % (coll, kind, name)
+        self.leaf = keys.get("func_name") or leaf
 
     def mask(self, bits):
         m = 0
@@ -125,11 +130,12 @@ class Catalog:
     def algorithms(self, op, kind="intra", nb=True):
         """The op's algorithms in file order, then for a blocking op the general ones:
         nb (implied for every blocking op) and buffer_swap (if the file lists it). Both are
-        compositional: nb on the op's nonblocking tree, buffer_swap on its host tree."""
+        compositional: nb on the op's nonblocking tree, buffer_swap on its host tree. Algorithms
+        with "disabled: 1" are left out: MPICH refuses them, forced or in a tuning file."""
         sec = "%s-%s" % (op, kind)
         if sec not in self.sections:
             raise KeyError("no section %s in coll_algorithms.txt" % sec)
-        out = [Alg(op, n, k) for n, k in self.sections[sec]]
+        out = [Alg(op, n, k) for n, k in self.sections[sec] if k.get("disabled", "0").strip() != "1"]
         if kind == "intra" and not op.startswith("i"):
             general = dict(self.sections.get("general", []))
             for name, (func, inner) in GENERAL.items():
@@ -138,6 +144,12 @@ class Catalog:
                     keys.setdefault("inner", inner)
                     out.append(Alg(op, name, dict(keys, func_name=func)))
         return out
+
+    def has_inner(self):
+        """Whether any algorithm outside the general section has an inner key (older catalogs
+        have none)."""
+        return any("inner" in keys for sec, algs in self.sections.items() if sec != "general"
+                   for _, keys in algs)
 
     def restriction_bits(self):
         """The restrictive (non-threshold) conditions in file order, then the
