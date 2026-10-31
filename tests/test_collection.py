@@ -1,6 +1,7 @@
 """bin/colltree over a collection: several collectives' units into one tuning
-file, --colls and --with, and the staleness check of inner calls into
-another collective (nb's ibcast tree)."""
+file, --colls and --with, the staleness check of inner calls into another
+collective (nb's ibcast tree), and several variant units of one collective
+(in-place and not) in one file."""
 import io
 import json
 import os
@@ -14,7 +15,8 @@ import numpy as np
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-from csel_tuner.model import Model, ModelFile  # noqa: E402
+from csel_tuner.model import Model, ModelFile, default_tags  # noqa: E402
+from csel_tuner.tree import json_choice  # noqa: E402
 
 LAYOUTS = [(1, 2), (1, 4), (2, 1), (2, 2), (2, 4), (4, 2)]
 SIZES = [2 ** k for k in range(0, 17, 2)]
@@ -28,9 +30,11 @@ def alg(inner=()):
     return {"leaf": None, "restrictions": [], "mask": 0, "inner": list(inner)}
 
 
-def model(coll, curves, inner=None):
+def model(coll, curves, inner=None, conditions=(), masks=None, tags=None):
     algs = {name: alg(inner.get(name, ()) if inner else ()) for name in curves}
-    m = Model(coll, SIZES, LAYOUTS, DOMAIN, [], algs)
+    for name, mk in (masks or {}).items():
+        algs[name]["mask"] = mk
+    m = Model(coll, SIZES, LAYOUTS, DOMAIN, list(conditions), algs, tags=tags)
     m.masks = {lay: 0 for lay in LAYOUTS}
     for name, (lat, bw) in curves.items():
         for lay in LAYOUTS:
@@ -95,7 +99,87 @@ def test_collection_errors():
                 assert msg in str(e), (argv, e)
 
 
+def alltoall(inplace, curves, masks=None, counts=None):
+    """A variant unit of alltoall: conditions inplace (bit 0) and pof2 (bit 1); the precheck found
+    inplace only where an algorithm restricts on it, so the masks start without it."""
+    tags = default_tags("alltoall", inplace=inplace)
+    if counts:
+        tags["counts"] = counts
+    return model("alltoall", curves, conditions=["inplace", "pof2"], masks=masks, tags=tags)
+
+
+def test_variants():
+    """In-place and not in one file: subtree 0 from the not-in-place unit, 0x1 from the in-place one,
+    each chosen by its own curves (brucks wins not in place, pairwise in place), and the dispatch on
+    the inplace bit; the in-place set is built even with no in-place-restricted algorithm."""
+    def point(inplace):
+        return {"p": 4, "m": 1024, "N": 2, "ppn": 2, "pof2": 1.0, "cond": {"inplace": inplace, "pof2": False}}
+    with tempfile.TemporaryDirectory() as tmp:
+        f, t = os.path.join(tmp, "m.json"), os.path.join(tmp, "t.json")
+        ModelFile([alltoall(False, {"brucks": (1.0, 1e4), "pairwise": (4.0, 1e4)}),
+                   alltoall(True, {"brucks": (4.0, 1e4), "pairwise": (1.0, 1e4)})]).save(f)
+        colltree([f, "--out", t])
+        out = json.load(open(t))
+        assert sorted(out) == ["name=alltoall-intra-0", "name=alltoall-intra-1", "name=alltoall-intra-auto"], out
+        assert out["name=alltoall-intra-auto"] == "dispatch=alltoall-intra(0x1)"
+        trees = {k[len("name="):]: v for k, v in out.items()}
+        bits = ["inplace", "pof2"]
+        assert json_choice(trees["alltoall-intra-auto"], point(False), trees, bits) == "MPIR_Alltoall_intra_brucks"
+        assert json_choice(trees["alltoall-intra-auto"], point(True), trees, bits) == "MPIR_Alltoall_intra_pairwise"
+        # an in-place-only algorithm joins the in-place set; a subset subtree from the other variant is a
+        # candidate only where this variant has curves of all its algorithms (no only_a here)
+        ModelFile([alltoall(False, {"brucks": (1.0, 1e4), "pairwise": (4.0, 1e4), "only_a": (0.5, 1e4)}),
+                   alltoall(True, {"brucks": (4.0, 1e4), "pairwise": (2.0, 1e4), "replace": (1.0, 1e4)},
+                            {"replace": 1})]).save(f)
+        colltree([f, "--out", t, "--min-fallback-algs", "1"])
+        trees = {k[len("name="):]: v for k, v in json.load(open(t)).items()}
+        assert json_choice(trees["alltoall-intra-auto"], point(True), trees, bits) == \
+            "MPIR_Alltoall_intra_replace"
+        assert json_choice(trees["alltoall-intra-auto"], point(False), trees, bits) == "MPIR_Alltoall_intra_only_a"
+        assert "call=" not in json.dumps(trees["alltoall-intra-1"])
+        # two units with the same input conditions (here differing in a tag only) collide
+        ModelFile([alltoall(False, {"brucks": (1.0, 1e4)}),
+                   alltoall(False, {"brucks": (1.0, 1e4)}, counts="linear")]).save(f)
+        try:
+            colltree([f, "--out", t])
+            assert False
+        except SystemExit as e:
+            assert "with the same input conditions" in str(e), e
+
+
+
+def test_reduction_variants():
+    """allreduce measures builtin commutative ops only: no variant has base 0, so the not-in-place one
+    (the fewest input conditions) also builds subtree 0 from its unrestricted algorithms, the
+    run-time fallback of user ops (until the default tree's subtree, D5)."""
+    bits = ["inplace", "commutative", "builtin_op"]
+
+    def unit(inplace, curves, masks=None):
+        return model("allreduce", curves, conditions=bits, masks=masks,
+                     tags=default_tags("allreduce", inplace=inplace))
+    with tempfile.TemporaryDirectory() as tmp:
+        f, t = os.path.join(tmp, "m.json"), os.path.join(tmp, "t.json")
+        ModelFile([unit(False, {"ring": (1.0, 1e4), "rsag": (0.5, 1e5)}, {"rsag": 4}),
+                   unit(True, {"ring": (1.0, 1e4), "rsag": (2.0, 1e3)}, {"rsag": 4})]).save(f)
+        colltree([f, "--out", t])
+        out = json.load(open(t))
+        # 0x6: builtin commutative, not in place; 0x7: also in place
+        assert sorted(out) == ["name=allreduce-intra-0", "name=allreduce-intra-6", "name=allreduce-intra-7",
+                               "name=allreduce-intra-auto"], sorted(out)
+        assert out["name=allreduce-intra-0"] == {"algorithm=MPIR_Allreduce_intra_ring": {}}
+        trees = {k[len("name="):]: v for k, v in out.items()}
+        x = {"p": 4, "m": 65536, "N": 2, "ppn": 2, "pof2": 1.0,
+             "cond": {"inplace": False, "commutative": True, "builtin_op": True}}
+        assert json_choice(trees["allreduce-intra-auto"], x, trees, bits) == "MPIR_Allreduce_intra_rsag"
+        x["cond"]["inplace"] = True
+        assert json_choice(trees["allreduce-intra-auto"], x, trees, bits) == "MPIR_Allreduce_intra_ring"
+        x["cond"]["builtin_op"] = False      # a user op: the run-time fallback
+        assert json_choice(trees["allreduce-intra-auto"], x, trees, bits) == "MPIR_Allreduce_intra_ring"
+
+
 if __name__ == "__main__":
     test_collection()
     test_collection_errors()
+    test_variants()
+    test_reduction_variants()
     print("ok")

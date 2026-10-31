@@ -427,6 +427,21 @@ also has a dispatch of its own, and `name=bcast-intra-auto` becomes
 call on device buffers falls back to `bcast-intra-gpu-0`, never to a host
 subtree. The device model's catalog must have the `gpu` restriction.
 
+Several variant units of one collective (in-place and not, §6.4 `--colls
+COLL:all`) go into the same file. Each unit's input conditions (`inplace`,
+and `builtin_op` and `commutative` for the reductions) are set in all its
+masks, so its subtrees have names of their own (alltoall: `-0` not in place,
+`-1` in place; allreduce: `-c` and `-d`), and the dispatch tests those
+bits too. A variant's base set is built from its own measurements even
+where no algorithm is restricted to it, and a set may `call=` another
+variant's subset subtree, scored with this variant's curves of that
+subtree's algorithms (only where it has them all). Where no variant is
+free of input conditions (the reductions measure builtin commutative ops
+only), the variant with the fewest builds subtree 0 from its unrestricted
+algorithms: the run-time fallback for user ops. Two units with the same
+input conditions (differing only in `counts`, say) are refused; pick one
+with `--unit`.
+
 With a compositional algorithm in the model, `colltree` compares its
 output's choices for that algorithm's inner calls with those of the file
 it was measured under, and prints `stale:` lines where they differ by more
@@ -526,7 +541,7 @@ python3 tests/test_extend.py     # adding an algorithm and layouts to a model, r
 python3 tests/test_gpu.py        # memory-kind restrictions; colltree merging host and device models
 python3 tests/test_kinds.py      # restriction kinds, variants; inner trees in --inner-selection
 python3 tests/test_stages.py     # algorithm stages from inner calls; disabled algorithms, leaf names and parameters
-python3 tests/test_collection.py  # colltree over several collectives, --colls, --with, cross-collective staleness
+python3 tests/test_collection.py  # colltree over several collectives and variants, --colls, --with, staleness
 ```
 
 They also run under pytest.

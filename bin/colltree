@@ -37,6 +37,14 @@ supersets':
   worst set 0); with --nested-dispatch, for an MPICH without it, nested
   restrictive conditions ending in "call=" those subtrees.
 
+Several variant units of one collective and memory kind (in-place and
+not; the reductions' builtin commutative op) share its subtrees: each
+unit's input conditions are set in all its masks (variant_base), its base
+set covers every layout, and a set may call a subset's subtree from another
+variant, scored with this unit's own curves. Without a variant free of
+input conditions, the one with the fewest builds set 0 from its
+unrestricted algorithms.
+
 Several models, one per memory kind of the buffers (a model's "mem": host,
 or device from bin/collmodel --mem device), go into one file with
 subtrees of their own: the host model's as above, the device model's as
@@ -150,14 +158,17 @@ def dispatch(op, bits, present, mem="host"):
 
 
 class Sets:
-    """The subtrees of one model, built in order of increasing mask."""
+    """The subtrees of one model (a variant unit), built in order of increasing mask. The variant
+    units of a collective and memory kind share `trees`, so a set may call a subset's subtree
+    from another variant; `base` is the variant's input conditions, true at all its layouts."""
 
-    def __init__(self, model, a, feats):
-        self.m, self.a, self.feats = model, a, feats
+    def __init__(self, model, a, feats, trees=None, base=0):
+        self.m, self.a, self.feats, self.base = model, a, feats, base
         self.sizes = np.array(model.sizes)
         self.pred = {}              # (alg, layout) -> log2 T on the grid
-        self.trees = {}             # mask -> (tree, [options]); an option is an algorithm or ("call", mask)
-        self.lines = []
+        self.trees = {} if trees is None else trees     # mask -> (tree, [options]); an option is an
+        self.lines = []                                 # algorithm or ("call", mask)
+        self.mine = []              # the masks this model built
 
     def p(self, alg, lay):
         if (alg, lay) not in self.pred:
@@ -189,10 +200,13 @@ class Sets:
             algs = [x for x in algs if m.mask_of(x) == 0]
         if not algs:
             return False
-        if mask and not any(m.mask_of(x) for x in algs):
+        if mask and mask != self.base and not any(m.mask_of(x) & ~self.base for x in algs):
             return False            # nothing restricted runs here: the dispatch uses a subset's subtree
+        # a subset's subtree (also another variant's) is scored with this model's own curves of its
+        # algorithms, so it is a candidate only where this model has them all
+        have = set(algs)
         calls = [s for s in sorted(self.trees) if s != mask and s & ~mask == 0
-                 and len(self.algs_used(s)) >= self.a.min_fallback_algs]
+                 and len(self.algs_used(s)) >= self.a.min_fallback_algs and self.algs_used(s) <= have]
         X = points(lays, self.sizes)
         cols = [np.concatenate([self.p(x, lay) for lay in lays]) for x in algs]
         for s in calls:
@@ -205,6 +219,7 @@ class Sets:
         opts = list(algs) + [("call", s) for s in calls]
         t, path = fit(X, np.column_stack(cols), self.feats, self.a)
         self.trees[mask] = (t, opts)
+        self.mine.append(mask)
         used = sorted({opts[l.alg] if not isinstance(opts[l.alg], tuple) else
                        "call=" + set_name(m.op, opts[l.alg][1], m.mem) for l in t.leaves()})
         self.lines.append(f"{set_name(m.op, mask, m.mem)}: {len(t.leaves())} leaves over {len(lays)} layouts x "
@@ -212,6 +227,30 @@ class Sets:
                           f"{path[0][0]} leaves) -> {path[-1][1]:.4f}; candidates {len(opts)}; used: "
                           f"{', '.join(used)}")
         return True
+
+
+def variant_base(model):
+    """The mask of the unit's input conditions that hold (its tags' variant), set at all its
+    layouts: the precheck finds an input condition only where an algorithm restricts on it."""
+    base = 0
+    for r, v in model.tags.get("variant", {}).items():
+        if r in model.conditions:
+            bit = 1 << model.conditions.index(r)
+            base |= bit if v else 0
+            model.masks = {lay: (mk | bit) if v else (mk & ~bit) for lay, mk in model.masks.items()}
+    model.masks = {lay: model.masks.get(lay, 0) | base for lay in model.layouts}
+    return base
+
+
+def unit_sets(model, base):
+    """{mask: [layouts]} of a variant unit: its base set (its input conditions) at every layout, and
+    each other mask at the layouts where exactly it holds (Model.sets() for base 0)."""
+    out = {base: list(model.layouts)}
+    for lay in model.layouts:
+        mk = model.masks.get(lay, 0)
+        if mk != base:
+            out.setdefault(mk, []).append(lay)
+    return out
 
 
 def drop_bit(model, bit):
@@ -241,12 +280,26 @@ def parse_inner(text):
     return sec.rsplit("-", 1)[0], comm, {k: int(v) for k, v in conds.items()}
 
 
+def pick_variant(units, caller):
+    """Of an inner collective's variant units [(model, Sets)], the one whose input conditions agree
+    with the caller's on the conditions both have (an inner call passes its buffers and op on),
+    else the first; None if there are none."""
+    if not units:
+        return None
+    mine = caller.tags.get("variant", {})
+    for m, S in units:
+        v = m.tags.get("variant", {})
+        if all(v[k] == mine[k] for k in v if k in mine):
+            return m, S
+    return units[0]
+
+
 def stale(model, S, out, built, tol):
     """Where the output chooses a compositional algorithm, the inner calls it
     makes that the output selects differently from the file the algorithm was
     measured under, and where the inner collective's model predicts the two
     choices more than `tol` apart: [(alg, inner, inner layout, [sizes], new, old, ratio)].
-    built: {(coll, "host"|"device"): (model, Sets)} of this output."""
+    built: {(coll, "host"|"device"): [(model, Sets)]} of this output."""
     m = model
     trees = {k[len("name="):]: v for k, v in out.items()}
     slot = "device" if is_device(m.mem) else "host"
@@ -267,7 +320,7 @@ def stale(model, S, out, built, tol):
         old = {k[len("name="):]: v for k, v in json.loads(m.inner_files[h]).items()}
         for inner in m.algorithms[c]["inner"]:
             coll, comm, cond = parse_inner(inner)
-            target = built.get((coll, "host" if cond.get(GPU) == 0 else slot))
+            target = pick_variant(built.get((coll, "host" if cond.get(GPU) == 0 else slot)), m)
             if target is None:
                 notes.append(f"{c}: inner {inner}: {coll}'s tree is not in this output; not checked")
                 continue
@@ -350,23 +403,19 @@ def main(argv=None):
             sys.exit(f"{path}: no unit selected by --unit/--colls (its units: "
                      + "; ".join(tag_str(u.tags) for u in f.units) + ")")
         units += [(path, u) for u in found]
-    # per collective: its unit of host buffers, and one of device buffers (launch kind gpu or device)
+    # per collective and memory kind (host, or device: launch kind gpu or device), its variant units
     colls = {}
     for path, m in units:
         slot = "device" if is_device(m.mem) else "host"
-        by_mem = colls.setdefault(m.op, {})
-        if slot in by_mem:
-            sys.exit(f"{path}: a second {m.op} unit of {slot} buffers ({tag_str(m.tags)}; the first: "
-                     f"{tag_str(by_mem[slot][1].tags)} in {by_mem[slot][0]}); select one with --unit")
-        by_mem[slot] = (path, m)
+        colls.setdefault(m.op, {}).setdefault(slot, []).append((path, m))
     missing = [x for x in want if x not in colls]
     if missing:
         sys.exit(f"--colls: no unit of {', '.join(missing)}")
+    bases = {}          # id(model) -> its variant's input conditions (mask)
     for op, by_mem in colls.items():
         if "host" not in by_mem:
             sys.exit(f"{op}: no unit of host buffers (the run-time fallback)")
-        if "device" in by_mem:
-            path, m = by_mem["device"]
+        for path, m in by_mem.get("device", []):
             if GPU not in m.conditions:
                 sys.exit(f"{path}: a model of device buffers, but its catalog has no {GPU} restriction "
                          "(MPICH cannot tell device buffers apart)")
@@ -374,6 +423,18 @@ def main(argv=None):
             # launch kind gpu: gpu_coll holds in the whole unit too (MPIR_CVAR_ENABLE_GPU_COLL=1)
             if m.mem == "gpu" and GPU_COLL in m.conditions:
                 drop_bit(m, 1 << m.conditions.index(GPU_COLL))
+        for slot, ums in by_mem.items():
+            seen = {}
+            for path, m in ums:
+                if m.conditions != ums[0][1].conditions:
+                    sys.exit(f"{path}: {tag_str(m.tags)} has the restrictions {m.conditions}, "
+                             f"{tag_str(ums[0][1].tags)} {ums[0][1].conditions} (one catalog per collective)")
+                base = bases[id(m)] = variant_base(m)
+                if base in seen:
+                    sys.exit(f"{path}: a second {op} unit of {slot} buffers with the same input conditions "
+                             f"({tag_str(m.tags)}; the first: {tag_str(seen[base][1].tags)} in {seen[base][0]}); "
+                             "select one with --unit")
+                seen[base] = (path, m)
     if a.buffer_swap and any("device" in by_mem for by_mem in colls.values()):
         sys.exit("--buffer-swap: give host models only")
     feats = ["N", "ppn", "p", "m", "pof2"] if a.node_aware else ["p", "m", "pof2"]
@@ -393,36 +454,45 @@ def main(argv=None):
                 warned.add((m.op, alg))
         return dict(rec, **override.get(alg, {}))
 
-    out, built = {}, {}     # built: {(coll, slot): (path, model, Sets)}
+    out, built = {}, {}     # built: {(coll, slot): [(path, model, Sets)]}
     for op, by_mem in colls.items():
         disp = {}
         for mem in ("host", "device"):
             if mem not in by_mem:
                 continue
-            path, m = by_mem[mem]
-            S = Sets(m, a, feats)
-            sets = m.sets()
-            for mask in sorted(sets, key=lambda s: (bin(s).count("1"), s)):
-                S.build(mask, sets[mask])
-            if 0 not in S.trees:
-                sys.exit(f"{path}: no unrestricted algorithm with a model")
+            trees, jobs = {}, []        # jobs: (mask, layouts, Sets), built in order of increasing mask
+            for path, m in by_mem[mem]:
+                S = Sets(m, a, feats, trees, bases[id(m)])
+                built.setdefault((op, mem), []).append((path, m, S))
+                jobs += [(mask, lays, S) for mask, lays in unit_sets(m, S.base).items()]
+            if 0 not in [mask for mask, _, _ in jobs]:
+                # no variant without input conditions (the reductions measure builtin commutative ops):
+                # the one with the fewest builds the run-time fallback from its unrestricted algorithms
+                S = min((x[2] for x in built[(op, mem)]), key=lambda S: (bin(S.base).count("1"), S.base))
+                jobs.append((0, list(S.m.layouts), S))
+                print(f"{set_name(op, 0, mem)}: from {tag_str(S.m.tags)}, its unrestricted algorithms",
+                      file=sys.stderr)
+            for mask, lays, S in sorted(jobs, key=lambda j: (bin(j[0]).count("1"), j[0])):
+                S.build(mask, lays)
+            if 0 not in trees:
+                sys.exit(f"{op}: no unrestricted algorithm with a model")
 
-            def sub(o, m=m):
+            def sub(o, m):
                 if isinstance(o, tuple):
-                    return "call=" + set_name(m.op, o[1], m.mem)
+                    return "call=" + set_name(op, o[1], mem)
                 return ("algorithm=" + m.leaf(o), leaf_params(m, o))
-            out.update({f"name={set_name(op, mask, mem)}": json_tree(t, opts, sub)
-                        for mask, (t, opts) in sorted(S.trees.items())})
-            present = sorted(S.trees)
+            owner = {mask: m for path, m, S in built[(op, mem)] for mask in S.mine}
+            for mask, (t, opts) in sorted(trees.items()):
+                out[f"name={set_name(op, mask, mem)}"] = json_tree(t, opts, lambda o, m=owner[mask]: sub(o, m))
+            present = sorted(trees)
             if a.nested_dispatch:
-                disp[mem] = dispatch(op, m.conditions, present, mem)
+                disp[mem] = dispatch(op, by_mem[mem][0][1].conditions, present, mem)
             else:
                 bits = 0
                 for s in present:
                     bits |= s
                 disp[mem] = "dispatch=%s(0x%x)" % (set_prefix(op, mem), bits) if bits else \
                     "call=" + set_name(op, 0, mem)
-            built[(op, mem)] = (path, m, S)
         out[f"name={op}-intra-auto"] = {GPU: disp["device"], "any": disp["host"]} if "device" in disp else \
             disp["host"]
         if a.buffer_swap:
@@ -441,13 +511,14 @@ def main(argv=None):
     with open(a.out, "w") as f:
         json.dump(written, f, indent=2)
         f.write("\n")
-    for path, m, S in built.values():
+    every = [x for v in built.values() for x in v]
+    for path, m, S in every:
         for line in S.lines:
             print(line)
     print(f"{a.out}: {', '.join(colls)}; features {','.join(feats)}; nesting {depth}")
 
-    models = {k: (m, S) for k, (path, m, S) in built.items()}
-    for path, m, S in built.values():
+    models = {k: [(m, S) for path, m, S in v] for k, v in built.items()}
+    for path, m, S in every:
         found, notes = stale(m, S, out, models, a.stale_tol)
         for n in notes:
             print(f"staleness check: {m.op} " + n)
