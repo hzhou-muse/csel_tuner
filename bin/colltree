@@ -81,7 +81,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 import numpy as np  # noqa: E402
 
-from csel_tuner.kinds import has_msg_size, is_device  # noqa: E402
+from csel_tuner.kinds import has_msg_size, is_device, measured, variants  # noqa: E402
 from csel_tuner.model import ModelFile, parse_sel, tag_str  # noqa: E402
 from csel_tuner.restrict import GPU, GPU_COLL, role_layout, set_name, set_prefix  # noqa: E402
 from csel_tuner.single import is_pof2  # noqa: E402
@@ -244,6 +244,30 @@ def variant_base(model):
             model.masks = {lay: (mk | bit) if v else (mk & ~bit) for lay, mk in model.masks.items()}
     model.masks = {lay: model.masks.get(lay, 0) | base for lay in model.layouts}
     return base
+
+
+def variant_report(op, mem, units, trees):
+    """The variants of a collective without a unit here: those not measured by design (no recipe,
+    e.g. user ops) and those missing, each with the subtree its calls reach (the dispatch's largest
+    built subset of its input conditions, before any set condition)."""
+    m0 = units[0]
+    have = [m.tags.get("variant", {}) for m in units]
+    groups = {}             # (what, target mask) -> [variant]
+    for v in variants(op, m0.conditions):
+        if any(all(h.get(k) == x for k, x in v.items()) for h in have):
+            continue
+        base = sum(1 << m0.conditions.index(k) for k, x in v.items() if x)
+        to = max((s for s in trees if s & ~base == 0), key=lambda s: (bin(s).count("1"), -s))
+        what = "not measured (no recipe)" if not measured(v) else "missing (not measured yet)"
+        groups.setdefault((what, to), []).append(v)
+    lines = []
+    for (what, to), vs in groups.items():
+        # the assignments the group's variants share, e.g. builtin_op=0 for the user ops
+        common = {k: x for k, x in vs[0].items() if all(v.get(k) == x for v in vs)}
+        name = " ".join("%s=%s" % kv for kv in sorted(common.items()))
+        lines.append(f"{set_prefix(op, mem)}: {what}: {len(vs)} variant{'s' if len(vs) > 1 else ''} {name}; "
+                     f"{'their' if len(vs) > 1 else 'its'} calls use {set_name(op, to, mem)}")
+    return lines
 
 
 def unit_sets(model, base):
@@ -461,7 +485,7 @@ def main(argv=None):
                 warned.add((m.op, alg))
         return dict(rec, **override.get(alg, {}))
 
-    out, built = {}, {}     # built: {(coll, slot): [(path, model, Sets)]}
+    out, built, report = {}, {}, []     # built: {(coll, slot): [(path, model, Sets)]}
     for op, by_mem in colls.items():
         disp = {}
         for mem in ("host", "device"):
@@ -484,6 +508,7 @@ def main(argv=None):
                 S.build(mask, lays)
             if 0 not in trees:
                 sys.exit(f"{op}: no unrestricted algorithm with a model")
+            report += variant_report(op, mem, [m for path, m in by_mem[mem]], trees)
 
             def sub(o, m):
                 if isinstance(o, tuple):
@@ -524,6 +549,8 @@ def main(argv=None):
     for path, m, S in every:
         for line in S.lines:
             print(line)
+    for line in report:
+        print(line)
     print(f"{a.out}: {', '.join(colls)}; features {','.join(feats)}; nesting {depth}")
 
     models = {k: [(m, S) for path, m, S in v] for k, v in built.items()}

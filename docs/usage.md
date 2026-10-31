@@ -442,7 +442,10 @@ only), the variant with the fewest builds subtree 0 from its unrestricted
 algorithms: the run-time fallback for user ops, correct for any op though
 scored on builtin-op timings (design §11). Two units with the same
 input conditions (differing only in `counts`, say) are refused; pick one
-with `--unit`.
+with `--unit`. colltree lists the variants without a unit, grouped: those
+not measured by design (no recipe: user ops) and those missing (e.g. the
+in-place variant not measured yet), each with the subtree its calls reach,
+the dispatch's largest built subset of its input conditions.
 
 With a compositional algorithm in the model, `colltree` compares its
 output's choices for that algorithm's inner calls with those of the file

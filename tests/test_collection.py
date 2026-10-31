@@ -137,6 +137,11 @@ def test_variants():
             "MPIR_Alltoall_intra_replace"
         assert json_choice(trees["alltoall-intra-auto"], point(False), trees, bits) == "MPIR_Alltoall_intra_only_a"
         assert "call=" not in json.dumps(trees["alltoall-intra-1"])
+        # the in-place variant not measured yet: reported, its calls use the not-in-place subtree
+        ModelFile([alltoall(False, {"brucks": (1.0, 1e4)})]).save(f)
+        log = colltree([f, "--out", t])
+        assert "alltoall-intra: missing (not measured yet): 1 variant inplace=1; its calls use " \
+            "alltoall-intra-0" in log, log
         # two units with the same input conditions (here differing in a tag only) collide
         ModelFile([alltoall(False, {"brucks": (1.0, 1e4)}),
                    alltoall(False, {"brucks": (1.0, 1e4)}, counts="linear")]).save(f)
@@ -161,7 +166,9 @@ def test_reduction_variants():
         f, t = os.path.join(tmp, "m.json"), os.path.join(tmp, "t.json")
         ModelFile([unit(False, {"ring": (1.0, 1e4), "rsag": (0.5, 1e5)}, {"rsag": 4}),
                    unit(True, {"ring": (1.0, 1e4), "rsag": (2.0, 1e3)}, {"rsag": 4})]).save(f)
-        colltree([f, "--out", t])
+        log = colltree([f, "--out", t])
+        assert "allreduce-intra: not measured (no recipe): 4 variants builtin_op=0; their calls use " \
+            "allreduce-intra-0" in log, log
         out = json.load(open(t))
         # 0x6: builtin commutative, not in place; 0x7: also in place
         assert sorted(out) == ["name=allreduce-intra-0", "name=allreduce-intra-6", "name=allreduce-intra-7",
