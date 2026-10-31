@@ -14,7 +14,8 @@ few percent of each other cost almost nothing to confuse, so the tree spends
 its splits where a wrong choice is expensive.
 
 1. Features. Today's CSEL conditions: comm_size(t) (p <= t),
-   avg_msg_size(t) (m <= t; for bcast the message size) and pof2. With
+   msg_size(t) (m <= t: the message size, or one rank's block; an MPICH
+   before it has avg_msg_size, json_tree's `names`) and pof2. With
    `node_aware`, also num_nodes(t) and ppn(t) (ranks per node, averaged over
    the nodes), conditions MPICH has since pmodels/mpich#8048.
 2. Growth: best-first, every candidate threshold of every feature (the
@@ -41,7 +42,7 @@ import heapq
 
 import numpy as np
 
-CSEL_NAME = {"p": "comm_size", "m": "avg_msg_size", "N": "num_nodes", "ppn": "ppn", "pof2": "pof2"}
+CSEL_NAME = {"p": "comm_size", "m": "msg_size", "N": "num_nodes", "ppn": "ppn", "pof2": "pof2"}
 
 
 class Node:
@@ -170,10 +171,11 @@ def select(root, x):
     return node.alg
 
 
-def json_tree(root, alg_names, leaf):
+def json_tree(root, alg_names, leaf, names=CSEL_NAME):
     """CSEL JSON object for the tree. alg_names: index -> algorithm name;
     leaf(name) -> (key, params) of an algorithm leaf, or a string such as
-    "call=<subtree>" that stands for the leaf itself."""
+    "call=<subtree>" that stands for the leaf itself; names: feature -> CSEL
+    condition."""
     def obj(node):
         out = {}
         cur = node
@@ -182,7 +184,7 @@ def json_tree(root, alg_names, leaf):
             if f == "pof2":
                 cond = "!pof2"          # pof2 is 0/1, so the split's left side (<= 0) is "not pof2"
             else:
-                cond = "%s(%d)" % (CSEL_NAME[f], int(t))
+                cond = "%s(%d)" % (names[f], int(t))
             if cond in out:             # cannot be reached again on this chain
                 cur = right
                 continue
@@ -191,7 +193,7 @@ def json_tree(root, alg_names, leaf):
             # redundant: whatever matches it matches this one too
             if out and f != "pof2":
                 last = next(reversed(out))
-                if last.startswith(CSEL_NAME[f] + "(") and out[last] == val:
+                if last.startswith(names[f] + "(") and out[last] == val:
                     del out[last]
             out[cond] = val
             cur = right
@@ -214,7 +216,7 @@ def json_choice(obj, x, trees=None, bits=None):
     whose condition holds, in hex>, or its largest subset that exists
     (bits: the restriction names, bit k = bits[k]). Returns the leaf's key
     after "algorithm=", e.g. "MPIR_Bcast_intra_binomial"."""
-    feature = {"comm_size": "p", "avg_msg_size": "m", "num_nodes": "N", "ppn": "ppn"}
+    feature = {"comm_size": "p", "msg_size": "m", "avg_msg_size": "m", "num_nodes": "N", "ppn": "ppn"}
     while True:
         if isinstance(obj, str) and obj.startswith("dispatch="):
             prefix, mask = obj[len("dispatch="):].rstrip(")").split("(")

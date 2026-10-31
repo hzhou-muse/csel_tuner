@@ -17,8 +17,12 @@ Each algorithm's model is fitted across layouts from all its curves; a
 tree is fitted on the predictions at every point of its layouts x the size
 grid, and pruned to the smallest tree whose predicted geomean regret is
 within --tol of the full tree's. Without --node-aware it uses comm_size,
-avg_msg_size and pof2; --node-aware adds num_nodes and ppn, conditions
-MPICH has since pmodels/mpich#8048.
+msg_size and pof2; --node-aware adds num_nodes and ppn, conditions
+MPICH has since pmodels/mpich#8048. Collectives without a message size the
+same on every rank (gatherv, scatterv, alltoallv, alltoallw, barrier) do not
+split on size: MPICH refuses a file in which they reach msg_size.
+--size-condition avg_msg_size writes the older condition, for an MPICH
+without msg_size.
 
 One subtree per restriction set (docs/design.md, sections 11 and 12), in
 order of increasing mask, so every subset's subtree exists before its
@@ -77,11 +81,11 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 import numpy as np  # noqa: E402
 
-from csel_tuner.kinds import is_device  # noqa: E402
+from csel_tuner.kinds import has_msg_size, is_device  # noqa: E402
 from csel_tuner.model import ModelFile, parse_sel, tag_str  # noqa: E402
 from csel_tuner.restrict import GPU, GPU_COLL, role_layout, set_name, set_prefix  # noqa: E402
 from csel_tuner.single import is_pof2  # noqa: E402
-from csel_tuner.tree import fit_tree, json_choice, json_tree, prune_to, select  # noqa: E402
+from csel_tuner.tree import CSEL_NAME, fit_tree, json_choice, json_tree, prune_to, select  # noqa: E402
 
 # Leaf parameters (coll_algorithms.txt extra_params) come from the model, which
 # records the CVAR values the server ran with (collmodel alg_info). This table
@@ -378,6 +382,8 @@ def main(argv=None):
     ap.add_argument("--stale-tol", type=float, default=1.05, help="report a changed inner choice of a "
                     "compositional algorithm when the model predicts the two more than this apart")
     ap.add_argument("--param", action="append", default=[], metavar="ALG.KEY=VALUE")
+    ap.add_argument("--size-condition", default="msg_size", choices=["msg_size", "avg_msg_size"],
+                    help="the CSEL condition of the size splits; avg_msg_size for an MPICH without msg_size")
     ap.add_argument("--nested-dispatch", action="store_true", help="dispatch on restrictions with nested "
                     "conditions (for an MPICH without dispatch=, pmodels/mpich#8048)")
     ap.add_argument("--buffer-swap", action="store_true", help="host model only: the file measures buffer_swap "
@@ -438,6 +444,7 @@ def main(argv=None):
     if a.buffer_swap and any("device" in by_mem for by_mem in colls.values()):
         sys.exit("--buffer-swap: give host models only")
     feats = ["N", "ppn", "p", "m", "pof2"] if a.node_aware else ["p", "m", "pof2"]
+    names = dict(CSEL_NAME, m=a.size_condition)
     override = {}
     for kv in a.param:
         k, v = kv.split("=", 1)
@@ -461,8 +468,9 @@ def main(argv=None):
             if mem not in by_mem:
                 continue
             trees, jobs = {}, []        # jobs: (mask, layouts, Sets), built in order of increasing mask
+            fs = feats if has_msg_size(op) else [f for f in feats if f != "m"]
             for path, m in by_mem[mem]:
-                S = Sets(m, a, feats, trees, bases[id(m)])
+                S = Sets(m, a, fs, trees, bases[id(m)])
                 built.setdefault((op, mem), []).append((path, m, S))
                 jobs += [(mask, lays, S) for mask, lays in unit_sets(m, S.base).items()]
             if 0 not in [mask for mask, _, _ in jobs]:
@@ -483,7 +491,8 @@ def main(argv=None):
                 return ("algorithm=" + m.leaf(o), leaf_params(m, o))
             owner = {mask: m for path, m, S in built[(op, mem)] for mask in S.mine}
             for mask, (t, opts) in sorted(trees.items()):
-                out[f"name={set_name(op, mask, mem)}"] = json_tree(t, opts, lambda o, m=owner[mask]: sub(o, m))
+                out[f"name={set_name(op, mask, mem)}"] = json_tree(t, opts, lambda o, m=owner[mask]: sub(o, m),
+                                                                   names)
             present = sorted(trees)
             if a.nested_dispatch:
                 disp[mem] = dispatch(op, by_mem[mem][0][1].conditions, present, mem)

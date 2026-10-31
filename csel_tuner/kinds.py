@@ -117,6 +117,17 @@ def run_variant(coll, inplace=False):
     return {r: int(inplace) if r == "inplace" else 1 for r, (colls, _) in RECIPES.items() if coll in colls}
 
 
+# the collectives with a message size the same on every rank (MPICH's msg_size condition,
+# MPIR_Csel_has_msg_size): the others (the v/w collectives whose ranks know only their own counts,
+# barrier) cannot split on size, and MPICH refuses a tuning file in which they reach msg_size
+SIZED = _with_nb(["bcast", "reduce", "allreduce", "scan", "exscan", "allgather", "allgatherv", "alltoall",
+                  "gather", "scatter", "reduce_scatter", "reduce_scatter_block"])
+
+
+def has_msg_size(coll):
+    return coll in SIZED
+
+
 def is_v(coll):
     return coll in _with_nb(VCOUNTS)
 

@@ -177,9 +177,27 @@ def test_reduction_variants():
         assert json_choice(trees["allreduce-intra-auto"], x, trees, bits) == "MPIR_Allreduce_intra_ring"
 
 
+
+def test_size_condition():
+    """Size splits read msg_size (avg_msg_size with --size-condition); gatherv, without a message
+    size the same on every rank, never splits on size even where the winner changes with it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        f, t = os.path.join(tmp, "m.json"), os.path.join(tmp, "t.json")
+        # linear wins small messages, binomial large ones
+        curves = {"linear": (1.0, 1e3), "binomial": (8.0, 1e5)}
+        ModelFile([model("gather", curves), model("gatherv", curves)]).save(f)
+        colltree([f, "--out", t])
+        out = json.load(open(t))
+        assert "msg_size(" in json.dumps(out["name=gather-intra-0"])
+        assert "msg_size" not in json.dumps(out["name=gatherv-intra-0"]), out["name=gatherv-intra-0"]
+        colltree([f, "--out", t, "--size-condition", "avg_msg_size"])
+        assert "avg_msg_size(" in json.dumps(json.load(open(t))["name=gather-intra-0"])
+
+
 if __name__ == "__main__":
     test_collection()
     test_collection_errors()
     test_variants()
     test_reduction_variants()
+    test_size_condition()
     print("ok")

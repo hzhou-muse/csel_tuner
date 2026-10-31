@@ -46,7 +46,7 @@ def test_json_shape():
     j = json_tree(t, ["a", "b"], lambda alg: ("algorithm=MPIR_Bcast_intra_" + alg, {}))
     check_csel(j)
     text = str(j)
-    assert "avg_msg_size(10)" in text and "comm_size(50)" in text   # m <= 10 and p <= 50 are the boundaries
+    assert "msg_size(10)" in text and "avg_msg_size" not in text and "comm_size(50)" in text   # m <= 10 and p <= 50 are the boundaries
 
 
 if __name__ == "__main__":
