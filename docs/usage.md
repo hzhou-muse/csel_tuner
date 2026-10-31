@@ -439,7 +439,8 @@ variant's subset subtree, scored with this variant's curves of that
 subtree's algorithms (only where it has them all). Where no variant is
 free of input conditions (the reductions measure builtin commutative ops
 only), the variant with the fewest builds subtree 0 from its unrestricted
-algorithms: the run-time fallback for user ops. Two units with the same
+algorithms: the run-time fallback for user ops, correct for any op though
+scored on builtin-op timings (design §11). Two units with the same
 input conditions (differing only in `counts`, say) are refused; pick one
 with `--unit`.
 

@@ -151,7 +151,7 @@ def test_variants():
 def test_reduction_variants():
     """allreduce measures builtin commutative ops only: no variant has base 0, so the not-in-place one
     (the fewest input conditions) also builds subtree 0 from its unrestricted algorithms, the
-    run-time fallback of user ops (until the default tree's subtree, D5)."""
+    run-time fallback of user ops: correct for any op, scored on MPI_SUM."""
     bits = ["inplace", "commutative", "builtin_op"]
 
     def unit(inplace, curves, masks=None):

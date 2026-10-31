@@ -603,7 +603,14 @@ recipe: `inplace` by `MPI_IN_PLACE`, `builtin_op` and `commutative` by
 a model of its own, and an input condition applies wherever MPI allows it,
 whether or not an algorithm restricts on it. Assignments that contradict an
 implication (`builtin_op` without `commutative`) are skipped; those without
-a recipe (user ops) are not measured. *Launch* conditions (`gpu`,
+a recipe (user ops) are not measured. Their calls reach subtree 0, whose
+algorithms are the unrestricted ones: restrictions are positive, so these
+take any op, non-commutative included. That is correct, if not optimal (it
+is scored on builtin-op timings). User ops and derived datatypes are too
+varied to model as a whole, since their cost depends on the actual op and
+type; the way to tune a common case among them is a narrow restrictive
+condition in MPICH (a vector datatype, a specific op), which joins as a
+black-box set condition, measured in a later enhancement run. *Launch* conditions (`gpu`,
 `gpu_coll`) are decided by how the ranks are started. Everything else is a
 *set* condition: the layout conditions (`pof2`, `hierarchical`, ...) and the
 black-box ones (`MPIDI_CH4_release_gather`), found by the precheck and

@@ -41,7 +41,7 @@ def _with_nb(colls):
 # input condition -> (the collectives it applies to, {value: request settings, or None: not measured})
 RECIPES = {
     "inplace": (_with_nb(INPLACE), {0: {}, 1: {"inplace": 1}}),
-    # user ops are not measured: colltree takes the default tree's subtree for them
+    # user ops are not measured: their calls reach subtree 0, whose unrestricted algorithms take any op
     "commutative": (_with_nb(REDUCTIONS), {0: None, 1: {}}),
     "builtin_op": (_with_nb(REDUCTIONS), {0: None, 1: {"op": "sum"}}),
 }
