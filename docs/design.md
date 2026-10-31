@@ -5,12 +5,14 @@ node-hour budget and produces a tuning file for MPICH's collective
 selection (CSEL). This document describes how it works and why. For how to
 run it, see [usage.md](usage.md).
 
-Status (2026-10-24): the server, the three builders, the tree output and
-the restricted / compositional algorithms of §11 are implemented, tested on
-replays and in local functional runs, and validated live on a large system
-(MPI_Bcast, the only collective wired through the builders so far). §12 is
-the target design for incremental models and batch strategies, not yet
-implemented.
+Status (2026-10-31): the server measures every intra-communicator
+collective, blocking and nonblocking, in place where MPI allows it, on host
+or device buffers. collmodel measures many units (a collective in one
+variant and launch kind, §12) in one run, in stages for the compositional
+algorithms (§11), into one model file, and colltree writes one tuning file
+over the whole collection. Validated live on a large system for MPI_Bcast
+(host and device buffers) and MPI_Allreduce (host); the other collectives
+are tested in local functional runs and on synthetic models.
 
 ## 1. Goal
 
@@ -31,7 +33,7 @@ bin/collmodel (driver, Python)                server/mpisrv (one MPI job of P ra
   csel_tuner.server.Server   -- batch of  -->   the requested sub-communicator measures,
                              <-- replies ---    rank 0 writes one JSON reply per request
         |
-        v  model file (collmodel/4: measurements + fit)
+        v  model file (collmodel/5: units of measurements + fit)
 bin/colltree (builder v3)  -->  tuning JSON  -->  MPIR_CVAR_COLL_SELECTION_JSON_FILE
 ```
 
@@ -462,14 +464,13 @@ shaped the design:
 
 ## 11. Restricted algorithms and staged sampling
 
-Status: implemented (`csel_tuner/algos.py`, `csel_tuner/restrict.py`,
-`bin/collmodel --catalog`, mpisrv `probe=1` and error replies) for
-restricted algorithms and for compositional ones whose inner calls are
-their own op (bcast smp), tested on the replay (with `--replay-alias`), in
-local functional runs and live. Compositional algorithms across ops
-(allreduce smp needs reduce and bcast files) are not. Since §12, a
-compositional algorithm is added to the model rather than built as a
-second stage; the stages below describe that order of work.
+Status: implemented (`csel_tuner/algos.py`, `restrict.py`, `kinds.py`,
+`stages.py`, `bin/collmodel --catalog / --plan / --max-stage`, mpisrv
+`probe=1` and error replies) for restricted algorithms and for
+compositional ones within and across collectives, tested on the replay
+(with `--replay-alias`), in local functional runs and, for bcast, live. A
+compositional algorithm is added to the model (§12) in a later stage of
+the same model file.
 
 Before, the builders chose among the algorithms that have no
 `restrictions` in MPICH's `src/mpi/coll/coll_algorithms.txt`. On a
@@ -499,27 +500,27 @@ condition used to count calls and create shared memory; now it only reads
 state, and the creation happens before the selection).
 
 **Restriction index.** Restrictions are positive: each names a condition
-that must hold (MPICH's `coll_algorithms.txt` has no negated restrictions;
-a restriction that needs a condition false names its own condition, e.g.
-`not_inplace`). Bit k is the k-th restrictive (non-threshold) condition of
-the file's `conditions:` list, one numbering for every collective, so a
-set's name means the same in every op, and appending a condition keeps the
-others' numbers (MPICH's list: `inplace` 0, `not_inplace` 1, ...,
-`hierarchical` 5, ..., `MPIDI_CH4_release_gather` 11). An algorithm's mask
-is the OR of its restrictions' bits; a set's mask is the conditions that
-are true; an algorithm runs in set S when its mask is a subset of S, so
-whatever runs in a set also runs in any larger one. A layout's mask comes
-from the precheck: the bits of every algorithm that ran; an algorithm that
-failed with all but one of its bits known true makes that one false; a bit
-no algorithm decides is taken as false and reported. Complementary
-conditions such as `inplace` / `not_inplace` give sets with exactly one of
-the two; the others are empty and skipped. The model file records the bit
-names. (Older MPICH files use `!inplace`; such a restriction is read as a
-condition of its own, numbered after the listed ones, and tested as
-`!inplace` in the tree.) The subtree `<op>-intra-r<mask>` serves calls whose
+that must hold (a restriction that needs a condition false names its own
+condition). Bit k is the restriction with index k in the catalog's
+`restrictions:` section (pmodels/mpich#8065: explicit, checked indices, new
+ones appended), one numbering for every collective, so a set's name means
+the same in every collective. (A catalog without the section numbers its
+restrictive conditions in order, then old-style `!c` restrictions, each
+read as a condition of its own and tested as `!c` in the tree.) An
+algorithm's mask is the OR of its restrictions' bits; a set's mask is the
+conditions that are true; an algorithm runs in set S when its mask is a
+subset of S, so whatever runs in a set also runs in any larger one. A
+layout's mask comes from the precheck: the bits of every algorithm that
+ran; an algorithm that failed with all but one of its bits known true
+makes that one false; a bit no algorithm decides is taken as false and
+reported. The conditions the launch kind decides (`gpu`, `gpu_coll`) are
+known before the precheck, and colltree sets a unit's input conditions
+(`inplace`, ...) in all its masks from its variant (§12.3). The model file
+records the bit names. The subtree `<op>-intra-<mask>` serves calls whose
 true conditions are exactly `mask`, written in hex without a prefix
-(`<op>-intra-0` is set 0, written `r0` below), e.g. `bcast-intra-800` for
-single-node communicators:
+(`<op>-intra-0` is set 0, written `r0` below), e.g. with the current
+catalog `bcast-intra-200` for single-node communicators
+(`MPIDI_CH4_release_gather`, bit 9):
 
 - `r0` holds the unrestricted algorithms and is fitted on **every** layout:
   it is the fallback whenever no other set applies at run time, also on
@@ -539,61 +540,53 @@ single-node communicators:
   restrictions. `--nested-dispatch` writes the nested conditions instead,
   each evaluated once on a path, for an MPICH without `dispatch=`.
 
-**Stages for compositional algorithms.** An algorithm such as `smp` runs
-other collectives on sub-communicators (the node comm, the comm of node
-leaders), and those calls go through the selection itself, so its time
-depends on the file being built.
+**Stages for compositional algorithms.** A compositional algorithm runs
+collectives through the selection: its `inner` calls in the catalog, as
+`<section>@<communicator>` (pmodels/mpich#8048), e.g. bcast `smp`
+`bcast-intra@node_comm, bcast-intra@node_roots_comm`, allreduce `smp`
+`reduce-intra@node_comm, allreduce-intra@node_roots_comm,
+bcast-intra@node_comm`. The general algorithms are compositional too, their
+calls written relative to the caller (pmodels/mpich#8073: `$coll`, `comm`,
+`[k=v]` setting a condition on the inner call; an older catalog gets the
+same calls): `nb` runs `i<op>-intra@comm`, the nonblocking collective's
+tree, and `buffer_swap` runs `<op>-intra@comm[gpu=0]`, the collective's own
+tree on host buffers. Its time depends on the trees those calls select
+from, so it is measured with a file of them loaded (`--inner-selection`,
+via `MPIR_CVAR_COLL_SELECTION_JSON_FILE`), and collmodel refuses one whose
+inner sections have no tree (`name=<section>-auto`) in that file rather
+than measure it under MPICH's default selection.
 
-1. Create the model with every non-compositional algorithm (with their
-   restrictions), build the subtrees: file F1.
-2. Add the compositional algorithms (`bin/collmodel --model M --algs smp
-   --inner-selection F1`): the server runs with F1 loaded
-   (`MPIR_CVAR_COLL_SELECTION_JSON_FILE`) and prechecks them; they decide
-   new bits (smp: `hierarchical`), so some layouts move to a new mask S.
-   They are sampled at the model's measured layouts where they run, against
-   every algorithm the model has there (§12.2).
-3. `bin/colltree M2` writes F2 from the one model: a subtree per set,
-   S's candidates being the algorithms allowed there and calls of subsets'
-   subtrees (§12.3), and a dispatch over all sets. Where F2 selects the
-   inner calls differently from F1, colltree reports smp's measurements as
-   stale (§12.3).
+That fixes the order of work (`csel_tuner/stages.py`). A plain algorithm is
+stage 1. A compositional one is 1 + the stage at which the trees its inner
+calls select from are complete; a tree, (collective, launch kind), is
+complete at the largest stage of its algorithms, leaving out those whose
+inner calls lead back into the chain (smp's bcast tree has no smp: smp
+needs `hierarchical`, which neither inner communicator has) and those the
+launch kind rules out (`buffer_swap`, restricted to `gpu`, is in no host
+tree). With MPICH's catalog: host bcast `nb` 2 (ibcast's tree is plain),
+`smp` 3 (its bcast tree has `nb`); on a gpu launch `buffer_swap` 4, `smp` 5;
+host allreduce `smp` 4. `collmodel --plan` prints each unit's algorithms by
+stage and the trees each needs. A stage-k run (`--model ... --max-stage k`)
+adds the algorithms up to k, with an inner selection file that colltree
+builds from the units' stages below k; it prechecks them (they decide new
+bits, e.g. `hierarchical`, so some layouts move to a new set) and samples
+them at the model's measured layouts against every algorithm there
+(§12.2). colltree then writes the file from the one model (§12.3), and
+where it selects an inner call differently from the file a compositional
+algorithm was measured under, it reports that algorithm as stale (§12.3).
 
-One file for the inner calls is enough when they do not reach a
-compositional algorithm: `smp` needs `hierarchical`, which the node comm (one node) and
-the leaders' comm (one rank per node) do not have, so F2 selects the same
-algorithms as F1 for every inner call, up to the changes the staleness
-check reports. The tool checks this on the precheck of the compositional
-algorithms before measuring them (one that ran at an inner call's layout
-fails the check); with pmodels/mpich#8048 a single-node communicator
-is not `hierarchical`, so user layouts and inner sub-communicators of the
-same shape have the same conditions.
-Compositional algorithms carry an `inner` key in `coll_algorithms.txt`
-(pmodels/mpich#8048): the collectives they call through the selection, as
-`<section>@<communicator>`, e.g. bcast smp `bcast-intra@node_comm,
-bcast-intra@node_roots_comm`, allreduce smp `reduce-intra@node_comm,
-allreduce-intra@node_roots_comm, bcast-intra@node_comm`. `--compositional`
-defaults to those algorithms (for files without the key: those restricted
-to `hierarchical`). From the key the tool gets, per algorithm, the ops
-whose tuning files must be loaded (other ops too: allreduce smp needs
-reduce and bcast), and the layouts the inner calls see: `node_comm` gives
-(1, ppn), `node_roots_comm` (N, 1), both in every stage-1 grid. The
-two-stage check is then per inner (op, communicator): no compositional algorithm
-of that op may be allowed under the precheck masks of those layouts (smp
-needs `hierarchical`, false on both). An inner call can name its own op
-(allreduce smp: `allreduce-intra@node_roots_comm`); the check covers it.
-With #8048 a forced algorithm whose restriction fails on an internal
+The **two-stage check** runs on the precheck of a compositional algorithm,
+per inner (collective, communicator) of its own collective: no
+compositional algorithm of that collective may be allowed under the
+precheck masks of the inner layouts (`node_comm` gives (1, ppn),
+`node_roots_comm` (N, 1), both in every grid), so one inner file is enough.
+With pmodels/mpich#8048 a single-node communicator is not `hierarchical`,
+so user layouts and inner communicators of the same shape have the same
+conditions, and a forced algorithm whose restriction fails on an internal
 sub-communicator falls back to the selection even with
-`MPIR_CVAR_COLLECTIVE_FALLBACK=error`, so forcing smp measures smp with its
-inner calls selected by the loaded stage-1 file.
-The general algorithms are compositional too. Their inner calls are
-written relative to the caller (pmodels/mpich#8073: `$coll`, `comm`, and
-`[k=v]` setting a restriction on the inner call), and an older catalog gets
-the same calls: `nb` runs `i<op>-intra@comm`, the nonblocking op's tree, so
-it is added only once the nonblocking op is tuned; `buffer_swap` runs
-`<op>-intra@comm[gpu=0]`, the op's own tree on host buffers. collmodel
-refuses a compositional algorithm whose inner sections have no tree
-(`name=<section>-auto`) in the loaded file, rather than measure it under
-MPICH's default selection for them.
+`MPIR_CVAR_COLLECTIVE_FALLBACK=error`, so forcing `smp` measures it with
+its inner calls selected by the loaded file.
+
 colltree places `nb` and `buffer_swap` like any algorithm: as leaves of
 the `<op>-intra-<mask>` subtrees under `<op>-intra-auto`, each scored per
 layout and size, not as fixed wrappers ahead of the selection. They cannot
@@ -643,13 +636,9 @@ MPICH's default, per restriction set (e.g. single-node / multi-node).
   reach it for allreduce. A later creation failure turns the algorithm
   infeasible on that comm (an error reply mid-sampling), which the builder
   treats like a failed precheck and reports.
-- Per-call conditions (`inplace`, `not_inplace`, `commutative`,
-  `builtin_op`, `count_ge_pof2`) depend on the call's arguments, not the
-  layout: the precheck runs per call variant, and mpisrv makes no in-place
-  calls yet, so only the `not_inplace` sets are built. Bcast has none.
-- Without a node-count condition, `r0` cannot tell 1 x 32 from 32 x 1; the
-  restriction split removes that conflict only where a restricted
-  algorithm wins.
+- Without `--node-aware` (the `num_nodes` and `ppn` conditions), `r0`
+  cannot tell 1 x 32 from 32 x 1; the restriction split removes that
+  conflict only where a restricted algorithm wins.
 - Budget: each later set keeps a share in proportion to its layouts, and
   reuses the measurements made before it at the same points.
 - **Forced compositional algorithms need #8048.** The algorithm CVAR is
@@ -661,11 +650,10 @@ MPICH's default, per restriction set (e.g. single-node / multi-node).
 
 ## 12. Incremental models and batch strategies
 
-Status (2026-10-24): implemented (`csel_tuner/model.py`, `bin/collmodel
---model / --layouts / --import`, `bin/colltree` on collmodel/4) and tested
-on the replay, except `--refit`, `--merge` and continuing the layout loop
-when adding (§13). It replaces the stages of §11 as a property of the
-tools; §11's restriction sets, dispatch and two-stage check stay.
+Status (2026-10-31): implemented (`csel_tuner/model.py`, `bin/collmodel
+--model / --layouts / --colls / --launch / --merge / --import`, `bin/colltree`
+on collmodel/5) and tested on the replay and in local functional runs,
+except `--refit` and continuing the layout loop when adding (§13).
 
 **Principle.** Two tools around one model file, and the plan of what to
 measure when outside both:
@@ -679,7 +667,7 @@ measure when outside both:
   rerun with other settings at will.
 - A **batch strategy** (which algorithms, collectives and layouts, in which
   jobs, within which node-hours) is a sequence of calls to the two tools
-  and a validation. Stage 1 + stage 2 of §11 is one such strategy.
+  and a validation (§12.4).
 
 ### 12.1 The model file: data and fit
 
@@ -709,10 +697,9 @@ could bracket a jump to a few bytes. The costs: rules the stored curve now
 hides (the value at sizes pruned at a layout, merging repeated measurements
 of a point across jobs) and a refit in every tool that reads the model.
 
-The **journal** stays a per-job crash log for `--resume` (§4) and audit.
-At the end of a job its measurements are merged into `data`
-(`collmodel --merge JOURNAL`, not implemented yet, would do the same for a
-job killed before that; checkpoints and `--resume` cover it meanwhile);
+The **journal** stays a per-job crash log for `--resume` (§4) and audit,
+one per unit when a run has several. At the end of a job its measurements
+are in `data`; a job killed before that continues with `--resume`, and
 nothing reads a journal for sampling decisions. A journal is unsuited for
 that, not because of size (ten thousand measurements are a few MB and
 parse in under a second) but because of its semantics: it is one job's requests in
@@ -759,6 +746,19 @@ import from their journals.
   algorithms'. The two-stage check of §11 still runs on the precheck.
 - **Stop** by the regret estimate of the whole model, the budget, a
   deadline or SIGTERM, as now. `--resume` within a job is unchanged.
+- **Units.** A run measures one or more units, each a collective in one
+  variant (its input conditions, §11) and launch kind, named by its tags:
+  `coll`, `variant`, `datatype`, `launch` and, for the v-collectives,
+  `counts`. `--colls COLL[:all|:inplace=..+counts=..],...` and `--launch
+  host,gpu` list them; they run one after another, one server launch per
+  launch kind, each unit with its own journal, budget (`--budget-h`) and a
+  `done` record, so `--resume` skips finished units and a killed job loses
+  at most the unit in progress. All go into one `--out` file, which keeps
+  its other units and gets those of `--model` it lacks; `--merge` combines
+  files from split jobs (a unit in two files must be the same).
+- **Leaf parameters.** mpisrv's info record lists the global int and enum
+  CVARs; each algorithm with `extra_params` records the values of its
+  parameters' CVARs (§8), which colltree writes into the leaves.
 
 ### 12.3 colltree: models to one file
 
@@ -771,17 +771,35 @@ import from their journals.
   A subtree with fewer is not worth the call; its algorithms enter S
   directly. Every candidate is scored at S's own layouts: a `call=` leaf at
   a point costs T's tree's choice evaluated there, not T's fit on its own
-  layouts. (Today every set falls back to r0, which is fitted on all
-  layouts and without node-aware conditions chooses by comm_size alone: the
-  single-node set can hand large messages to the algorithm that wins at
-  the same p across nodes.)
+  layouts.
 - **Staleness check for compositional algorithms.** For every
   compositional algorithm the output uses, colltree compares the output's
   choices at its inner layouts (node_comm: (1, ppn), node_roots_comm:
-  (N, 1); other ops from their files) with those of the inner selection
-  its data were measured under, and lists the layouts where they differ as
-  "remeasure". With the two-stage check this converges in one remeasure.
-- The stage-specific paths of §11 (`MODEL1 MODEL2`, `auto` leaves) are gone.
+  (N, 1), comm: the caller's own) with those of the inner selection its data
+  were measured under, for any inner collective whose tree is in the same
+  output, read with that collective's unit of the caller's variant, and
+  lists where they differ as "remeasure" with the collmodel command. With
+  the two-stage check this converges in one remeasure.
+- **Several collectives, one file.** Every collective among the selected
+  units (`--colls`, `--unit`) gets its subtrees in the output; `--with`
+  copies in another file's subtrees of the collectives not built here.
+- **Several variants of a collective, one file.** Each unit's input
+  conditions that hold are set in all its masks, so a variant's sets have
+  names of their own and the dispatch tests those bits too. Its base set
+  (exactly its input conditions) covers every layout and is built from its
+  own curves even without an algorithm restricted to it, since the variant
+  changes every algorithm's cost. The variants share one table of subtrees,
+  built in order of increasing mask: a set may call a subset's subtree from
+  another variant, scored with this variant's own curves of the algorithms
+  that subtree uses (only where it has them all). Where no variant is free
+  of input conditions (the reductions measure builtin commutative ops), the
+  one with the fewest builds r0 from its unrestricted algorithms: the
+  run-time fallback of user ops (§11). Two units with the same input
+  conditions (e.g. differing in `counts` only) are refused. colltree lists
+  the variants without a unit, those not measured by design and those
+  missing, with the subtree their calls reach.
+- **Sizes.** The size splits use `msg_size` (§7); collectives without a
+  message size the same on every rank build trees without size splits.
 - **Several memory kinds, one file.** Host and device buffers have their
   own model each, because an algorithm's cost on device buffers says
   little about its cost on host buffers. A device call must therefore
@@ -801,24 +819,33 @@ import from their journals.
 ### 12.4 Batch strategies
 
 What a strategy weighs: node-hours and queue limits (job length, nodes per
-job), the collectives to cover and their inner dependencies (allreduce smp
-needs reduce and bcast files), how complete the algorithm set must be, the
-allocation sizes, and when to validate. Examples:
+job), the collectives, variants and launch kinds to cover, how complete
+the algorithm set must be, the allocation sizes, and when to validate.
 
-- **All at once** (§11's stages): every non-compositional algorithm, tree,
-  compositional algorithms with that file loaded, tree, validation.
+The tools support one run over many units up to a stage (`--max-stage`) or
+a launch kind, and any split of that run: the unit of splitting is (coll,
+variant, launch, algorithm set). The only ordering that matters is the
+stage order of §11: a stage-k algorithm needs the trees of the units'
+stages below k, built by colltree from the model so far. Everything else is
+stage 1 and independent. Examples:
+
+- **The whole collection:** `--plan`; stage 1 of every unit (split across
+  jobs as the queue allows, `--merge` the files); colltree into an inner
+  file; each later stage with `--model` and that file; one colltree over
+  the collection; validation.
 - **Start small:** MPICH's default algorithms first, a file early, the
   rest added in later jobs as node-hours allow.
-- **Several collectives:** ops in the order of their inner dependencies,
-  one model per op, compositional algorithms after their inner ops' files.
 - **Remeasure:** after a staleness report or a large anchor drift.
+- **Enhancement runs:** when MPICH gains a narrow restrictive condition for
+  a common case the variants leave out (a vector datatype, a specific op,
+  §11), a later run adds the algorithms that need it to the units it
+  concerns.
 
-For now strategies are a usage guide written for an AI to turn into a
-handoff kit (job scripts, plans, checkpoints, the expected outputs) or an
-execution plan; an orchestration tool may follow once they settle.
-Validation stays part of every strategy: the same algorithm can cost
-differently by how it is selected (§10), which no model of forced
-measurements predicts.
+For now strategies are a usage guide written for an AI to turn into an
+execution plan (the repo's batch skill); an orchestration tool may follow
+once they settle. Validation stays part of every strategy: the same
+algorithm can cost differently by how it is selected (§10), which no model
+of forced measurements predicts.
 
 ## 13. Limitations and next steps
 
@@ -833,9 +860,10 @@ measurements predicts.
 - **GPU buffers**: one rank per GPU (or tile) only, warm buffers only, no
   mixed host/device buffers. `check=1` and a check of reductions on device
   buffers are not there yet. Placement keeps the host `place` modes, and
-  whether tile/GPU placement needs one of its own is open. The inner call
-  of `buffer_swap` (the host selection, on the same communicator) isn't
-  covered by the staleness check.
+  whether tile/GPU placement needs one of its own is open.
+- **Count patterns of the v-collectives** (`counts=uniform|linear|onebig`)
+  are units of their own, but no condition tells them apart at run time:
+  colltree takes one of them per collective (`--unit`).
 - **Extrapolation beyond the allocation** (N > N_max) is not modeled: the
   tree's last branch covers it.
 - The v1 p90 error estimate is unreliable (few random checks); v2's regret

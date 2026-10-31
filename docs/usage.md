@@ -111,11 +111,14 @@ It must end with `DRIVE CHECK PASSED`.
 
 ### 6.1 All algorithms of a collective (v2)
 
+One collective here; for many collectives, variants and launch kinds in
+stages, see §6.7.
+
 ```sh
 bin/collmodel --op bcast \
     --algs binomial,scatter_recursive_doubling_allgather,scatter_ring_allgather,circ_graph,tree,pipelined_tree \
     --site aurora --nodes 8 --ppn 96 \
-    --budget-node-h 2 --out bcast.json --log bcast.jsonl
+    --budget-h 0.25 --out bcast.json --log bcast.jsonl
 ```
 
 - `--site/--nodes/--ppn` launch the server through `launch/config.sh`;
@@ -140,7 +143,7 @@ bin/collmodel --op bcast \
 ```sh
 bin/collmodel --op bcast --algs all \
     --catalog $MPICH_SRC/src/mpi/coll/coll_algorithms.txt \
-    --site aurora --nodes 8 --ppn 96 --budget-node-h 2 --out bcast.json --log bcast.jsonl
+    --site aurora --nodes 8 --ppn 96 --budget-h 0.25 --out bcast.json --log bcast.jsonl
 ```
 
 - `--catalog` is the `coll_algorithms.txt` of the MPICH build under
@@ -156,7 +159,7 @@ bin/collmodel --op bcast --algs all \
   left out.
 - Then one builder per restriction set: `r0` (unrestricted algorithms) on
   every layout, then each other set on the layouts where exactly its
-  conditions hold (e.g. `800`, `release_gather` on single-node layouts). Each
+  conditions hold (e.g. `200`, `release_gather` on single-node layouts). Each
   later set keeps a share of the budget in proportion to its layouts, and
   reuses the measurements made before it.
 - Compositional algorithms (`--compositional`, default those with an
@@ -189,7 +192,7 @@ run an earlier job did not finish:
 cd "$PBS_O_WORKDIR"
 resume=""; [ -s bcast.log ] && resume=--resume
 bin/collmodel --algs binomial,scatter_recursive_doubling_allgather,scatter_ring_allgather,circ_graph,tree,pipelined_tree \
-    --site aurora --nodes 8 --ppn 96 --budget-node-h 6 \
+    --site aurora --nodes 8 --ppn 96 --budget-h 0.75 \
     --log bcast.log $resume --deadline 3300 --out bcast.json
 ```
 
@@ -207,7 +210,7 @@ the model the run started from).
 CAT=$MPICH_SRC/src/mpi/coll/coll_algorithms.txt
 # an algorithm the model lacks (all: every one of the catalog's it lacks)
 bin/collmodel --model bcast.json --algs pipelined_tree --catalog $CAT \
-    --site aurora --nodes 8 --ppn 96 --budget-node-h 1 --out bcast2.json --log add.jsonl
+    --site aurora --nodes 8 --ppn 96 --budget-h 0.125 --out bcast2.json --log add.jsonl
 # more layouts for the algorithms it has
 bin/collmodel --model bcast.json --layouts 4x24,16x8 --catalog $CAT ... --out bcast2.json
 ```
@@ -231,7 +234,7 @@ tuning file of their inner calls loaded in the launch:
 ```sh
 bin/colltree bcast.json --out bcast_tuning.json
 bin/collmodel --model bcast.json --algs smp --inner-selection bcast_tuning.json --catalog $CAT \
-    --site aurora --nodes 8 --ppn 96 --budget-node-h 1 --out bcast2.json --log add.jsonl
+    --site aurora --nodes 8 --ppn 96 --budget-h 0.125 --out bcast2.json --log add.jsonl
 bin/colltree bcast2.json --out bcast_tuning2.json
 ```
 
@@ -368,6 +371,50 @@ bin/collmodel --mem device --algs all --catalog $MPICH_SRC/src/mpi/coll/coll_alg
 
 Then build one tuning file from both models (§7).
 
+### 6.7 A whole collection, in stages
+
+Many units in one run: a unit is a collective in one variant (in place or
+not; for the reductions the builtin op `MPI_SUM`) and launch kind, named by
+its tags (§6.1). The compositional algorithms come in later stages, each
+measured with the trees of the earlier ones loaded (design.md §11).
+
+```sh
+CAT=$MPICH_SRC/src/mpi/coll/coll_algorithms.txt
+# 1. the units and their algorithms by stage, and the trees each needs
+bin/collmodel --plan --colls bcast,ibcast,reduce:all,ireduce:all,allreduce:all,iallreduce:all --launch host,gpu --catalog $CAT
+# 2. stage 1: every plain algorithm of every unit (one file; split into jobs as the queue allows)
+bin/collmodel --colls bcast,ibcast,reduce:all,ireduce:all,allreduce:all,iallreduce:all --launch host,gpu --algs all --max-stage 1 \
+    --catalog $CAT --site aurora --nodes 8 --ppn 96 --out s1.json --log s1.log
+# 3. the trees so far, as the inner selection of stage 2
+bin/colltree s1.json --out inner1.json
+# 4. stage 2 (e.g. bcast nb, on ibcast's tree); the --out file keeps s1.json's other units
+bin/collmodel --model s1.json --colls bcast --launch host --algs all --max-stage 2 \
+    --inner-selection inner1.json --catalog $CAT --site aurora --nodes 8 --ppn 96 --out s2.json --log s2.log
+# ... colltree s2.json, stage 3 (bcast smp, on the bcast tree with nb), and so on to the last stage
+# 5. the tuning file of the whole collection
+bin/colltree s3.json --out tuning.json
+```
+
+- `--colls COLL:all` measures every variant the collective takes (in place
+  and not); `--launch host,gpu` runs the units of each launch kind on a
+  server of its own (`gpu`: device buffers with `MPIR_CVAR_ENABLE_GPU_COLL=1`).
+  Each unit has its own journal in the `--log` directory, its own budget
+  (`--budget-h`) and a `done` record, so `--resume` continues where a job
+  stopped (§6.5).
+- `--plan` needs only `--catalog`. A stage-k algorithm is 1 + the stage at
+  which the trees its inner calls select from are complete: with MPICH's
+  catalog host bcast `nb` 2, `smp` 3; on gpu `buffer_swap` 4, `smp` 5; host
+  allreduce `smp` 4. `--max-stage k` adds only the algorithms up to k (with
+  `--algs all`; an explicit `--algs` above k is refused), and collmodel
+  refuses one whose inner trees are not in `--inner-selection`.
+- Split jobs any way: by collective, variant, launch kind or stage. Files
+  from parallel jobs combine with `collmodel --merge A.json --merge B.json
+  --out C.json`. Only the stage order is fixed.
+- colltree writes every collective's and variant's subtrees into one file,
+  reports the variants without a unit (user ops are not measured by design;
+  their calls reach subtree 0, correct for any op), and reports stale
+  compositional algorithms with the collmodel command that remeasures them.
+
 ## 7. Make and load the tuning file (`bin/colltree`)
 
 ```sh
@@ -407,11 +454,12 @@ subtree of that name; everything else keeps its defaults. A malformed file
 stops `MPI_Init` with the line and column of the error.
 
 The output has a subtree per restriction set (the suffix is the mask of
-true conditions, bit k = the condition with index k in
-`coll_algorithms.txt`): `name=bcast-intra-0`, `name=bcast-intra-800`, ...,
+true conditions, bit k = the restriction with index k in
+`coll_algorithms.txt`): `name=bcast-intra-0`, `name=bcast-intra-200`, ...,
 and `name=bcast-intra-auto` dispatches on the restrictions, e.g.
-`"dispatch=bcast-intra(0x820)"`: MPICH continues in `bcast-intra-800` on a
-single-node communicator, `bcast-intra-20` on a hierarchical one, else
+`"dispatch=bcast-intra(0x210)"`: MPICH continues in `bcast-intra-200`
+(`MPIDI_CH4_release_gather`, bit 9) on a single-node communicator,
+`bcast-intra-10` (`hierarchical`, bit 4) on a hierarchical one, else
 `bcast-intra-0`. An MPICH without `dispatch=` (pmodels/mpich#8048) needs
 `--nested-dispatch`, which writes nested conditions ending in `call=`. A
 restricted set's leaves are the algorithms allowed there or `call=` a

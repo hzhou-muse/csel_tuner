@@ -1,6 +1,6 @@
 ---
 name: csel-tuner-batch
-description: Plan and package csel_tuner measurement campaigns (batch strategies) — which collectives, algorithms and layouts to measure in which jobs within a node-hour budget, in what order (plain algorithms before compositional ones, inner ops first), and how to turn that into a handoff kit (PBS job scripts, an operator plan with checkpoints and a Log, a result tarball) or an execution plan run directly. Use whenever the user asks to tune MPICH collectives with csel_tuner on a cluster, to build or update a measurement kit, to add algorithms or layouts to an existing model, to remeasure, to validate a tuning file live, or to estimate what a tuning campaign costs.
+description: Plan and package csel_tuner measurement campaigns (batch strategies) — which collectives, variants, launch kinds, algorithms and layouts to measure in which jobs within a node-hour budget, in what order (the stages of the compositional algorithms), and how to turn that into a handoff kit (PBS job scripts, an operator plan with checkpoints and a Log, a result tarball) or an execution plan run directly. Use whenever the user asks to tune MPICH collectives with csel_tuner on a cluster, to build or update a measurement kit, to add algorithms or layouts to an existing model, to remeasure, to validate a tuning file live, or to estimate what a tuning campaign costs.
 ---
 
 # csel_tuner batch strategies
@@ -16,10 +16,12 @@ repo for the tools themselves; this file assumes them.
 
 | Block | Command | In → out | Cost |
 |---|---|---|---|
-| **create** | `bin/collmodel --algs all --catalog CAT ...` | → model `M0.json` | the budget (`--budget-node-h`) or less; precheck: one probe per algorithm × layout |
-| **add** | `bin/collmodel --model Mi.json --algs X[,Y] ...` or `--layouts NxP,...` | `Mi` → `Mi+1` | only the new measurements, plus a few anchors |
-| **add compositional** | `... --model Mi.json --algs smp --inner-selection Ti.json` | `Mi` → `Mi+1` | as add; the launch loads `Ti` |
-| **tree** | `bin/colltree Mi.json --out Ti.json [--node-aware]` | `Mi` → tuning file `Ti` | seconds to a minute on the login or compute node; no measurement |
+| **plan** | `bin/collmodel --plan --colls ... --launch ... --catalog CAT` | → the units, their algorithms by stage, the trees each needs | none |
+| **create** | `bin/collmodel --colls C1,C2:all,... --launch host,gpu --algs all --max-stage 1 --catalog CAT ...` | → model `M0.json` (one unit per collective, variant and launch kind) | per unit its budget (`--budget-h`) or less; precheck: one probe per algorithm × layout |
+| **add** | `bin/collmodel --model Mi.json --colls C --algs X[,Y] ...` or `--layouts NxP,...` | `Mi` → `Mi+1` (keeps `Mi`'s other units) | only the new measurements, plus a few anchors |
+| **next stage** | `... --model Mi.json --colls ... --algs all --max-stage k --inner-selection Ti.json` | `Mi` → `Mi+1` | as add; the launch loads `Ti`, the trees of the stages below k |
+| **merge** | `bin/collmodel --merge A.json --merge B.json --out C.json` | split jobs' files → one | none |
+| **tree** | `bin/colltree Mi.json --out Ti.json [--colls ...] [--node-aware]` | `Mi` → tuning file `Ti` for every collective and variant in it | seconds to a minute on the login or compute node; no measurement |
 | **validate** | `groundtruth/gen_plans.py --set validate`, `run_set.sh` ×3, `score_live.py validate` | `Mi`, `Ti` → report | truth = every algorithm at the plan's random points; default and tuned one request per point (gen_plans prints the counts) |
 | **import** | `bin/collmodel --import old.json:old.log ...` | collmodel/3 → /4 | none |
 
@@ -35,24 +37,35 @@ Rules the tools enforce or assume:
   or SIGTERM is re-submitted with `--resume` and the same arguments; the
   journal replays what was measured. Settings must not change between
   resumes (it refuses).
-- **Compositional after their inner ops.** A compositional algorithm (an
-  `inner` key in `coll_algorithms.txt`, e.g. bcast `smp`) is measured with
-  a tuning file for its inner calls loaded. Add every plain algorithm
-  first, build the tree, then add the compositional one with that tree. If
-  plain algorithms are added later, `colltree` prints `stale:` lines for
-  the compositional one; then add it again with the new tree (it replaces
-  its curves). The two-stage check stops a run whose inner calls could
-  reach a compositional algorithm.
-- **One model per op.** Across ops, inner dependencies decide the order
-  (allreduce smp calls reduce and bcast): finish the inner ops' models and
-  trees first. Cross-op inner calls are not checked by the tools yet; the
-  plan must load a tuning file that has every inner op's subtree.
+- **Stages.** A compositional algorithm (an `inner` key in
+  `coll_algorithms.txt`: bcast `smp`, and the general `nb` and
+  `buffer_swap`) is measured with a tuning file for its inner calls loaded,
+  so it comes in a later stage: `--plan` gives each algorithm's stage (with
+  MPICH's catalog host bcast `nb` 2, `smp` 3, gpu `buffer_swap` 4, host
+  allreduce `smp` 4). Run stage k with `--max-stage k` and an
+  `--inner-selection` file that colltree built from the stages below k;
+  collmodel refuses an algorithm whose inner trees the file lacks. If
+  earlier stages change later, `colltree` prints `stale:` lines with the
+  command that re-adds the compositional algorithm (it replaces its
+  curves). The two-stage check stops a run whose inner calls could reach a
+  compositional algorithm. Everything else is stage 1 and independent.
+- **One model file, many units.** A unit is (collective, variant, launch
+  kind); a run measures several one after another, each with its own
+  journal, budget and `done` record. Split jobs by unit (collective,
+  variant, launch kind) or by stage, any way the queue suggests, and
+  `--merge` the files. User ops and derived datatypes are not measured by
+  design: their calls reach subtree 0, correct for any op; a narrow MPICH
+  condition for a common case (a vector type, a specific op) is covered
+  later by an enhancement run.
 - **MPICH requirements.** The build under test needs the per-request
   algorithm switch (`MPISRV_CVAR_SWITCH=1`; MPICH main ≥ de0b8e6921), the
   `restrictions:` section and side-effect-free release_gather condition
   (pmodels/mpich#8048, merged) for `--catalog`, and `dispatch=` for
-  the default tree output (else `--nested-dispatch`). `mpisrv` must be
-  rebuilt against the MPICH under test.
+  the default tree output (else `--nested-dispatch`). The tree's size
+  splits use `msg_size` (pmodels/mpich#8083; else `colltree
+  --size-condition avg_msg_size`), and leaf parameters write booleans as
+  0/1 (pmodels/mpich#8080). `mpisrv` must be rebuilt against the MPICH
+  under test.
 - **Validate live.** The same algorithm can run at different speeds
   depending on how it is selected (built-in selection, CVAR, file), so a
   model built from forced measurements cannot replace timing MPICH with the
@@ -73,11 +86,12 @@ model per allocation shape; the tree extrapolates beyond it only crudely).
 | **Start small** | little time now, more later; or a quick first file | create with MPICH's default algorithms (those its built-in selection uses) → tree → validate; later adds of the rest as node-hours allow, each followed by tree (+ compositional re-add if stale) |
 | **Grow** | an existing model; a new MPICH algorithm or a new restriction | add the new algorithm(s) → tree → (re-add compositional if stale) → validate |
 | **More layouts** | validation shows a poor layout region; the builder stopped early | add `--layouts` for the region → tree → validate |
-| **Several collectives** | more than one op | per op in inner-dependency order (bcast and reduce before allreduce): create → tree; then compositional adds that need several ops' files, loaded together; then validate per op |
+| **Whole collection** | several collectives, variants, launch kinds | plan → stage 1 of every unit (split across jobs, merge) → tree → each later stage with the tree of the ones before → one tree over the collection → validate per collective |
+| **Enhancement** | MPICH gains a narrow condition for a common case the variants leave out (a vector datatype, a specific op) | add the algorithms that need it to the units it concerns → tree → validate |
 | **Remeasure** | `stale:` lines from colltree, or an anchor drift warning | stale: re-add the compositional algorithm with the latest tree. Drift: compare the anchor ratio with the validation; if the layouts moved, plan a fresh create rather than mixing jobs |
 | **Validate only** | a tuning file to check on a new build or other nodes | gen_plans + run_set + score_live |
 
-Sizing a job: a create step costs at most its `--budget-node-h` (it
+Sizing a job: a create step costs at most its units' `--budget-h` (each
 stops earlier at its regret target or when every layout is measured); an
 add costs a fraction of a create in proportion to the algorithms added,
 since the existing algorithms are not measured again; a tree costs no
@@ -90,9 +104,11 @@ an earlier model of the same system; read its history:
 python3 -c "import json,sys; [print(r['mode'], r.get('algs'), r.get('stop'), r.get('node_h')) for r in json.load(open(sys.argv[1]))['runs']]" M.json
 ```
 
-Give each step its own `--budget-node-h` cap and a `--deadline` that leaves
-time for the tree and for writing (5 min is plenty). A job may hold several
-steps; a step that cannot finish resumes in the next job.
+Give each unit a `--budget-h` cap (wall-clock hours, all jobs) if the
+plan needs one, and each job a `--deadline` that leaves time for the tree
+and for writing (5 min is plenty). A job may hold several steps; a step
+that cannot finish resumes in the next job (`--resume` skips finished
+units).
 
 ## Two ways to run a strategy
 
@@ -146,6 +162,9 @@ python3 $CSEL_TUNER/groundtruth/gen_plans.py --set validate --out plans/validate
 
 ## What to check (expected outputs to put in a plan)
 
+- **plan:** per unit, `tree complete at stage k` and the algorithms of each
+  stage with the trees they need; the number of stages is the number of
+  rounds of add + tree.
 - **create:** the `set <op>-intra-<mask>: N layouts, algorithms ...`
   lines (number of layouts per set: set 0 has every allowed layout, the
   release_gather set the single-node ones, the smp set those with several
@@ -156,13 +175,14 @@ python3 $CSEL_TUNER/groundtruth/gen_plans.py --set validate --out plans/validate
   `compositional (add them later ...)` line, the per-set
   lines and the total line (layouts, measurements, node-h, stop).
 - **add:** the `set` lines (a compositional or restricted algorithm adds a
-  set, e.g. `bcast-intra-20` with smp), the `anchors:` line (ratio geomean
+  set, e.g. `bcast-intra-10` with smp), the `anchors:` line (ratio geomean
   near 1; a `warning: an anchor moved` is a stop-and-report), `two-stage
   check` lines (failed = stop), the total line with `stop: done` (`budget`
   = the cap was too small; `deadline`/`terminated` = re-submit).
 - **tree:** per subtree, leaves, predicted regret and `used:`; the
-  dispatch line (`dispatch=<op>-intra(0x...)` covering every set); any
-  `stale:` lines (then the plan's remeasure step runs).
+  variant lines (`not measured (no recipe)` for the user ops is expected;
+  `missing (not measured yet)` names a unit the plan should still have);
+  any `stale:` lines (then the plan's remeasure step runs).
 - **validate:** `check_r.py` ends with `ALL CHECKS PASSED` for every
   result directory; copy the `score_live` report verbatim. The operator
   does not interpret it; you do, afterwards.
