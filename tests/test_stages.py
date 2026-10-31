@@ -75,6 +75,18 @@ def test_catalog_details():
     leaf = {x.name: x.leaf for x in cat.algorithms("ibcast")}
     assert leaf == {"sched_binomial": "MPIR_Ibcast_intra_sched_binomial",
                     "tsp_tree": "MPIR_TSP_Ibcast_sched_intra_tree"}
+    # leaf parameters at the server's CVAR values; "use_ring=0" is a constant, THROTTLE is alltoall's
+    tsp = [x for x in cat.algorithms("ibcast") if x.name == "tsp_tree"][0]
+    cv = {"MPIR_CVAR_IBCAST_TREE_TYPE": "kary", "MPIR_CVAR_IBCAST_TREE_KVAL": 4,
+          "MPIR_CVAR_IBCAST_TREE_PIPELINE_CHUNK_SIZE": 0}
+    assert tsp.params(cv) == ({"tree_type": "kary", "k": 4, "chunk_size": 0}, [])
+    assert tsp.params({}) == ({}, ["MPIR_CVAR_IBCAST_TREE_TYPE", "MPIR_CVAR_IBCAST_TREE_KVAL",
+                                   "MPIR_CVAR_IBCAST_TREE_PIPELINE_CHUNK_SIZE"])
+    from csel_tuner.algos import Alg
+    x = Alg("ialltoallv", "tsp_scattered", {"extra_params": "batch_size, use_ring=0, bblock",
+                                             "cvar_params": "SCATTERED_BATCH_SIZE, -, THROTTLE"})
+    assert x.params({"MPIR_CVAR_IALLTOALLV_SCATTERED_BATCH_SIZE": 4, "MPIR_CVAR_ALLTOALL_THROTTLE": 32}) == \
+        ({"batch_size": 4, "bblock": 32}, [])
     assert cat.has_inner()
     assert not catalog(CATALOG.replace("        inner: bcast-intra@node_comm, bcast-intra@node_roots_comm\n",
                                        "")).has_inner()

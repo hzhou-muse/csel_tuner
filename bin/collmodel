@@ -309,6 +309,7 @@ def live(a, shared=None):
         if shared is not None:
             shared["srv"] = srv
     info = srv.world
+    a.cvar_values = info.get("cvar_values")     # the algorithms' leaf parameters (alg_info)
     if info.get("mem", "host") != mem:
         srv.close()
         sys.exit(f"launch {a.launch}: the server reports {info.get('mem', 'host')} buffers, not {mem}")
@@ -570,9 +571,24 @@ def catalog_algs(a):
     return [x for x in cat.algorithms(a.op) if x.name not in skip], cat.restriction_bits()
 
 
-def alg_info(x, bits):
-    return {"leaf": x.leaf, "restrictions": x.restrictions, "mask": x.mask(bits),
+def alg_info(x, bits, cvar_values=None, old=None):
+    """An algorithm's model entry; "params" are its leaf parameters at the server's CVAR values
+    (none in replay), kept from old when the model has them already."""
+    info = {"leaf": x.leaf, "restrictions": x.restrictions, "mask": x.mask(bits),
             "inner": [str(i) for i in x.inner]}
+    params, missing = x.params(cvar_values) if cvar_values is not None else (None, [])
+    if missing:
+        print(f"{x.name}: the server reports no {', '.join(missing)}; its leaf parameters are not recorded",
+              file=sys.stderr)
+        params = None
+    if old and "params" in old:
+        if params is not None and params != old["params"]:
+            print(f"{x.name}: measured with parameters {old['params']}, the server now has {params}; "
+                  "keeping the model's", file=sys.stderr)
+        params = old["params"]
+    if params is not None:
+        info["params"] = params
+    return info
 
 
 def missing_inner(x, text):
@@ -617,7 +633,7 @@ def restriction_sets(a, model, algs, probe):
     sets = plan_sets(algs1, bits, masks)
     for mask, lays, names in sets:
         print(f"set {set_name(a.op, mask)}: {len(lays)} layouts, algorithms {', '.join(names)}", file=sys.stderr)
-    model.algorithms.update({x.name: alg_info(x, bits) for x in algs1})
+    model.algorithms.update({x.name: alg_info(x, bits, a.cvar_values) for x in algs1})
     model.masks = dict(masks)
     model.left_out = sorted(broken)
     model.notes += ["precheck: " + n for n in notes]
@@ -752,7 +768,7 @@ def extend(a, model, measure, probe, inner_hash, clock, nodes, on_layout, stop_c
         by_name = {x.name: x for x in algs}
         for name in m.algorithms:
             if name in by_name:
-                m.algorithms[name] = alg_info(by_name[name], bits)
+                m.algorithms[name] = alg_info(by_name[name], bits, a.cvar_values, m.algorithms[name])
     elif m.conditions:
         sys.exit("the model has restriction sets: give --catalog to add to it")
     else:
@@ -789,7 +805,7 @@ def extend(a, model, measure, probe, inner_hash, clock, nodes, on_layout, stop_c
     sample = set()
     for name in want:
         if name not in m.algorithms:
-            m.algorithms[name] = alg_info(by_name[name], bits) if name in by_name else \
+            m.algorithms[name] = alg_info(by_name[name], bits, a.cvar_values) if name in by_name else \
                 {"leaf": None, "restrictions": [], "mask": 0, "inner": []}
             sample.add(name)
         elif m.is_compositional(name) and m.fit_inner.get(name) != inner_hash:
@@ -1097,6 +1113,7 @@ def parse_args(argv):
                    help="replay algorithm NAME from the recorded REC, runnable only on single-node, multi-node, "
                         "or multi-node layouts with several ranks per node (hier); e.g. release_gather=auto@single "
                         "(MPICH's default on one node)")
+    ap.set_defaults(cvar_values=None)          # from the server's info record, in live()
     a = ap.parse_args(argv)
     if not a.out and not a.plan:
         ap.error("--out is required (except with --plan)")

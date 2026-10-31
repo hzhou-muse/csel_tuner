@@ -385,7 +385,7 @@ It prints the tree size, the predicted regret and the algorithms used.
 | `--min-fallback-algs` | 3 | a set may call a subset's subtree that uses at least this many algorithms; a smaller one's algorithms are candidates directly |
 | `--stale-tol` | 1.05 | report a compositional algorithm's changed inner choice when the two are predicted more than this apart |
 | `--nested-dispatch` | off | dispatch on restrictions with nested conditions instead of `dispatch=` (MPICH without pmodels/mpich#8048) |
-| `--param ALG.KEY=VALUE` | | extra parameter of an algorithm leaf, e.g. `tree.k=4` |
+| `--param ALG.KEY=VALUE` | | override an algorithm leaf's parameter, e.g. `tree.k=4`; by default the leaves get the parameters the model recorded (the CVAR values of the measurements, design §8) |
 
 Use it with MPICH:
 
@@ -517,7 +517,7 @@ python3 tests/test_restrict.py   # catalog, precheck, sets, dispatch; the builds
 python3 tests/test_extend.py     # adding an algorithm and layouts to a model, resume; needs replay data
 python3 tests/test_gpu.py        # memory-kind restrictions; colltree merging host and device models
 python3 tests/test_kinds.py      # restriction kinds, variants; inner trees in --inner-selection
-python3 tests/test_stages.py     # algorithm stages from inner calls; disabled algorithms, leaf names
+python3 tests/test_stages.py     # algorithm stages from inner calls; disabled algorithms, leaf names and parameters
 ```
 
 They also run under pytest.

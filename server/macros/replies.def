@@ -59,7 +59,9 @@ fncode: reply_info(int seq)
     $for i=0:num_colls
         $my const struct coll *cl = coll_table[i]
         fprintf(out, "%s\"%s\":{\"layout\":\"%s\",\"elem\":%ld,\"rooted\":%d,\"no_data\":%d,\"sbuf_p\":%d,\"rbuf_p\":%d,\"vcounts\":%d,\"inplace_ok\":%d}", i ? "," : "", cl->name, cl->layout == LAYOUT_PAIR ? "pair" : "comm", cl->elem, cl->rooted, cl->no_data, cl->sbuf_p, cl->rbuf_p, cl->vcounts, cl->inplace_ok)
-    fprintf(out, "},\"env\":{")
+    fprintf(out, "},")
+    put_cvar_values()
+    fprintf(out, "\"env\":{")
     extern char **environ;
     $my int first = 1
     $for char **e = environ; *e; e++

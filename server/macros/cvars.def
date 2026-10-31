@@ -101,3 +101,43 @@ fncode: apply_cvars(const struct req *rq, int restore)
             # rank 0 validated it, so ranks disagree: give up
             fprintf(stderr, "mpisrv: rank %d: %s: %s\n", world_rank, rq->cvar_name[k], err)
             MPI_Abort(MPI_COMM_WORLD, 3)
+
+# Rank 0, info record: "cvar_values":{NAME:VALUE,...} for every global MPI_INT
+# control variable of one element, an enum as its item name. collmodel records
+# the values of the algorithms' parameters (coll_algorithms.txt cvar_params),
+# which colltree writes into the tuning file's leaves.
+fncode: put_cvar_values()
+    $my int num = 0, int first = 1
+    MPI_T_cvar_get_num(&num)
+    fprintf(out, "\"cvar_values\":{")
+    $for idx=0:num
+        $my char name[256], int nlen = sizeof(name), int verb, int bind, int scope
+        $my MPI_Datatype dtype, MPI_T_enum etype
+        $if MPI_T_cvar_get_info(idx, name, &nlen, &verb, &dtype, &etype, NULL, NULL, &bind, &scope) != MPI_SUCCESS
+            continue
+        $if bind != MPI_T_BIND_NO_OBJECT || dtype != MPI_INT || strncmp(name, "MPIR_CVAR_", 10)
+            continue
+        $my MPI_T_cvar_handle h, int count = 0, int val = 0
+        $if MPI_T_cvar_handle_alloc(idx, NULL, &h, &count) != MPI_SUCCESS
+            continue
+        $if count == 1 && MPI_T_cvar_read(h, &val) == MPI_SUCCESS
+            fprintf(out, "%s\"%s\":", first ? "" : ",", name)
+            first = 0
+            $my const char *item_name = NULL, char item[256]
+            $if etype != MPI_T_ENUM_NULL
+                $my int n_items = 0, int len = 0
+                MPI_T_enum_get_info(etype, &n_items, NULL, &len)
+                $for i=0:n_items
+                    $my int iv, int ilen = sizeof(item)
+                    $if MPI_T_enum_get_item(etype, i, &iv, item, &ilen) == MPI_SUCCESS && iv == val
+                        item_name = item
+                        break
+            $if item_name
+                fprintf(out, "\"")
+                put_string(item_name)
+                fprintf(out, "\"")
+            $else
+                fprintf(out, "%d", val)
+        MPI_T_cvar_handle_free(&h)
+    fprintf(out, "},")
+

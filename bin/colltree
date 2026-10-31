@@ -69,9 +69,11 @@ from csel_tuner.restrict import GPU, GPU_COLL, role_layout, set_name, set_prefix
 from csel_tuner.single import is_pof2  # noqa: E402
 from csel_tuner.tree import fit_tree, json_choice, json_tree, prune_to, select  # noqa: E402
 
-# extra parameters of algorithm leaves (coll_algorithms.txt extra_params), at
-# the CVAR defaults the measurements ran with; --param alg.key=value overrides
-PARAMS = {"bcast": {"tree": {"tree_type": "kary", "k": 2, "is_non_blocking": True},
+# Leaf parameters (coll_algorithms.txt extra_params) come from the model, which
+# records the CVAR values the server ran with (collmodel alg_info). This table
+# is only for models recorded before that (and replay), at the MPICH CVAR
+# defaults of 2026-10; --param alg.key=value overrides either.
+LEGACY_PARAMS = {"bcast": {"tree": {"tree_type": "kary", "k": 2, "is_non_blocking": True},
                     "pipelined_tree": {"tree_type": "kary", "k": 2, "is_non_blocking": True,
                                        "chunk_size": 8192, "recv_pre_posted": False}},
           "allreduce": {"tree": {"tree_type": "knomial_1", "k": 2, "chunk_size": 0, "buffer_per_child": False},
@@ -339,11 +341,21 @@ def main(argv=None):
         if m.mem == "gpu" and GPU_COLL in m.conditions:
             drop_bit(m, 1 << m.conditions.index(GPU_COLL))
     feats = ["N", "ppn", "p", "m", "pof2"] if a.node_aware else ["p", "m", "pof2"]
-    params = {k: dict(v) for k, v in PARAMS.get(op, {}).items()}
+    override = {}
     for kv in a.param:
         k, v = kv.split("=", 1)
         alg, key = k.split(".", 1)
-        params.setdefault(alg, {})[key] = parse_value(v)
+        override.setdefault(alg, {})[key] = parse_value(v)
+
+    def leaf_params(m, alg):
+        rec = m.algorithms.get(alg, {}).get("params")
+        if rec is None:
+            rec = LEGACY_PARAMS.get(op, {}).get(alg, {})
+            if rec and alg not in warned:
+                print(f"{alg}: the model has no recorded leaf parameters; using {rec}", file=sys.stderr)
+                warned.add(alg)
+        return dict(rec, **override.get(alg, {}))
+    warned = set()
 
     out, disp, built = {}, {}, []
     for mem in ("host", "device"):
@@ -360,7 +372,7 @@ def main(argv=None):
         def sub(o, m=m):
             if isinstance(o, tuple):
                 return "call=" + set_name(op, o[1], m.mem)
-            return ("algorithm=" + m.leaf(o), params.get(o, {}))
+            return ("algorithm=" + m.leaf(o), leaf_params(m, o))
         out.update({f"name={set_name(op, mask, mem)}": json_tree(t, opts, sub)
                     for mask, (t, opts) in sorted(S.trees.items())})
         present = sorted(S.trees)

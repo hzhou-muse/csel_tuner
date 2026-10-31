@@ -376,6 +376,17 @@ before a tag existed has its default value).
 `"mem"` is the buffers' memory kind, `host` (also when the field is
 absent) or `device`.
 
+An algorithm with `extra_params` in the catalog also has `"params"`, the
+leaf parameters at the values the server ran with: mpisrv's info record
+lists every global int and enum CVAR (`cvar_values`, enums by item name),
+and each non-constant parameter takes `MPIR_CVAR_<COLL>_<cvar_param>`, as
+MPICH's `maint/gen_coll.py` maps them. colltree writes them into the
+leaves, so a tuning file runs an algorithm the way it was measured, also
+under `--env` overrides. A boolean comes out as 0 or 1 (MPI_T reports it as
+an int), which MPICH's JSON parser accepts since csel-json-bool-int. A
+model without `params` (recorded earlier, or replay) gets colltree's
+frozen table of the 2026-10 defaults.
+
 A measurement of a compositional algorithm also has `"inner": "<hash>"`,
 an anchor `"anchor": true`. An algorithm's model across layouts is a
 LayoutModel (§5) over all its curves, fitted on load. collmodel/2 and /3,

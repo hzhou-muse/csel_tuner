@@ -73,6 +73,23 @@ class Alg:
             leaf = "MPIR_%s_%s_%s" % (coll, kind, name)
         self.leaf = keys.get("func_name") or leaf
 
+    def params(self, cvar_values):
+        """The leaf parameters at the CVAR values the measurements ran with: ({name: value}, [missing
+        CVARs]). Each non-constant extra_params entry takes the value of MPIR_CVAR_<COLL>_<cvar_param>
+        (maint/gen_coll.py get_algo_extra_args); "name=value" entries are constants, not in the leaf."""
+        out, missing = {}, []
+        for name, cvar in zip(self.extra_params, self.cvar_params):
+            if "=" in name:
+                continue
+            full = "MPIR_CVAR_%s_%s" % (self.op.upper(), cvar)
+            if cvar == "THROTTLE":
+                full = "MPIR_CVAR_ALLTOALL_THROTTLE"
+            if full in cvar_values:
+                out[name] = cvar_values[full]
+            else:
+                missing.append(full)
+        return out, missing
+
     def mask(self, bits):
         m = 0
         for r in self.restrictions:
