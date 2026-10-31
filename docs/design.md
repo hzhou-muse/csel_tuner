@@ -594,6 +594,15 @@ it is added only once the nonblocking op is tuned; `buffer_swap` runs
 refuses a compositional algorithm whose inner sections have no tree
 (`name=<section>-auto`) in the loaded file, rather than measure it under
 MPICH's default selection for them.
+colltree places `nb` and `buffer_swap` like any algorithm: as leaves of
+the `<op>-intra-<mask>` subtrees under `<op>-intra-auto`, each scored per
+layout and size, not as fixed wrappers ahead of the selection. They cannot
+loop there, because their own code changes the call before it selects
+again: `nb` turns it into the nonblocking collective, `buffer_swap` clears
+the gpu condition (and is restricted to it). This fits MPICH's planned
+split into a `main` tree for user calls and an `auto` tree for every
+internal call: `main` stays `call=auto`, and `smp`'s inner calls on device
+buffers can still pick `buffer_swap` at their own level.
 
 **Kinds of restrictions.** The catalog lists restrictions without saying
 how a tuner treats them; that is csel_tuner's policy, in
