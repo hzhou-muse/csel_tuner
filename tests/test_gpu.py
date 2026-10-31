@@ -148,8 +148,8 @@ def test_merge_errors():
         host_model().save(h)
         device_model().save(d)
         device_model(["hierarchical", "other", "gpu_coll"]).save(d2)
-        for argv, msg in [([d, "--out", t], "no model of host buffers"),
-                          ([h, h, "--out", t], "a second unit of host buffers"),
+        for argv, msg in [([d, "--out", t], "no unit of host buffers"),
+                          ([h, h, "--out", t], "a second bcast unit of host buffers"),
                           ([h, d2, "--out", t], "has no gpu restriction")]:
             try:
                 colltree(argv)

@@ -373,12 +373,18 @@ Then build one tuning file from both models (§7).
 ```sh
 bin/colltree bcast.json --out bcast_tuning.json
 bin/colltree bcast.json bcast_gpu.json --out bcast_tuning.json   # host and device buffers (§6.6)
+bin/colltree run.json --colls bcast,ibcast --out tuning.json      # several collectives, one file
 ```
 
-It prints the tree size, the predicted regret and the algorithms used.
+Every collective among the selected units (`--colls`, `--unit`) gets its
+subtrees in the one output: per collective a unit of host buffers and
+optionally one of device buffers. `--with FILE` copies in FILE's subtrees
+of the collectives this run does not build. It prints the tree size, the
+predicted regret and the algorithms used.
 
 | Option | Default | Meaning |
 |---|---|---|
+| `--colls` | all | the collectives to build, e.g. `bcast,ibcast` |
 | `--tol` | 0.005 | allowed predicted geomean regret over the full tree; larger = smaller tree |
 | `--max-regret` | 1.5 | pruning never lets a point's predicted regret exceed this |
 | `--node-aware` | off | also split on `num_nodes` and `ppn` (MPICH with pmodels/mpich#8048) |
@@ -425,7 +431,9 @@ With a compositional algorithm in the model, `colltree` compares its
 output's choices for that algorithm's inner calls with those of the file
 it was measured under, and prints `stale:` lines where they differ by more
 than `--stale-tol`, followed by the `collmodel` command that remeasures it
-with the output loaded.
+with the output loaded. Inner calls into another collective (`nb` into
+`ibcast`, allreduce `smp` into reduce and bcast) are checked when that
+collective's tree is in the same output.
 
 ## 8. Replay (development)
 
@@ -518,6 +526,7 @@ python3 tests/test_extend.py     # adding an algorithm and layouts to a model, r
 python3 tests/test_gpu.py        # memory-kind restrictions; colltree merging host and device models
 python3 tests/test_kinds.py      # restriction kinds, variants; inner trees in --inner-selection
 python3 tests/test_stages.py     # algorithm stages from inner calls; disabled algorithms, leaf names and parameters
+python3 tests/test_collection.py  # colltree over several collectives, --colls, --with, cross-collective staleness
 ```
 
 They also run under pytest.

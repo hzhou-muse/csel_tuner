@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Turn model files (collmodel/5 or /4, from bin/collmodel; --unit selects units) into an MPICH
-collective-selection JSON (builder v3, csel_tuner/tree.py).
+"""Turn model files (collmodel/5 or /4, from bin/collmodel; --colls and --unit select units) into
+an MPICH collective-selection JSON (builder v3, csel_tuner/tree.py).
 
     bin/colltree bcast.json [bcast_gpu.json] --out bcast_tuning.json [--tol 0.005] [--node-aware]
+    bin/colltree run.json [--colls bcast,ibcast] --out tuning.json
+
+Every collective among the selected units gets its subtrees in the one
+output file, each built as below from its unit of host buffers and,
+optionally, one of device buffers.
 
 Then run with MPIR_CVAR_COLL_SELECTION_JSON_FILE=bcast_tuning.json (and the
 collective's algorithm CVAR left at auto). Older model files convert with
@@ -46,12 +51,13 @@ is required; each memory kind at most once.
 
 A compositional algorithm (e.g. smp) was measured with a tuning file
 selecting its inner calls. Where the output chooses it, colltree compares
-the output's choices for those inner calls (on the node communicator and
-the node leaders' communicator, same op) with that file's, and lists where
-they differ by more than --stale-tol in predicted time: there the
-measurements are stale, and the algorithm should be
-measured again with the output loaded (bin/collmodel --model ... --algs smp
---inner-selection <output>).
+the output's choices for those inner calls (on the node communicator, the
+node leaders' communicator or the caller's own, into any collective whose
+tree is in the output: smp's bcast, nb's ibcast, buffer_swap's host tree)
+with that file's, and lists where they differ by more than --stale-tol in
+predicted time, by the inner collective's model: there the measurements
+are stale, and the algorithm should be measured again with the output
+loaded (bin/collmodel --model ... --algs smp --inner-selection <output>).
 """
 import argparse
 import json
@@ -216,22 +222,41 @@ def drop_bit(model, bit):
         info["mask"] = info.get("mask", 0) & ~bit
 
 
-def stale(model, S, out, x_of, tol):
+def x_of(m, lay, size):
+    """The point of a call at layout lay and this size, in model m (its conditions at lay)."""
+    n, q = lay
+    mk = m.masks.get(lay, 0)
+    cond = {b: bool(mk >> k & 1) for k, b in enumerate(m.conditions)}
+    cond[GPU] = is_device(m.mem)    # left out of a device model's masks (drop_bit)
+    if m.mem == "gpu":
+        cond[GPU_COLL] = True
+    return {"p": n * q, "m": size, "N": n, "ppn": q, "pof2": float(is_pof2(n * q)), "cond": cond}
+
+
+def parse_inner(text):
+    """"bcast-intra@node_comm", "bcast-intra@comm[gpu=0]" -> (coll, comm, {cond: value})."""
+    sec, _, rest = text.partition("@")
+    comm, _, cond = rest.partition("[")
+    conds = dict(kv.split("=", 1) for kv in cond.rstrip("]").split(",") if kv)
+    return sec.rsplit("-", 1)[0], comm, {k: int(v) for k, v in conds.items()}
+
+
+def stale(model, S, out, built, tol):
     """Where the output chooses a compositional algorithm, the inner calls it
-    makes (same op) that the output selects differently from the file the
-    algorithm was measured under, and where the model predicts the two inner
-    choices more than `tol` apart: [(alg, inner, inner layout, [sizes], new, old, ratio)]."""
-    m, op = model, model.op
+    makes that the output selects differently from the file the algorithm was
+    measured under, and where the inner collective's model predicts the two
+    choices more than `tol` apart: [(alg, inner, inner layout, [sizes], new, old, ratio)].
+    built: {(coll, "host"|"device"): (model, Sets)} of this output."""
+    m = model
     trees = {k[len("name="):]: v for k, v in out.items()}
-    by_leaf = {m.leaf(x): x for x in m.algorithms}
-    idx = {size: i for i, size in enumerate(m.sizes)}
+    slot = "device" if is_device(m.mem) else "host"
     found, notes = [], []
     for c in [x for x in m.algorithms if m.is_compositional(x) and x in m.curves]:
         uses = {}
         for lay in m.layouts:
             mask = S.effective(m.masks.get(lay, 0))
             for size in m.sizes:
-                if S.choose(mask, x_of(lay, size)) == c:
+                if S.choose(mask, x_of(m, lay, size)) == c:
                     uses.setdefault(lay, set()).add(size)
         if not uses:
             continue
@@ -241,13 +266,18 @@ def stale(model, S, out, x_of, tol):
             continue
         old = {k[len("name="):]: v for k, v in json.loads(m.inner_files[h]).items()}
         for inner in m.algorithms[c]["inner"]:
-            sec, comm = inner.split("@", 1)
-            if sec != op + "-intra":
-                notes.append(f"{c}: inner {inner} is another op; not checked")
+            coll, comm, cond = parse_inner(inner)
+            target = built.get((coll, "host" if cond.get(GPU) == 0 else slot))
+            if target is None:
+                notes.append(f"{c}: inner {inner}: {coll}'s tree is not in this output; not checked")
                 continue
-            if comm not in ("node_comm", "node_roots_comm"):
-                notes.append(f"{c}: inner {inner}: not checked (only node_comm and node_roots_comm are)")
+            if comm not in ("node_comm", "node_roots_comm", "comm", "self"):
+                notes.append(f"{c}: inner {inner}: unknown communicator; not checked")
                 continue
+            mi, Si = target
+            by_leaf = {mi.leaf(x): x for x in mi.algorithms}
+            idx = {size: i for i, size in enumerate(mi.sizes)}
+            auto = f"{coll}-intra-auto"
             at = {}             # inner layout -> sizes at which some outer call uses c
             for lay, sizes in uses.items():
                 r = role_layout(lay, comm)
@@ -256,14 +286,15 @@ def stale(model, S, out, x_of, tol):
             for r, sizes in sorted(at.items()):
                 diff = {}
                 for size in sorted(sizes):
-                    x = x_of(r, size)
-                    new = by_leaf.get(json_choice(trees[f"{op}-intra-auto"], x, trees, m.conditions))
-                    was = by_leaf.get(json_choice(old[f"{op}-intra-auto"], x, old, m.conditions)) \
-                        if f"{op}-intra-auto" in old else None
-                    if new == was or new is None or was is None or was not in m.curves:
+                    if size not in idx:
+                        continue
+                    x = x_of(mi, r, size)
+                    new = by_leaf.get(json_choice(trees[auto], x, trees, mi.conditions))
+                    was = by_leaf.get(json_choice(old[auto], x, old, mi.conditions)) if auto in old else None
+                    if new == was or new is None or was is None or was not in mi.curves:
                         continue
                     i = idx[size]
-                    ratio = 2 ** (S.p(new, r)[i] - S.p(was, r)[i])
+                    ratio = 2 ** (Si.p(new, r)[i] - Si.p(was, r)[i])
                     if abs(np.log(ratio)) > np.log(tol):
                         diff.setdefault((new, was), []).append((size, ratio))
                 for (new, was), v in diff.items():
@@ -278,8 +309,10 @@ def main(argv=None):
     ap.add_argument("--unit", metavar="KEY=VALUE,...", help="the units to use from the model files, by their "
                     "tags (coll, launch, datatype, counts) or variant conditions (inplace, ...), e.g. "
                     "coll=allgather,inplace=0; default: every unit of each file")
-    ap.add_argument("model", nargs="+", help="model files (collmodel/5 or /4): one of host buffers, optionally one "
-                    "of device buffers")
+    ap.add_argument("--colls", help="the collectives to build, e.g. bcast,ibcast; default: every collective "
+                    "among the selected units")
+    ap.add_argument("model", nargs="+", help="model files (collmodel/5 or /4): per collective one unit of host "
+                    "buffers, optionally one of device buffers")
     ap.add_argument("--out", required=True, help="selection JSON to write")
     ap.add_argument("--tol", type=float, default=0.005, help="allowed predicted geomean regret over the full tree")
     ap.add_argument("--node-aware", action="store_true", help="also split on num_nodes and ppn (MPICH with "
@@ -298,105 +331,109 @@ def main(argv=None):
                     "(device buffers swap to host, then the host tree): <op>-intra-auto is "
                     "{gpu: buffer_swap, any: <host dispatch>}")
     ap.add_argument("--with", dest="with_files", action="append", default=[], metavar="FILE",
-                    help="also write the subtrees of FILE's other ops into --out (a tuning file for the inner "
-                    "calls of another op, or the final file of several ops)")
+                    help="also write the subtrees of FILE's collectives that this run does not build into --out "
+                    "(a tuning file for inner calls into another collective, or the final file)")
     a = ap.parse_args(argv)
     try:
         sel = parse_sel(a.unit)
     except ValueError as e:
         sys.exit(f"--unit: {e}")
-    models, paths = [], []
+    want = [x for x in (a.colls or "").split(",") if x]
+    units = []          # [(path, unit)]
     for path in a.model:
         try:
             f = ModelFile.load(path)
         except (OSError, ValueError) as e:
             sys.exit(str(e))
-        units = f.select(sel)
-        if not units:
-            sys.exit(f"{path}: no unit selected by --unit {a.unit or ''} (its units: "
+        found = [u for u in f.select(sel) if not want or u.op in want]
+        if not found:
+            sys.exit(f"{path}: no unit selected by --unit/--colls (its units: "
                      + "; ".join(tag_str(u.tags) for u in f.units) + ")")
-        models += units
-        paths += [path] * len(units)
-    # the host unit, and one of device buffers (launch kind gpu or device)
-    by_mem = {}
-    for path, m in zip(paths, models):
+        units += [(path, u) for u in found]
+    # per collective: its unit of host buffers, and one of device buffers (launch kind gpu or device)
+    colls = {}
+    for path, m in units:
         slot = "device" if is_device(m.mem) else "host"
+        by_mem = colls.setdefault(m.op, {})
         if slot in by_mem:
-            sys.exit(f"{path}: a second unit of {slot} buffers ({tag_str(m.tags)}; the first: "
+            sys.exit(f"{path}: a second {m.op} unit of {slot} buffers ({tag_str(m.tags)}; the first: "
                      f"{tag_str(by_mem[slot][1].tags)} in {by_mem[slot][0]}); select one with --unit")
         by_mem[slot] = (path, m)
-    if "host" not in by_mem:
-        sys.exit("no model of host buffers (the run-time fallback)")
-    op = models[0].op
-    for path, m in zip(paths, models):
-        if m.op != op:
-            sys.exit(f"{path}: a model of {m.op}, not {op}")
-    if "device" in by_mem:
-        path, m = by_mem["device"]
-        if GPU not in m.conditions:
-            sys.exit(f"{path}: a model of device buffers, but its catalog has no {GPU} restriction "
-                     "(MPICH cannot tell device buffers apart)")
-        drop_bit(m, 1 << m.conditions.index(GPU))
-        # launch kind gpu: gpu_coll holds in the whole unit too (MPIR_CVAR_ENABLE_GPU_COLL=1)
-        if m.mem == "gpu" and GPU_COLL in m.conditions:
-            drop_bit(m, 1 << m.conditions.index(GPU_COLL))
+    missing = [x for x in want if x not in colls]
+    if missing:
+        sys.exit(f"--colls: no unit of {', '.join(missing)}")
+    for op, by_mem in colls.items():
+        if "host" not in by_mem:
+            sys.exit(f"{op}: no unit of host buffers (the run-time fallback)")
+        if "device" in by_mem:
+            path, m = by_mem["device"]
+            if GPU not in m.conditions:
+                sys.exit(f"{path}: a model of device buffers, but its catalog has no {GPU} restriction "
+                         "(MPICH cannot tell device buffers apart)")
+            drop_bit(m, 1 << m.conditions.index(GPU))
+            # launch kind gpu: gpu_coll holds in the whole unit too (MPIR_CVAR_ENABLE_GPU_COLL=1)
+            if m.mem == "gpu" and GPU_COLL in m.conditions:
+                drop_bit(m, 1 << m.conditions.index(GPU_COLL))
+    if a.buffer_swap and any("device" in by_mem for by_mem in colls.values()):
+        sys.exit("--buffer-swap: give host models only")
     feats = ["N", "ppn", "p", "m", "pof2"] if a.node_aware else ["p", "m", "pof2"]
     override = {}
     for kv in a.param:
         k, v = kv.split("=", 1)
         alg, key = k.split(".", 1)
         override.setdefault(alg, {})[key] = parse_value(v)
+    warned = set()
 
     def leaf_params(m, alg):
         rec = m.algorithms.get(alg, {}).get("params")
         if rec is None:
-            rec = LEGACY_PARAMS.get(op, {}).get(alg, {})
-            if rec and alg not in warned:
-                print(f"{alg}: the model has no recorded leaf parameters; using {rec}", file=sys.stderr)
-                warned.add(alg)
+            rec = LEGACY_PARAMS.get(m.op, {}).get(alg, {})
+            if rec and (m.op, alg) not in warned:
+                print(f"{m.op} {alg}: the model has no recorded leaf parameters; using {rec}", file=sys.stderr)
+                warned.add((m.op, alg))
         return dict(rec, **override.get(alg, {}))
-    warned = set()
 
-    out, disp, built = {}, {}, []
-    for mem in ("host", "device"):
-        if mem not in by_mem:
-            continue
-        path, m = by_mem[mem]
-        S = Sets(m, a, feats)
-        sets = m.sets()
-        for mask in sorted(sets, key=lambda s: (bin(s).count("1"), s)):
-            S.build(mask, sets[mask])
-        if 0 not in S.trees:
-            sys.exit(f"{path}: no unrestricted algorithm with a model")
+    out, built = {}, {}     # built: {(coll, slot): (path, model, Sets)}
+    for op, by_mem in colls.items():
+        disp = {}
+        for mem in ("host", "device"):
+            if mem not in by_mem:
+                continue
+            path, m = by_mem[mem]
+            S = Sets(m, a, feats)
+            sets = m.sets()
+            for mask in sorted(sets, key=lambda s: (bin(s).count("1"), s)):
+                S.build(mask, sets[mask])
+            if 0 not in S.trees:
+                sys.exit(f"{path}: no unrestricted algorithm with a model")
 
-        def sub(o, m=m):
-            if isinstance(o, tuple):
-                return "call=" + set_name(op, o[1], m.mem)
-            return ("algorithm=" + m.leaf(o), leaf_params(m, o))
-        out.update({f"name={set_name(op, mask, mem)}": json_tree(t, opts, sub)
-                    for mask, (t, opts) in sorted(S.trees.items())})
-        present = sorted(S.trees)
-        if a.nested_dispatch:
-            disp[mem] = dispatch(op, m.conditions, present, mem)
-        else:
-            bits = 0
-            for s in present:
-                bits |= s
-            disp[mem] = "dispatch=%s(0x%x)" % (set_prefix(op, mem), bits) if bits else \
-                "call=" + set_name(op, 0, mem)
-        built.append((path, m, S))
-    out[f"name={op}-intra-auto"] = {GPU: disp["device"], "any": disp["host"]} if "device" in disp else \
-        disp["host"]
-    if a.buffer_swap:
-        if "device" in disp:
-            sys.exit("--buffer-swap: give the host model only")
-        out[f"name={op}-intra-auto"] = {GPU: {"algorithm=MPIR_Coll_buffer_swap": {}}, "any": disp["host"]}
+            def sub(o, m=m):
+                if isinstance(o, tuple):
+                    return "call=" + set_name(m.op, o[1], m.mem)
+                return ("algorithm=" + m.leaf(o), leaf_params(m, o))
+            out.update({f"name={set_name(op, mask, mem)}": json_tree(t, opts, sub)
+                        for mask, (t, opts) in sorted(S.trees.items())})
+            present = sorted(S.trees)
+            if a.nested_dispatch:
+                disp[mem] = dispatch(op, m.conditions, present, mem)
+            else:
+                bits = 0
+                for s in present:
+                    bits |= s
+                disp[mem] = "dispatch=%s(0x%x)" % (set_prefix(op, mem), bits) if bits else \
+                    "call=" + set_name(op, 0, mem)
+            built[(op, mem)] = (path, m, S)
+        out[f"name={op}-intra-auto"] = {GPU: disp["device"], "any": disp["host"]} if "device" in disp else \
+            disp["host"]
+        if a.buffer_swap:
+            out[f"name={op}-intra-auto"] = {GPU: {"algorithm=MPIR_Coll_buffer_swap": {}}, "any": disp["host"]}
     written = dict(out)
+    mine = tuple(f"name={op}-intra-" for op in colls)
     for path in a.with_files:
         with open(path) as f:
             other = json.load(f)
         for k, v in other.items():
-            if not k.startswith(f"name={op}-intra-"):
+            if not k.startswith(mine):
                 written[k] = v
     depth = json_depth(written)
     if depth > 64:
@@ -404,28 +441,21 @@ def main(argv=None):
     with open(a.out, "w") as f:
         json.dump(written, f, indent=2)
         f.write("\n")
-    for path, m, S in built:
+    for path, m, S in built.values():
         for line in S.lines:
             print(line)
-    print(f"{a.out}: features {','.join(feats)}; nesting {depth}")
+    print(f"{a.out}: {', '.join(colls)}; features {','.join(feats)}; nesting {depth}")
 
-    for path, m, S in built:
-        def x_of(lay, size, m=m):
-            n, q = lay
-            mk = m.masks.get(lay, 0)
-            cond = {b: bool(mk >> k & 1) for k, b in enumerate(m.conditions)}
-            cond[GPU] = is_device(m.mem)    # left out of a device model's masks (drop_bit)
-            if m.mem == "gpu":
-                cond[GPU_COLL] = True
-            return {"p": n * q, "m": size, "N": n, "ppn": q, "pof2": float(is_pof2(n * q)), "cond": cond}
-        found, notes = stale(m, S, out, x_of, a.stale_tol)
+    models = {k: (m, S) for k, (path, m, S) in built.items()}
+    for path, m, S in built.values():
+        found, notes = stale(m, S, out, models, a.stale_tol)
         for n in notes:
-            print("staleness check: " + n)
+            print(f"staleness check: {m.op} " + n)
         for c, inner, r, ss, new, was, ratio in found:
-            print(f"stale: {c}'s inner {inner} at N={r[0]} ppn={r[1]}, {len(ss)} sizes ({ss[0]}..{ss[-1]}): the "
-                  f"output selects {new}, {c} was measured with {was} (predicted {ratio:.2f}x)")
+            print(f"stale: {m.op} {c}'s inner {inner} at N={r[0]} ppn={r[1]}, {len(ss)} sizes ({ss[0]}..{ss[-1]}): "
+                  f"the output selects {new}, {c} was measured with {was} (predicted {ratio:.2f}x)")
         if found:
-            print(f"remeasure: bin/collmodel --model {path} --algs "
+            print(f"remeasure: bin/collmodel --model {path} --colls {m.op} --algs "
                   f"{','.join(sorted({c for c, *_ in found}))} --inner-selection {a.out} ...")
 
 

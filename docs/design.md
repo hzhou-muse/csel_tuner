@@ -800,16 +800,14 @@ measurements predicts.
 
 ## 13. Limitations and next steps
 
-- **Incremental models** (§12): no `--refit` or `--merge` yet; adding to a
+- **Incremental models** (§12): no `--refit` yet; adding to a
   model samples the given algorithms at the measured layouts and the given
   `--layouts`, but does not continue the layout loop (risk and random
   checks, the regret estimate) on its own.
-- **Compositional algorithms across ops** (allreduce smp, nb): neither the
-  two-stage check nor the staleness check covers inner calls of another op;
-  collmodel only checks that the loaded file has their trees.
-- **Collectives:** only bcast is wired through the builders (`OPS` in
-  `bin/collmodel`, leaf parameters in `bin/colltree`); mpisrv also measures
-  allreduce and ping-pong.
+- **Compositional algorithms across collectives** (allreduce smp, nb): the
+  staleness check covers them when colltree builds the inner collective's
+  tree in the same output; collmodel's two-stage check does not, it only
+  checks that the loaded file has their trees.
 - **GPU buffers**: one rank per GPU (or tile) only, warm buffers only, no
   mixed host/device buffers. `check=1` and a check of reductions on device
   buffers are not there yet. Placement keeps the host `place` modes, and
