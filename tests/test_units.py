@@ -91,7 +91,23 @@ def test_merge():
         assert r.returncode != 0 and "also in" in r.stderr
 
 
+def test_carry_model_units():
+    """collmodel --model A --out B: B gets the run's unit and A's other units (B's own win)."""
+    from importlib.machinery import SourceFileLoader
+    collmodel = SourceFileLoader("collmodel", os.path.join(REPO, "bin", "collmodel")).load_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        a, b = os.path.join(tmp, "a.json"), os.path.join(tmp, "b.json")
+        ModelFile([unit("bcast"), unit("ibcast"), unit("scan")]).save(a)
+        ModelFile([unit("scan", t=7.0)]).save(b)
+        collmodel.save_unit(b, unit("bcast", t=3.0), a)
+        f = ModelFile.load(b)
+        assert sorted(u.op for u in f.units) == ["bcast", "ibcast", "scan"]
+        assert f.get(default_tags("bcast")).measurements[0]["t_us"] == [3.0]
+        assert f.get(default_tags("scan")).measurements[0]["t_us"] == [7.0]
+
+
 if __name__ == "__main__":
+    test_carry_model_units()
     test_tags()
     test_file()
     test_v4()

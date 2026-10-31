@@ -352,7 +352,8 @@ of units, each one model of one collective measured one way, named by its
 
 A unit is self-contained (its jobs, inner files and runs are its own), so
 units copy between files unchanged: a collmodel run puts its unit into
-`--out` and keeps the file's other units, `collmodel --merge` combines
+`--out` and keeps the file's other units (adding those of `--model` it
+lacks, so adding to a model keeps its other units), `collmodel --merge` combines
 files, `collmodel --model` and `colltree --unit` select units by their tags.
 A collmodel/4 file reads as one unit; new tags get defaults (a unit written
 before a tag existed has its default value).

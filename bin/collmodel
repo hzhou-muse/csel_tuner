@@ -6,7 +6,7 @@ collmodel/1) or several, sampled for selection into a unit of a model file
 (collmodel/5, csel_tuner/model.py: the measurements and the fit derived
 from them; needs the per-request algorithm switch, MPISRV_CVAR_SWITCH=1).
 The unit is named by its tags (--op, --inplace, --counts, --launch); --out
-keeps its other units, and --merge combines model files. --colls and
+keeps its other units (and gets those of --model it lacks), and --merge combines model files. --colls and
 --launch measure several units in one run, one after another, one server
 launch per launch kind, a journal per unit in the --log directory.
 
@@ -886,9 +886,10 @@ def extend(a, model, measure, probe, inner_hash, clock, nodes, on_layout, stop_c
 _out_files = {}
 
 
-def save_unit(path, unit):
+def save_unit(path, unit, base=None):
     """Put the unit into the model file at path, keeping the file's other units (an existing
-    collmodel/4 or /5 file; any other file there is replaced)."""
+    collmodel/4 or /5 file; any other file there is replaced) and adding those of the --model
+    file base that it lacks, so a run that adds to a model keeps its other units."""
     f = _out_files.get(path)
     if f is None:
         f = ModelFile()
@@ -900,6 +901,10 @@ def save_unit(path, unit):
         old = f.get(unit.tags)
         if old is not None:
             print(f"{path}: replacing its unit {tag_str(unit.tags)}", file=sys.stderr)
+        if base and os.path.abspath(base) != os.path.abspath(path):
+            for u in ModelFile.load(base).units:
+                if f.get(u.tags) is None:
+                    f.put(u)
         _out_files[path] = f
     f.put(unit)
     f.save(path)
@@ -1014,7 +1019,7 @@ def import_v3(a):
         for (name, lay), (_, c) in pick.items():
             model.set_curve(name, lay, c)
         model.runs.append({"mode": "import", "from": path, "journal": log or None, "meta": d.get("meta")})
-    save_unit(a.out, model)
+    save_unit(a.out, model, a.model)
     print(f"{a.out}: {len(model.algorithms)} algorithms, {len(model.measured_layouts())} layouts, "
           f"{len(model.measurements)} measurements, {len(model.jobs)} jobs")
 
@@ -1041,7 +1046,8 @@ def parse_args(argv):
     ap.add_argument("--exclude-algs", default="", metavar="A,B", help="leave these catalog algorithms out of "
                     "--algs all (e.g. one that hangs)")
     ap.add_argument("--out", help="model file to write (collmodel/5): this run's unit goes "
-                    "into it, replacing a unit with the same tags; its other units stay")
+                    "into it, replacing a unit with the same tags; its other units stay, and those of --model "
+                    "it lacks are added")
     ap.add_argument("--model", metavar="MODEL", help="add to this run's unit (the one with its tags: --op, "
                     "--inplace, --counts, --mem) in this model file (collmodel/4 or /5): the algorithms of "
                     "--algs that it does not have, and the layouts of --layouts")
@@ -1395,7 +1401,7 @@ def run_unit(a, tags, t_job, shared):
                 return write_atomic(a.out, model_v1(a, built[0][3], sizes, nodes, ppn_max, meta, jobs, False, cost))
             if base is None:
                 store_curves(model, built)
-            save_unit(a.out, model)
+            save_unit(a.out, model, a.model)
 
         def on_layout(*_):
             now = time.time()
@@ -1492,7 +1498,7 @@ def run_unit(a, tags, t_job, shared):
     run["jobs"] = list(range(a._jobs_before, len(model.jobs)))
     model.runs.append(run)
     try:
-        save_unit(a.out, model)
+        save_unit(a.out, model, a.model)
     except Exception as e:
         sys.exit(f"no model written ({type(e).__name__}: {e}); the journal {a.log} keeps the measurements for --resume")
     print(f"{a.out}: {len(model.measured_layouts())} layouts, {run['n_measurements']} measurements in this run "

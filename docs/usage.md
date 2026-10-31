@@ -172,7 +172,7 @@ bin/collmodel --op bcast --algs all \
   its job, the precheck results, the catalog's conditions and each layout's
   mask (`data`), and each algorithm's curve at each layout it was sampled
   at (`fit`). A run puts its unit into `--out` and keeps the file's other
-  units; `collmodel --merge A.json --merge B.json --out C.json` combines
+  units, adding those of `--model` it lacks; `collmodel --merge A.json --merge B.json --out C.json` combines
   files; `colltree --unit coll=allreduce,inplace=0` picks units from a file
   with several. collmodel/4 files are read as one unit.
 
