@@ -280,6 +280,8 @@ Also `--log`, `--resume`, `--deadline`, `--checkpoint-every` (§6.5) and
 | `--inplace` | off | measure with `MPI_IN_PLACE` (mpisrv `inplace=1`), for the operations that allow it |
 | `--colls` | | several units in one run, one after another: `COLL`, `COLL:all` (every in-place setting the collective takes), or `COLL:K=V+K=V` with `inplace=0\|1`, `counts=uniform\|linear\|onebig`; e.g. `allreduce:all,alltoallv:counts=linear,barrier`. Needs `--algs all`; `--log` is then a directory with one journal per unit (alias `--coll`) |
 | `--launch` | `--mem` | launch kinds, one server launch each, its units one after another: `host`, `gpu` (device buffers, one GPU per rank, `MPIR_CVAR_ENABLE_GPU_COLL=1`), `device` (device buffers without `GPU_COLL`, the older `--mem device`); with `--site` it sets `LAUNCH` for `launch/config.sh`. The unit's `launch` tag |
+| `--plan` | | print each unit's algorithms by stage (from the catalog's `inner` keys: a compositional algorithm is 1 + the stage at which the trees it selects from are complete) and the trees each one needs, then exit; needs `--catalog` |
+| `--max-stage` | none | add only algorithms up to this stage (`--plan`); an explicit `--algs` above it is refused. A stage-k algorithm needs an `--inner-selection` file built (colltree) from the units' stages below k |
 | `--budget-h` | none | per unit: stop after this many wall-clock hours, all jobs |
 | `--budget-node-h` | none | per unit, in node-hours (deprecated: `--budget-h`; replay experiments use it) |
 | `--prune` | 2.0 | v2: skip sizes predicted this much slower than the best; 0 = off |
@@ -515,6 +517,7 @@ python3 tests/test_restrict.py   # catalog, precheck, sets, dispatch; the builds
 python3 tests/test_extend.py     # adding an algorithm and layouts to a model, resume; needs replay data
 python3 tests/test_gpu.py        # memory-kind restrictions; colltree merging host and device models
 python3 tests/test_kinds.py      # restriction kinds, variants; inner trees in --inner-selection
+python3 tests/test_stages.py     # algorithm stages from inner calls; disabled algorithms, leaf names
 ```
 
 They also run under pytest.

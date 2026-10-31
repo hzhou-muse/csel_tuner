@@ -132,6 +132,7 @@ import numpy as np  # noqa: E402
 from csel_tuner.algos import GENERAL, Catalog  # noqa: E402
 from csel_tuner.kinds import RECIPES, classify, is_device, is_v  # noqa: E402
 from csel_tuner.layouts import axis_values, size_grid  # noqa: E402
+from csel_tuner.stages import Stages  # noqa: E402
 from csel_tuner.model import FORMAT, FORMAT_V4, Model, ModelFile, default_tags, file_hash, tag_key, tag_str  # noqa: E402,E501
 from csel_tuner.multi import Builder2, MultiSampler, known_sampler  # noqa: E402
 from csel_tuner.restrict import fixed_point, mem_known, plan_sets, precheck, set_name  # noqa: E402
@@ -757,9 +758,16 @@ def extend(a, model, measure, probe, inner_hash, clock, nodes, on_layout, stop_c
     else:
         by_name = {}
     inner_text = open(a.inner_selection).read() if a.inner_selection else None
+    stage = unit_stage_map(a) if a.catalog else {}
+    if a.max_stage is not None and a.algs != ["all"]:
+        high = [x for x in a.algs if stage.get(x, 1) > a.max_stage]
+        if high:
+            sys.exit(f"--algs: above --max-stage {a.max_stage}: "
+                     + ", ".join(f"{x} (stage {stage[x]})" for x in high))
     if a.algs == ["all"]:       # the catalog's algorithms the model lacks (compositional ones need their file)
         want = [x.name for x in algs if x.name not in m.algorithms and x.name not in m.left_out
-                and (not x.inner or a.inner_selection or a.replay)]
+                and (not x.inner or a.inner_selection or a.replay)
+                and (a.max_stage is None or stage.get(x.name, 1) <= a.max_stage)]
         if not a.replay:
             for name in [x for x in want if by_name[x].inner and missing_inner(by_name[x], inner_text)]:
                 print(f"{name}: not added, --inner-selection has no tree for "
@@ -1016,7 +1024,7 @@ def parse_args(argv):
                    "algorithm in --catalog")
     ap.add_argument("--exclude-algs", default="", metavar="A,B", help="leave these catalog algorithms out of "
                     "--algs all (e.g. one that hangs)")
-    ap.add_argument("--out", required=True, help="model file to write (collmodel/5): this run's unit goes "
+    ap.add_argument("--out", help="model file to write (collmodel/5): this run's unit goes "
                     "into it, replacing a unit with the same tags; its other units stay")
     ap.add_argument("--model", metavar="MODEL", help="add to this run's unit (the one with its tags: --op, "
                     "--inplace, --counts, --mem) in this model file (collmodel/4 or /5): the algorithms of "
@@ -1026,6 +1034,10 @@ def parse_args(argv):
     ap.add_argument("--anchors", type=int, default=3, help="with --model: layouts at which to remeasure a few "
                     "points of the best algorithms, for the drift between jobs (0: none)")
     ap.add_argument("--drift-tol", type=float, default=1.10, help="warn when an anchor moved more than this")
+    ap.add_argument("--plan", action="store_true", help="print the units (--colls/--op, --launch) with their "
+                    "algorithms by stage (from the inner calls in --catalog) and the trees each needs; no run")
+    ap.add_argument("--max-stage", type=int, help="with --model: add only algorithms up to this stage (--plan); "
+                    "an explicit --algs above it is refused")
     ap.add_argument("--merge", action="append", default=[], metavar="MODEL",
                     help="combine the units of these model files into --out (a unit in two files must be the "
                     "same)")
@@ -1086,8 +1098,14 @@ def parse_args(argv):
                         "or multi-node layouts with several ranks per node (hier); e.g. release_gather=auto@single "
                         "(MPICH's default on one node)")
     a = ap.parse_args(argv)
+    if not a.out and not a.plan:
+        ap.error("--out is required (except with --plan)")
     if a.import_ or a.merge:
         return a
+    if a.plan:
+        if not a.catalog:
+            ap.error("--plan needs --catalog")
+        a.algs = a.algs or "all"
     if not (a.alg or a.algs or (a.model and a.layouts)):
         ap.error("one of --alg or --algs is required (or --model with --layouts)")
     a.algs = a.algs.split(",") if a.algs else [a.alg] if a.alg else []
@@ -1124,6 +1142,8 @@ def parse_args(argv):
         a.launcher = "bash -c 'source %s && launch %d %d \"$0\" \"$@\"'" % (cfg, a.nodes, a.ppn)
     if a.replay and a.units != [("host",) + a.units[0][1:]]:
         ap.error("--replay: the recorded data is of host buffers")
+    if a.plan:
+        return a
     if not a.replay and not a.launcher:
         ap.error("--site/--nodes/--ppn or --launcher is required unless --replay")
     if a.resume and not a.log:
@@ -1136,6 +1156,37 @@ def on_sigterm(signum, frame):
     # more than once: only the first one counts, so the model can be written
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     raise Terminated()
+
+
+def unit_stage_map(a):
+    """{algorithm: stage} of this run's unit (a.op on a.launch), from --catalog."""
+    st = Stages(Catalog.load(a.catalog), [x for x in a.exclude_algs.split(",") if x])
+    return {x.name: s for s, x, _ in st.unit_stages(a.op, a.launch)}
+
+
+def plan(a):
+    """--plan: the units, their algorithms by stage and what each depends on."""
+    st = Stages(Catalog.load(a.catalog), [x for x in a.exclude_algs.split(",") if x])
+    top = 0
+    for launch, op, inplace, counts in a.units:
+        rows = st.unit_stages(op, launch)
+        if not rows:
+            print(f"unit {tag_str(default_tags(op, launch, inplace, counts))}: no algorithms in {a.catalog}")
+            continue
+        print(f"unit {tag_str(default_tags(op, launch, inplace, counts))}: tree complete at stage "
+              f"{st.tree_stage(op, launch)}")
+        for k in sorted({s for s, _, _ in rows}):
+            names = []
+            for s, x, deps in rows:
+                if s != k:
+                    continue
+                need = ", ".join(f"{c} {l} (stage {st.tree_stage(c, l, frozenset({(op, launch)}))})"
+                                 for c, l in deps)
+                names.append(x.name + (f" [needs {need}]" if need else ""))
+            print(f"  stage {k}: " + ", ".join(names))
+            top = max(top, k)
+    print(f"stages 1..{top}: a stage-k algorithm is measured with --max-stage k and an --inner-selection "
+          "file of the trees it needs, built (colltree) from the units' stages below k")
 
 
 def parse_colls(text, counts="uniform"):
@@ -1185,6 +1236,8 @@ def main(argv=None):
     a = parse_args(argv)
     if a.merge:
         return merge(a)
+    if a.plan:
+        return plan(a)
     if a.import_:
         return import_v3(a)
     t_job = time.time()
