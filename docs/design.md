@@ -310,7 +310,7 @@ predicted regret of choosing a at point i):
   allgatherv and reduce_scatter), the same on every rank, which is mpisrv's
   `m`; the collectives without one (gatherv, scatterv, alltoallv,
   alltoallw, barrier) do not split on size, and MPICH refuses a file in
-  which they reach `msg_size`. An MPICH before `msg_size` has
+  which they reach `msg_size`. An MPICH before `msg_size` (pmodels/mpich#8083) has
   `avg_msg_size` (`colltree --size-condition avg_msg_size`). With `--node-aware` also `num_nodes(t)` and `ppn(t)` (ranks per
   node, averaged over the nodes), conditions MPICH has since
   pmodels/mpich#8048 (an older one rejects such a file with "unknown

@@ -385,7 +385,7 @@ predicted regret and the algorithms used.
 | Option | Default | Meaning |
 |---|---|---|
 | `--colls` | all | the collectives to build, e.g. `bcast,ibcast` |
-| `--size-condition` | `msg_size` | the CSEL condition of size splits; `avg_msg_size` for an MPICH without `msg_size` (before the step-0 PR) |
+| `--size-condition` | `msg_size` | the CSEL condition of size splits; `avg_msg_size` for an MPICH without `msg_size` (before pmodels/mpich#8083) |
 | `--tol` | 0.005 | allowed predicted geomean regret over the full tree; larger = smaller tree |
 | `--max-regret` | 1.5 | pruning never lets a point's predicted regret exceed this |
 | `--node-aware` | off | also split on `num_nodes` and `ppn` (MPICH with pmodels/mpich#8048) |
