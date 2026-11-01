@@ -163,15 +163,43 @@ def test_guard_on_replay():
         assert cls["scatter_ring_allgather"]["lat"][0] == "linear" and cls["binomial"]["lat"][0] == "logarithmic"
         t = os.path.join(d, "t.json")
         r = subprocess.run([sys.executable, os.path.join(REPO, "bin", "colltree"), m, "--out", t, "--max-depth", "4",
-                            "--guard-above", "768", "--linear-above", "0.45"], check=True,
+                            "--guard-above", "768"], check=True,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-        tree = {k.split("=", 1)[1]: v for k, v in json.load(open(t)).items()}
-        sub = tree["bcast-intra-0"]
-        assert list(sub)[0] == "comm_size(768)", list(sub)
-        assert "guard bcast-intra-0 above comm_size 768" in r.stdout + r.stderr
-        x = lambda p, m: {"p": p, "m": m, "N": p, "ppn": 1, "pof2": 1.0, "cond": {}}
-        assert json_choice(sub, x(4096, 64), tree) != json_choice(sub["comm_size(768)"], x(4096, 64), tree) or \
-            json_choice(sub, x(4096, 1 << 20), tree) != json_choice(sub["comm_size(768)"], x(4096, 1 << 20), tree)
+        out = r.stdout + r.stderr
+        assert "### bcast" in out and "| scatter_ring_allgather |" in out      # the class table
+        assert "name=bcast-intra-0" in json.load(open(t))
+
+
+def test_guard_synthetic():
+    """colltree's guarded(): above P, the branches for smaller comms go, a linear leaf is
+    replaced by the best candidate below the threshold at the leaf's largest comm size, an
+    unclear leaf stays, and splits whose sides then agree merge."""
+    import numpy as np
+    from csel_tuner.tree import fit_tree, json_tree
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("colltree_g", os.path.join(REPO, "bin", "colltree"))
+    spec = importlib.util.spec_from_loader("colltree_g", loader)
+    ct = importlib.util.module_from_spec(spec)
+    loader.exec_module(ct)
+    ps, ms = [2, 4, 8, 16, 32, 64], [2 ** k for k in range(4, 22)]
+    X = {"p": np.array([p for p in ps for m in ms], float), "m": np.array([m for p in ps for m in ms], float),
+         "pof2": np.ones(len(ps) * len(ms))}
+    lp, lm = np.log2(X["p"]), np.log2(X["m"])
+    # ring wins for small p, lg for large p; big wins at large m everywhere
+    L = np.column_stack([0.2 * lp + 3, 0.4 * lp + 2.5 + np.where(lp > 3, 2, 0), np.where(lm > 16, -5, 6.0)])
+    opts = ["lg", "ring", "big"]
+    t = fit_tree(X, L, ["p", "m"])
+    fit = lambda e: (e, e - 0.05, e + 0.05, 6)
+    cls = {"ring": {"lat": ("linear", fit(1.2)), "bw": ("linear", fit(1.2))},
+           "lg": {"lat": ("logarithmic", fit(0.4)), "bw": ("logarithmic", fit(0.4))},
+           "big": {"lat": ("unclear", fit(0.7)), "bw": ("unclear", fit(0.7))}}
+    g, notes = ct.guarded(t, opts, X, cls, 64, 0.7)
+    algs = {opts[leaf.alg] for leaf in g.leaves()}
+    assert "ring" not in algs and "big" in algs, (algs, notes)
+    assert any(n.startswith("big (unclear") for n in notes)
+    o = json_tree(g, opts, lambda x: ("algorithm=" + x, {}))
+    assert "comm_size" not in json.dumps(o)                  # every comm_size split was below 64
 
 
 if __name__ == "__main__":

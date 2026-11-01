@@ -377,13 +377,16 @@ def above(node, P):
     return node
 
 
-def guarded(t, opts, X, cls, P):
+def guarded(t, opts, X, cls, P, linear_above):
     """A copy of tree t for communicators above comm size P (the sampled range): the branches
-    only smaller communicators reach dropped (above), then a leaf whose algorithm is in
-    the linear or unclear growth class of its size band (the band of the median size of its
-    points) is replaced by the logarithmic-class candidate with the least regret at the leaf's
-    largest sampled comm size. cls: growth.classes() of the model; an algorithm without anchors
-    and a leaf that calls another subtree stay. Returns (copy, [report lines])."""
+    only smaller communicators reach dropped (above), then a leaf whose algorithm is in the
+    linear growth class of its size band (the band of the median size of its points; the
+    interval above linear_above) is replaced by the candidate with the least regret at the
+    leaf's largest sampled comm size among those not linear whose exponent is below
+    linear_above. A leaf of unclear class is kept and reported (anchors from a few nodes
+    leave most logarithmic algorithms unclear); so are an algorithm without anchors and a leaf
+    that calls another subtree. cls: growth.classes() of the model. Returns (copy, [report
+    lines])."""
     from csel_tuner.growth import LAT_MAX
     g = above(copy.deepcopy(t), P)
     notes = []
@@ -393,14 +396,19 @@ def guarded(t, opts, X, cls, P):
             continue
         band = "lat" if np.median(X["m"][leaf.idx]) <= LAT_MAX else "bw"
         c = cls.get(a, {}).get(band, (None,))[0]
-        if c is None or c == "logarithmic":
+        if c == "unclear":
+            notes.append(f"{a} (unclear, {band} band): kept")
+        if c != "linear":
             continue
-        cand = [j for j, o in enumerate(opts) if not isinstance(o, tuple)
-                and cls.get(o, {}).get(band, (None,))[0] == "logarithmic"]
+
+        def below(o):
+            cl, fit = cls.get(o, {}).get(band, (None, None))
+            return cl is not None and cl != "linear" and fit is not None and fit[0] < linear_above
+        cand = [j for j, o in enumerate(opts) if not isinstance(o, tuple) and below(o)]
         ps = X["p"][leaf.idx]
         top = leaf.idx[ps == ps.max()]
         if not cand:
-            notes.append(f"{a} ({c}, {band} band): no logarithmic candidate, kept")
+            notes.append(f"{a} ({c}, {band} band): no candidate with an exponent below {linear_above}, kept")
             continue
         j = min(cand, key=lambda j: float(t.R[top, j].sum()))
         notes.append(f"{a} -> {opts[j]} ({c} in the {band} band; scored at p={int(ps.max())}, sizes "
@@ -737,7 +745,8 @@ def main(argv=None):
                         growth_cls[id(m)] = growth_classes(m, a.linear_above)
                         report += growth_table(m, growth_cls[id(m)]) if growth_cls[id(m)] else \
                             [f"{tag_str(m.tags)}: no growth anchors; --guard-above leaves its subtrees as they are"]
-                    g, notes = guarded(t, opts, owner_sets[mask].points[mask], growth_cls[id(m)], a.guard_above)
+                    g, notes = guarded(t, opts, owner_sets[mask].points[mask], growth_cls[id(m)], a.guard_above,
+                                       a.linear_above)
                     if notes:
                         report += [f"guard {set_name(op, mask, mem)} above comm_size {a.guard_above}:"] + \
                             ["  " + n for n in notes]
