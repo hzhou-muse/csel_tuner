@@ -28,6 +28,10 @@ launch() {
     n=$(( ${NODE_CORES#*-} - ${NODE_CORES%-*} + 1 ))
     for ((i = 0; i < ppn; i++)); do list+="${list:+,}$(( ${NODE_CORES%-*} + i * n / ppn ))"; done
     hosts=$(echo "$JGPU_HOSTS" | cut -d, -f1-"$nodes")
+    # -genvall: every rank, on the remote nodes too, gets the whole environment (the
+    # collmodel/config.sh settings such as MPIR_CVAR_COLLECTIVE_FALLBACK, MPIR_CVAR_ENABLE_GPU,
+    # FI_PROVIDER, MPIR_CVAR_COLL_SELECTION_JSON_FILE). -genvlist would pass only the listed
+    # variables to the ranks Hydra starts over ssh, so the nodes would run differently.
     GPU_PPN=$ppn mpiexec -hosts "$hosts" -n $((nodes * ppn)) -ppn "$ppn" -bind-to "user:$list" \
-        -genvlist GPU_PPN,GPU_BIND,GPU_RUNTIME,GPU_DEVICES $GPU_WRAPPER "$@"
+        -genvall $GPU_WRAPPER "$@"
 }
