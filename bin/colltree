@@ -85,7 +85,8 @@ from csel_tuner.kinds import has_msg_size, is_device, measured, variants  # noqa
 from csel_tuner.model import ModelFile, parse_sel, tag_str  # noqa: E402
 from csel_tuner.restrict import GPU, GPU_COLL, role_layout, set_name, set_prefix  # noqa: E402
 from csel_tuner.single import is_pof2  # noqa: E402
-from csel_tuner.tree import CSEL_NAME, fit_tree, json_choice, json_tree, prune_to, select  # noqa: E402
+from csel_tuner.tree import (CSEL_NAME, cond_depth, fit_tree, json_choice, json_tree,  # noqa: E402
+                             prune_to, regret_stats, select)
 
 # Leaf parameters (coll_algorithms.txt extra_params) come from the model, which
 # records the CVAR values the server ran with (collmodel alg_info). This table
@@ -117,6 +118,114 @@ def json_depth(o):
     return 1 + max((json_depth(v) for v in o.values() if isinstance(v, dict)), default=0)
 
 
+def top_entries(text):
+    """[(key, key_start, value_start, value_end)] of a JSON object's top-level entries, by a scan
+    that keeps strings and nesting apart (the text is valid JSON)."""
+    out, depth, i, key, kstart = [], 0, 0, None, None
+    vstart = None
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            if depth == 1 and key is None:
+                key, kstart = json.loads(text[i:j + 1]), i
+            elif depth == 1 and vstart is None:          # a string value
+                out.append((key, kstart, i, j + 1))
+                key = None
+            i = j + 1
+            continue
+        if c == ":" and depth == 1 and key is not None:
+            k = i + 1
+            while text[k] in " \t\r\n":
+                k += 1
+            if text[k] in "{[":
+                vstart = k
+        if c in "{[":
+            depth += 1
+        elif c in "}]":
+            depth -= 1
+            if depth == 1 and vstart is not None:
+                out.append((key, kstart, vstart, i + 1))
+                key, vstart = None, None
+        i += 1
+    return out
+
+
+def format_main(v, indent):
+    """A subtree value in the style of MPICH's coll_selection.json: the brace on the line after
+    its key, the first level of conditions 8 columns in, deeper ones 4 more, an algorithm leaf
+    "algorithm=...":{} (its parameters indented under it)."""
+    if isinstance(v, str):
+        return json.dumps(v)
+
+    def obj(o, ind, step):
+        lines = []
+        for i, (k, x) in enumerate(o.items()):
+            sep = "," if i < len(o) - 1 else ""
+            if k.startswith("algorithm="):
+                if x:
+                    body = ",\n".join(" " * (ind + 4) + "%s: %s" % (json.dumps(pk), json.dumps(pv))
+                                       for pk, pv in x.items())
+                    lines.append(" " * ind + json.dumps(k) + ":{\n" + body + "\n" + " " * ind + "}" + sep)
+                else:
+                    lines.append(" " * ind + json.dumps(k) + ":{}" + sep)
+            elif isinstance(x, str):
+                lines.append(" " * ind + "%s: %s" % (json.dumps(k), json.dumps(x)) + sep)
+            else:
+                lines.append(" " * ind + json.dumps(k) + ":\n" + " " * ind + "{\n" + obj(x, ind + step, 4)
+                             + "\n" + " " * ind + "}" + sep)
+        return "\n".join(lines)
+    return "{\n" + obj(v, indent + 8, 4) + "\n" + " " * indent + "}"
+
+
+def entry_main(key, v, indent):
+    """A top-level "key": value in coll_selection.json's style (a string value on the key's line)."""
+    if isinstance(v, str):
+        return "%s: %s" % (json.dumps(key), json.dumps(v))
+    return json.dumps(key) + ":\n" + " " * indent + format_main(v, indent)
+
+
+def splice_into(text, ours, colls):
+    """MPICH's selection file `text` with the subtrees of `ours` ({key: value}) in place of the
+    old ones: a key both have keeps its position, an old `name=<op>-intra-...` subtree of a
+    collective in `colls` that ours lacks is removed, and a new key goes after its collective's
+    `name=<op>-intra-auto`; every other entry stays as it was, byte for byte."""
+    old = json.loads(text)
+    ents = top_entries(text)
+    if [e[0] for e in ents] != list(old):
+        sys.exit("--into: could not take the file's top-level entries apart")
+    mine = tuple(f"name={op}-intra-" for op in colls)
+    kept = []                   # (key, text of "key": value) in order
+    for key, ks, vs, ve in ents:
+        indent = ks - text.rfind("\n", 0, ks) - 1
+        if key in ours:
+            kept.append((key, entry_main(key, ours[key], indent)))
+        elif key.startswith(mine) and key not in ours:
+            continue
+        else:
+            kept.append((key, text[ks:ve]))
+    have = {k for k, _ in kept}
+    for key in ours:
+        if key in have:
+            continue
+        op = key[len("name="):].split("-intra-")[0]
+        auto = f"name={op}-intra-auto"
+        at = max((i for i, (k, _) in enumerate(kept) if k == auto or k.startswith(f"name={op}-intra-")),
+                 default=len(kept) - 1)
+        kept.insert(at + 1, (key, entry_main(key, ours[key], 4)))
+        have.add(key)
+    first, end = ents[0][1], ents[-1][3]
+    body = ",\n    ".join(t for _, t in kept)
+    new = text[:first] + body + text[end:]
+    want = {k: v for k, v in old.items() if not (k.startswith(mine) and k not in ours)}
+    want.update(ours)
+    if json.loads(new) != want:
+        sys.exit("--into: the spliced file does not parse to the intended subtrees")
+    return new
+
+
 def parse_value(v):
     if v in ("true", "false"):
         return v == "true"
@@ -137,8 +246,22 @@ def points(layouts, sizes):
 
 
 def fit(X, L, feats, a):
-    t = fit_tree(X, L, feats, max_leaves=a.max_leaves)
-    return prune_to(t, a.tol, a.max_regret)
+    """The pruned tree and its pruning path; with --max-depth, the depth chosen by p90 (the
+    smallest depth up to --max-depth whose predicted p90 regret is at most --depth-p90 and within
+    --depth-slack of the deepest's), its table [(depth, geomean, p90, max, leaves)] in t.depths."""
+    if a.max_depth is None:
+        t, path = prune_to(fit_tree(X, L, feats, max_leaves=a.max_leaves), a.tol, a.max_regret)
+        t.depths = None
+        return t, path
+    fits = {d: prune_to(fit_tree(X, L, feats, max_leaves=a.max_leaves, max_depth=d), a.tol, a.max_regret)
+            for d in range(1, a.max_depth + 1)}
+    table = [(d, *regret_stats(t), len(t.leaves())) for d, (t, _) in fits.items()]
+    deepest = table[-1][2]
+    pick = next((d for d, gm, p90, mx, nl in table if p90 <= a.depth_p90 and p90 <= deepest + a.depth_slack),
+                a.max_depth)
+    t, path = fits[pick]
+    t.depths = (pick, table)
+    return t, path
 
 
 def dispatch(op, bits, present, mem="host"):
@@ -226,10 +349,15 @@ class Sets:
         self.mine.append(mask)
         used = sorted({opts[l.alg] if not isinstance(opts[l.alg], tuple) else
                        "call=" + set_name(m.op, opts[l.alg][1], m.mem) for l in t.leaves()})
-        self.lines.append(f"{set_name(m.op, mask, m.mem)}: {len(t.leaves())} leaves over {len(lays)} layouts x "
-                          f"{len(self.sizes)} sizes; predicted geomean regret {path[0][1]:.4f} (full tree, "
-                          f"{path[0][0]} leaves) -> {path[-1][1]:.4f}; candidates {len(opts)}; used: "
-                          f"{', '.join(used)}")
+        gm, p90, mx = regret_stats(t)
+        self.lines.append(f"{set_name(m.op, mask, m.mem)}: {len(t.leaves())} leaves, depth {cond_depth(t)}, over "
+                          f"{len(lays)} layouts x {len(self.sizes)} sizes; predicted regret geomean {gm:.4f} p90 "
+                          f"{p90:.3f} max {mx:.2f} (full tree {path[0][0]} leaves, geomean {path[0][1]:.4f}); "
+                          f"candidates {len(opts)}; used: {', '.join(used)}")
+        if t.depths:
+            pick, table = t.depths
+            self.lines.append("  depth by p90 (chose %d): " % pick + "; ".join(
+                f"{d}: geomean {g:.4f} p90 {q:.3f} max {x:.2f} ({nl} leaves)" for d, g, q, x, nl in table))
         return True
 
 
@@ -401,6 +529,15 @@ def main(argv=None):
     ap.add_argument("--max-regret", type=float, default=1.5,
                     help="pruning never lets a point's predicted regret rise above this")
     ap.add_argument("--max-leaves", type=int, default=1024, help="size of the full tree before pruning")
+    ap.add_argument("--max-depth", type=int, help="at most this many nested condition levels per subtree; "
+                    "the depth is chosen by --depth-p90 (a compact file, e.g. MPICH's default)")
+    ap.add_argument("--depth-p90", type=float, default=1.10, help="with --max-depth: the smallest depth whose "
+                    "predicted p90 regret is at most this ...")
+    ap.add_argument("--depth-slack", type=float, default=0.02, help="... and within this of the deepest "
+                    "tree's p90; otherwise --max-depth")
+    ap.add_argument("--features", metavar="COND,...", help="the CSEL conditions splits may use, from comm_size, "
+                    "msg_size, pof2, num_nodes, ppn (default: comm_size, msg_size, pof2; with --node-aware also "
+                    "num_nodes, ppn)")
     ap.add_argument("--min-fallback-algs", type=int, default=3, help="a set may call a subset's subtree that "
                     "uses at least this many algorithms; a smaller one's algorithms are candidates directly")
     ap.add_argument("--stale-tol", type=float, default=1.05, help="report a changed inner choice of a "
@@ -413,6 +550,9 @@ def main(argv=None):
     ap.add_argument("--buffer-swap", action="store_true", help="host model only: the file measures buffer_swap "
                     "(device buffers swap to host, then the host tree): <op>-intra-auto is "
                     "{gpu: buffer_swap, any: <host dispatch>}")
+    ap.add_argument("--into", metavar="FILE", help="write --out as FILE (MPICH's src/mpi/coll/coll_selection.json) "
+                    "with this run's subtrees in place of its own: the built collectives' intra subtrees "
+                    "replaced, new subtrees after their collective's, every other entry kept byte for byte")
     ap.add_argument("--with", dest="with_files", action="append", default=[], metavar="FILE",
                     help="also write the subtrees of FILE's collectives that this run does not build into --out "
                     "(a tuning file for inner calls into another collective, or the final file)")
@@ -468,6 +608,12 @@ def main(argv=None):
     if a.buffer_swap and any("device" in by_mem for by_mem in colls.values()):
         sys.exit("--buffer-swap: give host models only")
     feats = ["N", "ppn", "p", "m", "pof2"] if a.node_aware else ["p", "m", "pof2"]
+    if a.features:
+        key = {"comm_size": "p", "msg_size": "m", "pof2": "pof2", "num_nodes": "N", "ppn": "ppn"}
+        bad = [f for f in a.features.split(",") if f not in key]
+        if bad:
+            sys.exit(f"--features: unknown {', '.join(bad)} (comm_size, msg_size, pof2, num_nodes, ppn)")
+        feats = [key[f] for f in a.features.split(",")]
     names = dict(CSEL_NAME, m=a.size_condition)
     override = {}
     for kv in a.param:
@@ -542,9 +688,15 @@ def main(argv=None):
     depth = json_depth(written)
     if depth > 64:
         sys.exit(f"tree nests {depth} levels; MPICH's parser allows 64 (try a larger --tol)")
-    with open(a.out, "w") as f:
-        json.dump(written, f, indent=2)
-        f.write("\n")
+    if a.into:
+        with open(a.into) as f:
+            text = splice_into(f.read(), out, colls)
+        with open(a.out, "w") as f:
+            f.write(text)
+    else:
+        with open(a.out, "w") as f:
+            json.dump(written, f, indent=2)
+            f.write("\n")
     every = [x for v in built.values() for x in v]
     for path, m, S in every:
         for line in S.lines:

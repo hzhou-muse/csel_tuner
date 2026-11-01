@@ -87,8 +87,11 @@ own `launch()` puts `$GPU_WRAPPER` in front of the command.
 
 `launch/sites/aurora.sh` is a complete example (ALCF Aurora, PALS
 `mpiexec`). `launch/sites/local.sh` runs on one machine with MPICH's fake
-nodes (`MPIR_CVAR_NUM_CLIQUES=2`, tcp): good for trying the tools, its
-timings mean nothing.
+nodes: each launch of `--nodes N --ppn Q` sets `MPIR_CVAR_NUM_CLIQUES=N`,
+over loopback tcp, one rank per core of `NODE_CORES` (keep N × Q at or
+below the cores). Its timings describe that machine, not a real network.
+`launch/sites/local-cuda.sh` adds one CUDA GPU that every rank shares
+(`GPU_WRAPPER=env` keeps `gpu_bind.sh` out; mpisrv uses device 0).
 
 The server checks `SOCKETS` and `NICS_PER_SOCKET` at startup against the
 ranks' binding and against what MPICH reports, and lists mismatches as
@@ -470,10 +473,21 @@ predicted regret and the algorithms used.
 | `--tol` | 0.005 | allowed predicted geomean regret over the full tree; larger = smaller tree |
 | `--max-regret` | 1.5 | pruning never lets a point's predicted regret exceed this |
 | `--node-aware` | off | also split on `num_nodes` and `ppn` (MPICH with pmodels/mpich#8048) |
+| `--features` | `comm_size,msg_size,pof2` | the conditions splits may use, any of `comm_size`, `msg_size`, `pof2`, `num_nodes`, `ppn` (e.g. a default file without node conditions) |
+| `--max-depth` | none | at most this many nested condition levels per subtree, applied while the tree grows; the depth is the smallest up to this whose predicted p90 regret is at most `--depth-p90` (1.10) and within `--depth-slack` (0.02) of the deepest's, else `--max-depth`. The report lists each depth's geomean, p90, max and leaves |
+| `--into FILE` | | write `--out` as FILE (MPICH's `src/mpi/coll/coll_selection.json`) with this run's subtrees in place of its own: the built collectives' intra subtrees replaced (old ones the run lacks removed), new ones after their collective's, every other entry byte for byte |
 | `--min-fallback-algs` | 3 | a set may call a subset's subtree that uses at least this many algorithms; a smaller one's algorithms are candidates directly |
 | `--stale-tol` | 1.05 | report a compositional algorithm's changed inner choice when the two are predicted more than this apart |
 | `--nested-dispatch` | off | dispatch on restrictions with nested conditions instead of `dispatch=` (MPICH without pmodels/mpich#8048) |
 | `--param ALG.KEY=VALUE` | | override an algorithm leaf's parameter, e.g. `tree.k=4`; by default the leaves get the parameters the model recorded (the CVAR values of the measurements, design §8) |
+
+A compact file for MPICH's built-in default (subtrees of a few levels, no
+node conditions), spliced into the source tree:
+
+```sh
+bin/colltree run.json --features comm_size,msg_size,pof2 --max-depth 4 \
+    --into $MPICH_SRC/src/mpi/coll/coll_selection.json --out $MPICH_SRC/src/mpi/coll/coll_selection.json
+```
 
 Use it with MPICH:
 

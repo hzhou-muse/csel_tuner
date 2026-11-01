@@ -26,7 +26,9 @@ its splits where a wrong choice is expensive.
    are `max_leaves` leaves. Leaves pick the least-regret algorithm.
 3. Pruning: weakest link first (the split whose removal adds the least
    regret per leaf removed), down to the smallest tree whose predicted
-   geomean regret is within `tol` of the full tree's, never merging a split
+   geomean regret is within `tol` of the full tree's (a depth limit,
+   at most that many nested condition levels in the JSON, cond_depth, is
+   applied while growing: fit_tree's max_depth), never merging a split
    that would give a point a predicted regret above `max_regret` (the
    geomean alone lets a few expensive mistakes through, e.g. an algorithm
    that wins at power-of-two p chosen for the non-power-of-two p next to
@@ -94,15 +96,20 @@ def best_split(node, X, R, names):
     return best
 
 
-def fit_tree(X, L, names, min_gain=1e-6, max_leaves=1024):
+def fit_tree(X, L, names, min_gain=1e-6, max_leaves=1024, max_depth=None):
     """X: {feature: values per point}; L: predicted log2 T, points x algorithms;
-    names: the features splits may use."""
+    names: the features splits may use; max_depth: at most this many nested condition levels
+    in the JSON (cond_depth): a split at a node with `lev` levels above it puts its condition at
+    level lev + 1, its left child inside it (lev + 1), its right child in the same chain (lev)."""
     R = L - L.min(axis=1, keepdims=True)
     n = len(R)
     root = Node(np.arange(n), R)
+    root.lev = 0
     heap = []
 
     def push(node):
+        if max_depth is not None and node.lev >= max_depth:
+            return
         s = best_split(node, X, R, names)
         if s and s[0] > min_gain * n:
             heapq.heappush(heap, (-s[0], id(node), node, s))
@@ -111,6 +118,7 @@ def fit_tree(X, L, names, min_gain=1e-6, max_leaves=1024):
     while heap and nleaves < max_leaves:
         _, _, node, (gain, f, t, li, ri) = heapq.heappop(heap)
         node.split = [f, t, Node(li, R), Node(ri, R), gain]
+        node.split[2].lev, node.split[3].lev = node.lev + 1, node.lev
         nleaves += 1
         push(node.split[2])
         push(node.split[3])
@@ -160,6 +168,22 @@ def prune_to(root, tol=0.005, max_regret=1.5):
             break
         path.append((len(root.leaves()), gm()))
     return root, path
+
+
+def cond_depth(node):
+    """Nesting of condition levels in the JSON that json_tree writes for node: a split's left
+    branch nests one level deeper, its right branch continues the same level (a chain of
+    splits becomes one object of sibling conditions); a leaf adds none."""
+    if node.split is None:
+        return 0
+    left, right = node.split[2], node.split[3]
+    return max(1 + cond_depth(left), cond_depth(right) if right.split is not None else 1)
+
+
+def regret_stats(root):
+    """(geomean, p90, max) of the predicted regret (ratios) over the fitted points."""
+    r = np.concatenate([root.R[l.idx, l.alg] for l in root.leaves()])
+    return float(2 ** r.mean()), float(2 ** np.quantile(r, 0.9)), float(2 ** r.max())
 
 
 def select(root, x):

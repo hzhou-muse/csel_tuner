@@ -208,3 +208,34 @@ if __name__ == "__main__":
     test_reduction_variants()
     test_size_condition()
     print("ok")
+
+
+def test_splice_into_main_file():
+    """colltree --into: only the built collective's intra subtrees change; the rest stays byte
+    for byte; old subtrees of that collective that the run lacks go; a second splice is a no-op."""
+    import importlib.machinery
+    import importlib.util
+    path = os.path.join(REPO, "bin", "colltree")
+    loader = importlib.machinery.SourceFileLoader("colltree_mod", path)
+    spec = importlib.util.spec_from_loader("colltree_mod", loader)
+    ct = importlib.util.module_from_spec(spec)
+    loader.exec_module(ct)
+    text = ('{\n    "name=main": "call=auto",\n    "name=bcast-intra-auto":\n    {\n'
+            '            "comm_size<8":\n            {\n                "algorithm=MPIR_Bcast_intra_binomial":{}\n'
+            '            },\n            "any":\n            {\n'
+            '                "algorithm=MPIR_Bcast_intra_scatter_ring_allgather":{}\n            }\n    },\n'
+            '    "name=bcast-intra-10": "call=bcast-intra-auto",\n'
+            '    "name=bcast-inter-auto":\n    {\n        "algorithm=MPIR_Bcast_inter_remote_send_local_bcast":{}\n'
+            '    }\n}\n')
+    ours = {"name=bcast-intra-auto": "dispatch=bcast-intra(0x200)",
+            "name=bcast-intra-0": {"msg_size(4096)": {"algorithm=MPIR_Bcast_intra_binomial": {}},
+                                   "any": {"algorithm=MPIR_Bcast_intra_tree": {"k": 2}}},
+            "name=bcast-intra-200": {"algorithm=MPIDI_POSIX_mpi_bcast_release_gather": {}}}
+    new = ct.splice_into(text, ours, ["bcast"])
+    d = json.loads(new)
+    assert list(d) == ["name=main", "name=bcast-intra-auto", "name=bcast-intra-0", "name=bcast-intra-200",
+                       "name=bcast-inter-auto"]
+    assert d["name=bcast-intra-0"] == ours["name=bcast-intra-0"] and "name=bcast-intra-10" not in d
+    assert new.startswith('{\n    "name=main": "call=auto",\n    "name=bcast-intra-auto": "dispatch=')
+    assert new.endswith(text[text.index('    "name=bcast-inter-auto"'):])
+    assert ct.splice_into(new, ours, ["bcast"]) == new
