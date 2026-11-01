@@ -687,6 +687,16 @@ One unit of a file (collmodel/5, §12) has two sections:
   finds an older fit version refits (not implemented yet: tools refuse a
   fit of another version).
 
+**Growth anchors** (`collmodel --growth-anchors`) are records of a fixed
+point set: every modeled algorithm at an N ladder (powers of two) × a few
+fixed ppn × a latency and a bandwidth size band. The sampler measures an
+algorithm only where it can win, so its data says little about how a losing
+algorithm, or one past its crossover, grows with the communicator; fits of
+that growth (to select beyond the measured layouts) need the same points
+for every algorithm. The records carry `growth: true` and the fit skips
+them, as it skips drift anchors: the curves and the tree do not depend on
+them. Fixed ppn keeps pof2 constant along each ladder.
+
 *Alternative, not adopted for now:* store only `data` and fit on load. The
 fit is a function of the data and the fitter version (per-layout PCHIP and
 the penalty a(m): seconds, less than building
@@ -865,6 +875,7 @@ of forced measurements predicts.
   are units of their own, but no condition tells them apart at run time:
   colltree takes one of them per collective (`--unit`).
 - **Extrapolation beyond the allocation** (N > N_max) is not modeled: the
-  tree's last branch covers it.
+  tree's last branch covers it. Growth anchors (§12.1) record the data for
+  growth fits; no tool uses them yet.
 - The v1 p90 error estimate is unreliable (few random checks); v2's regret
   estimate is reliable on the replay.

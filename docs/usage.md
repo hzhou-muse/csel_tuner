@@ -228,6 +228,38 @@ bin/collmodel --model bcast.json --layouts 4x24,16x8 --catalog $CAT ... --out bc
   drift between jobs; above `--drift-tol` (1.10) it warns. Anchors are kept
   in the data, flagged, and not used for the fit.
 
+**Growth anchors** (`--growth-anchors`, design.md §12.1): a fixed set of
+points for fits of how each algorithm's time grows with N and ppn, measured
+after the sampling of a create or add run, or alone to top up a model:
+
+```sh
+bin/collmodel --algs all --catalog $CAT --growth-anchors --site aurora --nodes 32 --ppn 96 --out bcast.json ...
+bin/collmodel --model bcast.json --growth-anchors --site aurora --nodes 32 --ppn 96 --out bcast2.json
+```
+
+- The points are known before the run and do not depend on any
+  measurement: N in powers of two from 2 up to the allocation (N = 1 too, for
+  the ppn direction) × the ppn classes 1, the largest power of two ≤
+  √ppn_max and ppn_max × a latency band (1, 4, 16 KB) and a bandwidth band
+  (the largest size / 16 and / 4), each size snapped to the grid.
+  `--growth-n`, `--growth-ppn` and `--growth-sizes` (k/M suffixes) replace
+  the defaults.
+- Every modeled algorithm is measured at every point, contender or not,
+  where its restrictions hold, its precheck passed and (compositional) the
+  run's inner selection is the one its curves ran under. The run record
+  (`runs[-1].growth_anchors`) lists the points, what was measured and the
+  (algorithm, layout) pairs left out with the reason.
+- The records carry `growth: true`; the fit and the drift anchors skip
+  them, so the sampling, the curves and the tree are the same with or
+  without anchors. A top-up does not remeasure points the model has.
+- They run after the sampling, also when it stopped at its budget; a
+  deadline, SIGTERM or `--resume` treat them like the rest of the run, and a
+  resumed job must keep the anchor options.
+- The bandwidth band dominates their cost (every point bills the whole
+  allocation). Fixed ppn keeps pof2 constant along each N ladder; an
+  allocation of 16–32 nodes gives a ladder long enough to compare its lower
+  and upper halves.
+
 **Compositional algorithms** (e.g. smp; design.md §11) are added with the
 tuning file of their inner calls loaded in the launch:
 
@@ -285,6 +317,8 @@ Also `--log`, `--resume`, `--deadline`, `--checkpoint-every` (§6.5) and
 | `--launch` | `--mem` | launch kinds, one server launch each, its units one after another: `host`, `gpu` (device buffers, one GPU per rank, `MPIR_CVAR_ENABLE_GPU_COLL=1`), `device` (device buffers without `GPU_COLL`, the older `--mem device`); with `--site` it sets `LAUNCH` for `launch/config.sh`. The unit's `launch` tag |
 | `--plan` | | print each unit's algorithms by stage (from the catalog's `inner` keys: a compositional algorithm is 1 + the stage at which the trees it selects from are complete) and the trees each one needs, then exit; needs `--catalog` |
 | `--max-stage` | none | add only algorithms up to this stage (`--plan`); an explicit `--algs` above it is refused. A stage-k algorithm needs an `--inner-selection` file built (colltree) from the units' stages below k |
+| `--growth-anchors` | off | after the sampling, measure every modeled algorithm at a fixed point set for scaling fits (§6.2); with `--model` alone, top up a model's anchors |
+| `--growth-n`, `--growth-ppn`, `--growth-sizes` | powers of two; 1, 2^⌊log2 √ppn_max⌋, ppn_max; 1k,4k,16k, max/16, max/4 | the anchors' node counts, ranks per node and sizes |
 | `--budget-h` | none | per unit: stop after this many wall-clock hours, all jobs |
 | `--budget-node-h` | none | per unit, in node-hours (deprecated: `--budget-h`; replay experiments use it) |
 | `--prune` | 2.0 | v2: skip sizes predicted this much slower than the best; 0 = off |
@@ -591,6 +625,7 @@ python3 tests/test_replay.py     # replay end to end; needs pandas and replay da
 python3 tests/test_resume.py     # a cut journal resumes to the same model; same needs
 python3 tests/test_restrict.py   # catalog, precheck, sets, dispatch; the builds with sets need replay data
 python3 tests/test_extend.py     # adding an algorithm and layouts to a model, resume; needs replay data
+python3 tests/test_growth_anchors.py  # growth anchors: point set, fit unchanged, restrictions, top-up, resume
 python3 tests/test_gpu.py        # memory-kind restrictions; colltree merging host and device models
 python3 tests/test_kinds.py      # restriction kinds, variants; inner trees in --inner-selection
 python3 tests/test_stages.py     # algorithm stages from inner calls; disabled algorithms, leaf names and parameters

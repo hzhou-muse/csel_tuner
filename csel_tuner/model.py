@@ -114,7 +114,8 @@ class Model:
         self.left_out = []              # algorithms that fail without a restriction
         self.notes = []
         self.jobs = []                  # [{...}], a measurement's "job" is an index here
-        self.measurements = []          # [{"alg", "N", "ppn", "m", "t_us", "wall_us", "job", "inner"?, "anchor"?}]
+        self.measurements = []          # [{"alg", "N", "ppn", "m", "t_us", "wall_us", "job", "inner"?, "anchor"?,
+        #                                 "growth"?}]
         self.prechecks = []             # [{"alg", "N", "ppn", "ok", "msg", "job"}]
         self.inner_files = {}           # hash -> content of a tuning file loaded for inner calls
         self.curves = {}                # alg -> {layout: log2 T on the grid}
@@ -184,13 +185,17 @@ class Model:
         self.jobs.append(job)
         return len(self.jobs) - 1
 
-    def add_measurement(self, job, alg, n, ppn, m, t_us, wall_us, inner=None, anchor=False):
+    def add_measurement(self, job, alg, n, ppn, m, t_us, wall_us, inner=None, anchor=False, growth=False):
+        """anchor: a drift anchor (remeasured point of an earlier job); growth: a growth anchor
+        (collmodel --growth-anchors, a fixed point for scaling fits). The fit skips both."""
         rec = {"alg": alg, "N": n, "ppn": ppn, "m": int(m), "t_us": [round(float(t), 4) for t in t_us],
                "wall_us": round(float(wall_us), 1), "job": job}
         if inner:
             rec["inner"] = inner
         if anchor:
             rec["anchor"] = True
+        if growth:
+            rec["growth"] = True
         self.measurements.append(rec)
 
     def add_precheck(self, job, alg, n, ppn, ok, msg=""):
@@ -217,12 +222,13 @@ class Model:
 
     def values(self, alg, lay, inner=None):
         """{grid index: [log2 of each measurement's median]} of an algorithm at a
-        layout, anchors excluded; for a compositional algorithm only those under
-        the given inner selection."""
+        layout, drift and growth anchors excluded; for a compositional algorithm
+        only those under the given inner selection."""
         idx = {m: i for i, m in enumerate(self.sizes)}
         out = {}
         for r in self.measurements:
-            if r["alg"] != alg or (r["N"], r["ppn"]) != tuple(lay) or r.get("anchor") or r["m"] not in idx:
+            if r["alg"] != alg or (r["N"], r["ppn"]) != tuple(lay) or r.get("anchor") or r.get("growth") \
+                    or r["m"] not in idx:
                 continue
             if self.is_compositional(alg) and r.get("inner") != inner:
                 continue

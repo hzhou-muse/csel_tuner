@@ -79,6 +79,20 @@ does) instead of the precheck:
     bin/collmodel --mem device --algs all --catalog ... --out bcast_gpu.json \\
         --site aurora --nodes 8 --ppn 12 --log bcast_gpu.log
 
+Growth anchors (--growth-anchors): after the sampling, a fixed set of points
+for fits of how each algorithm's time grows with N and ppn, known before the
+run and independent of every measurement: N in powers of two up to the
+allocation, at a few fixed ppn (1, the largest power of two <= sqrt(ppn_max),
+ppn_max; N = 1 too at each ppn above 1), at a latency band (1, 4, 16 KB) and
+a bandwidth band (a quarter and a sixteenth of the largest size), every modeled
+algorithm whose restrictions hold and whose precheck passed, contender or not.
+--growth-n, --growth-ppn and --growth-sizes replace the defaults. The records
+carry "growth": true, and the fit skips them: the sampling, the curves and
+the tree are the same with or without them. With --model alone it tops up a
+model's anchors (points it has are not remeasured):
+
+    bin/collmodel --model bcast.json --growth-anchors --out bcast2.json --site aurora --nodes 32 --ppn 96
+
 Replay on recorded data in replay/data (replay/README.md), for development:
 
     bin/collmodel --algs binomial,tree --out m.json --replay [--seed 0]
@@ -153,7 +167,8 @@ OPS = _AlgCvars()
 OLD_OPS = {"bcast": 1, "allreduce": 4, "reduce": 4, "ireduce": 4, "iallreduce": 4}
 # settings that change which requests the builder makes: a resumed job must keep them
 SAME_ON_RESUME = ["mode", "op", "algs", "seed", "batches", "sync", "prune", "nodes", "ppn_max", "max_m", "counts", "inplace",
-                  "compositional", "probe_m", "base", "inner", "layouts", "anchors", "mem", "exclude_algs"]
+                  "compositional", "probe_m", "base", "inner", "layouts", "anchors", "mem", "exclude_algs",
+                  "growth"]
 RESUME_DEFAULTS = {"mem": "host", "exclude_algs": "", "counts": "uniform", "inplace": False}       # for journals written before the setting existed
 
 
@@ -726,7 +741,7 @@ def anchors(a, model, measure, jobs_before):
     """Remeasure a few points of the model's best algorithms at layouts earlier jobs
     measured: (points, ratio geomean, ratio max) of new / earlier values."""
     m = model
-    earlier = [r for r in m.measurements if r["job"] < jobs_before and not r.get("anchor")]
+    earlier = [r for r in m.measurements if r["job"] < jobs_before and not r.get("anchor") and not r.get("growth")]
     if not earlier or not a.anchors:
         return None
     have = {(r["N"], r["ppn"]) for r in earlier}
@@ -769,7 +784,7 @@ def extend(a, model, measure, probe, inner_hash, clock, nodes, on_layout, stop_c
         for name in m.algorithms:
             if name in by_name:
                 m.algorithms[name] = alg_info(by_name[name], bits, a.cvar_values, m.algorithms[name])
-    elif m.conditions:
+    elif m.conditions and (a.algs or a.layouts):
         sys.exit("the model has restriction sets: give --catalog to add to it")
     else:
         by_name = {}
@@ -881,6 +896,116 @@ def extend(a, model, measure, probe, inner_hash, clock, nodes, on_layout, stop_c
     return run
 
 
+# ---- growth anchors ------------------------------------------------------------
+
+GROWTH_LAT = (1024, 4096, 16384)       # latency band (bytes)
+GROWTH_BW = (16, 4)                    # bandwidth band: the largest size divided by these
+
+
+def parse_ints(text, what):
+    """'1024,4k,16M' -> [1024, 4096, 16777216]."""
+    out = []
+    for x in filter(None, text.split(",")):
+        k = x.strip().lower()
+        mult = {"k": 1 << 10, "m": 1 << 20, "g": 1 << 30}.get(k[-1:], 1)
+        try:
+            out.append(int(k[:-1] if mult > 1 else k) * mult)
+        except ValueError:
+            sys.exit(f"{what}: {x} is not a number")
+    return out
+
+
+def growth_layouts(a, allowed):
+    """The growth anchors' layouts in visiting order (ppn class, then N), their N ladder
+    and ppn classes."""
+    allowed = set(allowed)
+    nodes, ppn_max = max(n for n, _ in allowed), max(q for _, q in allowed)
+    if a.growth_n:
+        ns = sorted(set(parse_ints(a.growth_n, "--growth-n")))
+    else:
+        ns = [1 << k for k in range(1, nodes.bit_length()) if 1 << k <= nodes]
+    if a.growth_ppn:
+        qs = sorted(set(parse_ints(a.growth_ppn, "--growth-ppn")))
+    else:
+        qs = sorted({1, 1 << ((math.isqrt(ppn_max)).bit_length() - 1), ppn_max})
+    lays = [(n, q) for q in qs for n in [1] + [n for n in ns if n != 1] if n * q > 1]
+    bad = [f"{n}x{q}" for n, q in lays if (n, q) not in allowed]
+    if bad and (a.growth_n or a.growth_ppn):
+        sys.exit(f"--growth-n/--growth-ppn: not allowed layouts of this allocation: {', '.join(bad)}")
+    return [l for l in lays if l in allowed], ns, qs
+
+
+def growth_sizes(a, sizes):
+    """The growth anchors' sizes, each snapped to the nearest size of the grid (in log)."""
+    if list(sizes) == [0]:      # barrier
+        return [0]
+    want = parse_ints(a.growth_sizes, "--growth-sizes") if a.growth_sizes else \
+        list(GROWTH_LAT) + [sizes[-1] // d for d in GROWTH_BW]
+    grid = np.log2(np.asarray(sizes, float))
+    return sorted({int(sizes[int(np.argmin(np.abs(grid - np.log2(max(m, 1)))))]) for m in want})
+
+
+def growth_spec(a):
+    """The anchors' settings as the job record keeps them (None without --growth-anchors)."""
+    if not a.growth_anchors:
+        return None
+    return {"n": a.growth_n, "ppn": a.growth_ppn, "sizes": a.growth_sizes}
+
+
+def growth_anchors(a, model, measure, inner_hash, stop_check, on_layout, cost):
+    """Measure the growth anchors: every modeled algorithm at every anchor layout and size where
+    it may run, points with a growth record in the model left out. Returns the run record's
+    "growth_anchors" entry."""
+    m = model
+    lays, ns, qs = growth_layouts(a, m.layouts)
+    sizes = growth_sizes(a, m.sizes)
+    feas = m.feasible() if m.prechecks else None
+    have = {(r["alg"], r["N"], r["ppn"], r["m"]) for r in m.measurements if r.get("growth")}
+    skipped, plan = [], []
+    for lay in lays:
+        mask = m.masks.get(lay, 0)
+        for x in m.algorithms:
+            why = "left out" if x in m.left_out else \
+                "restriction" if not m.allowed(x, mask) else \
+                "precheck" if feas is not None and x not in feas.get(lay, ()) else \
+                "inner selection" if m.is_compositional(x) and m.fit_inner.get(x) != inner_hash else None
+            if why:
+                skipped.append({"alg": x, "N": lay[0], "ppn": lay[1], "why": why})
+                continue
+            ms = [s for s in sizes if (x, lay[0], lay[1], s) not in have]
+            if ms:
+                plan.append((lay, x, ms))
+    rec = {"N": ns, "ppn": qs, "sizes": sizes, "layouts": [list(l) for l in lays],
+           "points": sum(len(ms) for _, _, ms in plan), "skipped": skipped, "measured": 0, "stop": "done"}
+    print(f"growth anchors: {len(lays)} layouts (N {','.join(map(str, ns))} x ppn {','.join(map(str, qs))}), "
+          f"sizes {','.join(map(str, sizes))}: {rec['points']} points to measure, "
+          f"{len(skipped)} (algorithm, layout) pairs left out", file=sys.stderr)
+    c0 = cost()
+    try:
+        last = None
+        for lay, x, ms in plan:
+            if lay != last:
+                if last is not None:
+                    on_layout()
+                why = stop_check()
+                if why:
+                    rec["stop"] = why
+                    break
+                last = lay
+            measure(lay[0], lay[1], x, ms, tag="growth")
+            rec["measured"] += len(ms)
+        else:
+            if last is not None:
+                on_layout()
+    except Terminated:
+        rec["stop"] = "terminated"
+        print("SIGTERM: writing the model with the growth anchors measured so far", file=sys.stderr)
+    rec["node_h"] = round(cost() - c0, 4)
+    print(f"growth anchors: {rec['measured']} of {rec['points']} points, {rec['node_h']:.3f} node-h, "
+          f"stop: {rec['stop']}", file=sys.stderr)
+    return rec
+
+
 # ---- the output file -----------------------------------------------------------
 
 _out_files = {}
@@ -990,7 +1115,7 @@ def import_v3(a):
                 elif rep.get("status") == "ok" and alg != "auto":
                     model.add_measurement(job, alg, n, q, req["m"], rep["t_us"], rep["wall_us"],
                                           inner=inner if model.is_compositional(alg) else None,
-                                          anchor=req.get("tag") == "anchor")
+                                          anchor=req.get("tag") == "anchor", growth=req.get("tag") == "growth")
         else:
             print(f"--import {path}: no journal; the model has its curves but no measurements", file=sys.stderr)
             model.add_job({"imported_from": path, "inner_selection": inner})
@@ -1056,6 +1181,16 @@ def parse_args(argv):
     ap.add_argument("--anchors", type=int, default=3, help="with --model: layouts at which to remeasure a few "
                     "points of the best algorithms, for the drift between jobs (0: none)")
     ap.add_argument("--drift-tol", type=float, default=1.10, help="warn when an anchor moved more than this")
+    g = ap.add_argument_group("growth anchors")
+    g.add_argument("--growth-anchors", action="store_true", help="after the sampling, measure every modeled "
+                   "algorithm at a fixed set of points (N ladder x ppn classes x latency and bandwidth sizes), "
+                   "for scaling fits; the fit skips them. With --model alone: top up a model's anchors")
+    g.add_argument("--growth-n", metavar="N,...", help="the anchors' node counts (default: powers of two from 2 "
+                   "up to the allocation; N=1 is always added)")
+    g.add_argument("--growth-ppn", metavar="PPN,...", help="the anchors' ranks per node (default: 1, the largest "
+                   "power of two <= sqrt(ppn_max), ppn_max)")
+    g.add_argument("--growth-sizes", metavar="M,...", help="the anchors' sizes, snapped to the grid, k/M "
+                   "suffixes allowed (default: 1k,4k,16k and the largest size /16 and /4)")
     ap.add_argument("--plan", action="store_true", help="print the units (--colls/--op, --launch) with their "
                     "algorithms by stage (from the inner calls in --catalog) and the trees each needs; no run")
     ap.add_argument("--max-stage", type=int, help="with --model: add only algorithms up to this stage (--plan); "
@@ -1129,8 +1264,10 @@ def parse_args(argv):
         if not a.catalog:
             ap.error("--plan needs --catalog")
         a.algs = a.algs or "all"
-    if not (a.alg or a.algs or (a.model and a.layouts)):
-        ap.error("one of --alg or --algs is required (or --model with --layouts)")
+    if (a.growth_n or a.growth_ppn or a.growth_sizes) and not a.growth_anchors:
+        ap.error("--growth-n, --growth-ppn and --growth-sizes go with --growth-anchors")
+    if not (a.alg or a.algs or (a.model and (a.layouts or a.growth_anchors))):
+        ap.error("one of --alg or --algs is required (or --model with --layouts or --growth-anchors)")
     a.algs = a.algs.split(",") if a.algs else [a.alg] if a.alg else []
     if a.model:
         if a.alg:
@@ -1141,6 +1278,8 @@ def parse_args(argv):
         ap.error("--layouts needs --model")
     if a.algs == ["all"] and not a.catalog:
         ap.error("--algs all needs --catalog")
+    if a.growth_anchors and not a.model and len(a.algs) == 1 and not a.catalog:
+        ap.error("--growth-anchors needs a collmodel/5 model: several --algs, --catalog, or --model")
     # the units: (launch kind, coll, inplace, counts), launch kinds outermost
     kinds = a.launch.split(",") if a.launch else [a.mem]
     for k in kinds:
@@ -1210,6 +1349,16 @@ def plan(a):
             top = max(top, k)
     print(f"stages 1..{top}: a stage-k algorithm is measured with --max-stage k and an --inner-selection "
           "file of the trees it needs, built (colltree) from the units' stages below k")
+    if a.growth_anchors:
+        if a.nodes and a.ppn:
+            allowed = [(n, q) for n in axis_values(a.nodes) for q in axis_values(a.ppn) if n * q > 1]
+            lays, ns, qs = growth_layouts(a, allowed)
+            sizes = growth_sizes(a, size_grid(a.max_m))
+            print(f"growth anchors per unit: {len(lays)} layouts (N {','.join(map(str, ns))} x ppn "
+                  f"{','.join(map(str, qs))}) x sizes {','.join(map(str, sizes))} (for operations with p blocks "
+                  "per buffer the grid, and so the bandwidth band, is smaller), each algorithm where it may run")
+        else:
+            print("growth anchors: give --nodes and --ppn to list their points")
 
 
 def parse_colls(text, counts="uniform"):
@@ -1324,7 +1473,7 @@ def run_unit(a, tags, t_job, shared):
     srv = None
     v1 = not a.model and len(a.algs) == 1 and not a.catalog
     built = []      # [(mask, layouts, algorithm names, builder)], in build order (creating a model)
-    model, run = None, None
+    model, run, growth = None, None, None
     try:
         send, make_req, probe, layouts, sizes, nodes, ppn_max, max_m, meta, srv = \
             replay(a) if a.replay else live(a, shared)
@@ -1337,7 +1486,7 @@ def run_unit(a, tags, t_job, shared):
                "compositional": a.compositional, "exclude_algs": a.exclude_algs, "probe_m": a.probe_m,
                "base": base_hash, "inner": inner_hash,
                "layouts": a.layouts, "anchors": a.anchors if a.model else None, "mem": a.launch,
-               "counts": a.counts, "inplace": a.inplace, "tags": tags}
+               "counts": a.counts, "inplace": a.inplace, "tags": tags, "growth": growth_spec(a)}
         if journal.jobs:
             first = journal.jobs[0]
             err, dropped = resume_check(journal.jobs, job)
@@ -1385,7 +1534,7 @@ def run_unit(a, tags, t_job, shared):
                 elif rep.get("status") == "ok":
                     model.add_measurement(jid, alg, n, q, req["m"], rep["t_us"], rep["wall_us"],
                                           inner=inner_hash if model.is_compositional(alg) else None,
-                                          anchor=req.get("tag") == "anchor")
+                                          anchor=req.get("tag") == "anchor", growth=req.get("tag") == "growth")
         else:
             on_reply = None
         measure = make_measure(journal, send, make_req, on_reply)
@@ -1423,6 +1572,16 @@ def run_unit(a, tags, t_job, shared):
         prober = make_probe(journal, probe, make_req, a.probe_m, on_reply)
         if base is not None:
             run = extend(a, model, measure, prober, inner_hash, clock, nodes, on_layout, stop_check, cost)
+            if a.growth_anchors:
+                if run["stop"] in ("terminated", "deadline"):
+                    growth = {"stop": "not started: " + run["stop"]}
+                else:
+                    growth = growth_anchors(a, model, measure, inner_hash, stop_check, on_layout, cost)
+                    if growth["stop"] != "done":
+                        run["stop"] = growth["stop"]
+                run["growth_anchors"] = growth
+                run["complete"] = growth["stop"] == "done"
+                run["n_measurements"] += growth.get("measured", 0)
         else:
             if a.catalog:
                 sets = restriction_sets(a, model, catalog_algs(a)[0], prober)
@@ -1460,6 +1619,12 @@ def run_unit(a, tags, t_job, shared):
                 if b.stop == "deadline" and i < len(sets) - 1:
                     print(f"stop: {b.stop} in set {set_name(a.op, mask)}; later sets not built", file=sys.stderr)
                     break
+            if a.growth_anchors and not v1:
+                last = built[-1][3].stop if built else "terminated"
+                if len(built) < len(sets) or last in ("terminated", "deadline"):
+                    growth = {"stop": "not started: " + last}
+                else:
+                    growth = growth_anchors(a, model, measure, None, stop_check, on_layout, cost)
     except Terminated:
         sys.exit("terminated before the builder started; the journal keeps what was measured")
     finally:
@@ -1485,7 +1650,8 @@ def run_unit(a, tags, t_job, shared):
         if not built[0][3].samplers:
             sys.exit(f"stop: {built[0][3].stop} before the first layout was measured; no model written")
         store_curves(model, built)
-        complete = len(built) == len(sets) and all(x[3].stop not in ("terminated", "deadline") for x in built)
+        complete = len(built) == len(sets) and all(x[3].stop not in ("terminated", "deadline") for x in built) \
+            and (growth is None or growth["stop"] == "done")
         run = {"mode": "create", "algs": sorted({x for _, _, names, _ in built for x in names}),
                "complete": complete, "stop": built[-1][3].stop, "node_h": round(cost(), 4),
                "n_measurements": sum(x[3].n_meas for x in built),
@@ -1495,6 +1661,11 @@ def run_unit(a, tags, t_job, shared):
         for mask, _, _, x in built:
             print(f"  set {set_name(a.op, mask)}: {len(x.samplers)} layouts, {x.n_meas} measurements, "
                   f"stop: {x.stop}")
+        if growth is not None:
+            run["growth_anchors"] = growth
+            run["n_measurements"] += growth.get("measured", 0)
+            if growth["stop"] in ("terminated", "deadline"):
+                run["stop"] = growth["stop"]
     run["jobs"] = list(range(a._jobs_before, len(model.jobs)))
     model.runs.append(run)
     try:
