@@ -10,6 +10,8 @@
 
 subcode: _autoload
     $define(HELPER_TAG) 7                 # pingpong uses tag 0 on the same communicator
+    $define(BARRIER_TAG) 8                # helper_barrier
+    $define(REQUEST_TAG) 9                # bcast_request (idle.def), on MPI_COMM_WORLD
     # how: AGREE_MAX, AGREE_SUM, AGREE_ROOT (comm rank 0's value), or
     # AGREE_MAXMIN (first half of the vector max, second half min)
     $enum(agree_how) AGREE_MAX, AGREE_SUM, AGREE_ROOT, AGREE_MAXMIN
@@ -68,6 +70,17 @@ fncode: helper_bcast(double *v, int len, MPI_Comm c)
             helper_ok(MPI_Send(v, len, MPI_DOUBLE, me + mask, HELPER_TAG, c), "a measurement helper's MPI_Send")
         $elif me >= mask && me < 2 * mask
             helper_ok(MPI_Recv(v, len, MPI_DOUBLE, me - mask, HELPER_TAG, c, MPI_STATUS_IGNORE), "a measurement helper's MPI_Recv")
+
+# A barrier among the members of c from point-to-point messages
+# (dissemination: in round mask, send to me + mask, receive from me - mask),
+# for sync=call and before the timed batches: MPI_Barrier would run the
+# barrier algorithm the selection under test picks.
+fncode: helper_barrier(MPI_Comm c)
+    $my int n, int me
+    MPI_Comm_size(c, &n)
+    MPI_Comm_rank(c, &me)
+    $for int mask = 1; mask < n; mask <<= 1
+        helper_ok(MPI_Sendrecv(NULL, 0, MPI_BYTE, (me + mask) % n, BARRIER_TAG, NULL, 0, MPI_BYTE, (me - mask + n) % n, BARRIER_TAG, c, MPI_STATUS_IGNORE), "a measurement helper's MPI_Sendrecv")
 
 # A helper call that must not fail (it is not the measured call).
 fncode: helper_ok(int rc, const char *what)

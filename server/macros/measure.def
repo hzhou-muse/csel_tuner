@@ -22,7 +22,7 @@ fncode: run(const struct req *rq, const struct coll *cl, MPI_Comm c, int crank, 
         $my long off = rq->cold ? (i * bytes) % max_m : 0
         $if rq->sync_call
             $if !cl->self_sync
-                MPI_Barrier(c)
+                helper_barrier(c)
             t0 = MPI_Wtime()
         # the call uses s, r or both (colls/)
         $my char *s = sbuf + off, char *r = rbuf + off
@@ -89,7 +89,7 @@ fncode: measure(const struct req *rq, MPI_Comm c, struct result *res)
 
     $my double e[MAX_BATCHES], double emax[MAX_BATCHES], double emin[MAX_BATCHES]
     $if !cl->self_sync
-        MPI_Barrier(c)
+        helper_barrier(c)
     $my double t0 = MPI_Wtime()
     $for j=0:rq->batches
         $my double b

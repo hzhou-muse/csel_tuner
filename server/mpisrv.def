@@ -82,7 +82,8 @@
 #         and the core stays at speed. Rank 0 also spins while polling stdin.
 #   sleep same, but nanosleep in between. Cores drop to low clock speed and
 #         need tens of ms of work to recover (docs/design.md, section 3.4).
-#   busy  blocking MPI_Bcast (MPICH busy-polls its progress engine).
+#   busy  a blocking MPI_Recv of the request (MPICH busy-polls its progress
+#         engine). The request travels point to point in every mode (idle.def).
 #   split the members of the last request spin, all other ranks sleep (at
 #         start every rank sleeps), so idle cores do not take the measured
 #         cores' turbo budget. With MPISRV_SPINUP_US, the spin-up runs only

@@ -24,19 +24,36 @@ fncode: idle_pause
             $for i=0:100
                 __builtin_ia32_pause()
 
-# Wait for the next request without driving MPI progress in between.
+# Wait for the next request without driving MPI progress in between. The
+# request goes from world rank 0 to every rank on a binomial tree of
+# point-to-point messages (as helper_bcast), never through an MPI collective:
+# a collective here would run the algorithm the selection under test picks
+# (MPIR_CVAR_COLL_SELECTION_JSON_FILE), and its leftover work would land in
+# the next timed call. busy: a blocking receive (MPICH busy-polls its
+# progress engine); otherwise a receive tested between idle pauses.
 fncode: bcast_request(struct req *rq)
-    $if idle_mode == IDLE_BUSY
-        MPI_Bcast(rq, sizeof(*rq), MPI_BYTE, 0, MPI_COMM_WORLD)
-        return
-    $my MPI_Request r
-    $my int done = 0
-    MPI_Ibcast(rq, sizeof(*rq), MPI_BYTE, 0, MPI_COMM_WORLD, &r)
-    $while 1
-        MPI_Test(&r, &done, MPI_STATUS_IGNORE)
-        $if done
-            break
-        idle_pause()
+    $my int me = world_rank, int mask = 1
+    $if me > 0
+        # the parent: rank me - 2^k, k the highest bit of me
+        $while mask * 2 <= me
+            mask *= 2
+        $if idle_mode == IDLE_BUSY
+            helper_ok(MPI_Recv(rq, sizeof(*rq), MPI_BYTE, me - mask, REQUEST_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE), "the request broadcast's MPI_Recv")
+        $else
+            $my MPI_Request r
+            $my int done = 0
+            helper_ok(MPI_Irecv(rq, sizeof(*rq), MPI_BYTE, me - mask, REQUEST_TAG, MPI_COMM_WORLD, &r), "the request broadcast's MPI_Irecv")
+            $while 1
+                MPI_Test(&r, &done, MPI_STATUS_IGNORE)
+                $if done
+                    break
+                idle_pause()
+        mask *= 2
+    # forward: in round mask, the ranks below mask send to me + mask
+    $while mask < world_size
+        $if me + mask < world_size
+            helper_ok(MPI_Send(rq, sizeof(*rq), MPI_BYTE, me + mask, REQUEST_TAG, MPI_COMM_WORLD), "the request broadcast's MPI_Send")
+        mask *= 2
 
 # Rank 0: read the next line; from stdin, wait for input in the idle mode.
 # stdin is unbuffered (see main), so poll() sees every line not yet read even
