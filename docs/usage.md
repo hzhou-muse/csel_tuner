@@ -91,7 +91,10 @@ nodes: each launch of `--nodes N --ppn Q` sets `MPIR_CVAR_NUM_CLIQUES=N`,
 over loopback tcp, one rank per core of `NODE_CORES` (keep N × Q at or
 below the cores). Its timings describe that machine, not a real network.
 `launch/sites/local-cuda.sh` adds one CUDA GPU that every rank shares
-(`GPU_WRAPPER=env` keeps `gpu_bind.sh` out; mpisrv uses device 0).
+(`GPU_WRAPPER=env` keeps `gpu_bind.sh` out; mpisrv uses device 0). `launch/sites/jenkins-gpu.sh` is two
+GPU nodes launched with Hydra over ssh (`JGPU_HOSTS`): one rank per
+physical core, and `GPU_BIND=socket`, under which `gpu_bind.sh` gives each
+rank the GPU of its socket, so several ranks share a GPU.
 
 The server checks `SOCKETS` and `NICS_PER_SOCKET` at startup against the
 ranks' binding and against what MPICH reports, and lists mismatches as
@@ -604,6 +607,28 @@ MPIR_CVAR_COLL_SELECTION_JSON_FILE=$PWD/bcast_tuning.json \
 python3 groundtruth/score_live.py validate --truth results/validate/truth --default results/validate/default \
     --tuned results/validate/tuned --model bcast.json --tuning bcast_tuning.json
 ```
+
+`validate` takes any collective with `--op` (and `--inplace`, `--counts`;
+`--v-algs` is then required); score_live takes the collective from the
+model. Two more sets for any collective:
+
+```sh
+# forced sweeps: chosen algorithms per request around a threshold, sync call and batch
+python3 groundtruth/gen_plans.py --set forced --op allreduce --f-algs recursive_multiplying,reduce_scatter_allgather \
+    --f-min-m 8192 --f-max-m 262144 --per-octave 8 --nodes 2 --ppn 32 --out plans/forced
+# MPICH's own selection for many collectives, run with the built-in file and with a new one
+python3 groundtruth/gen_plans.py --set live --l-ops bcast,ibcast,allreduce,allreduce:inplace --nodes 2 --ppn 32 \
+    --max-m 16777216 --v-layouts 99 --v-per-octave 1 --min-m 4 --out plans/live
+groundtruth/run_set.sh plans/live results/live-base 3600
+MPIR_CVAR_COLL_SELECTION_JSON_FILE=$PWD/new.json groundtruth/run_set.sh plans/live results/live-new 3600
+python3 groundtruth/score_live.py compare --base results/live-base --new results/live-new [--noise results/live-base2]
+```
+
+`compare` reports T(new) / T(base) per collective and size band (≤ 1 KB,
+2–64 KB, ≥ 128 KB), p10/p90 and the points slower than 1.2x; `--noise`, a
+second run of the base, gives the noise floor. With `LAUNCH=gpu` (device
+buffers) `run_set.sh` starts mpisrv with `--mem device` under the site's GPU
+binding.
 
 The validation reports the regret of MPICH's default, of MPICH with the
 tuning file, of the tree's and the model's own choices, whether MPICH

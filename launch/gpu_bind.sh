@@ -18,7 +18,16 @@ if [ -z "$r" ]; then
     export MPISRV_BIND_ERROR="gpu_bind.sh: no local rank in the environment (PALS, Hydra, Open MPI or Slurm)"
     exec "$@"
 fi
-if [ -n "${GPU_DEVICES:-}" ] && [ "$r" -ge "$GPU_DEVICES" ]; then
+# GPU_BIND=socket: several ranks per GPU, local rank r of GPU_PPN gets GPU
+# floor(r * GPU_DEVICES / GPU_PPN), the GPU of its socket when the launch binds
+# the ranks in order over the sockets' cores (sites/jenkins-gpu.sh).
+if [ "${GPU_BIND:-}" = socket ]; then
+    if [ -z "${GPU_PPN:-}" ] || [ -z "${GPU_DEVICES:-}" ]; then
+        export MPISRV_BIND_ERROR="gpu_bind.sh: GPU_BIND=socket needs GPU_PPN and GPU_DEVICES"
+        exec "$@"
+    fi
+    r=$(( r * GPU_DEVICES / GPU_PPN ))
+elif [ -n "${GPU_DEVICES:-}" ] && [ "$r" -ge "$GPU_DEVICES" ]; then
     export MPISRV_BIND_ERROR="gpu_bind.sh: local rank $r, but a node has $GPU_DEVICES GPU devices (one rank each)"
     exec "$@"
 fi

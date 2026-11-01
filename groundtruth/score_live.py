@@ -4,6 +4,7 @@
     python3 score_live.py switch RESULT_DIR
     python3 score_live.py validate --truth DIR --default DIR --tuned DIR --model MODEL.json \\
         --tuning TUNING.json [--tuning-node-aware T.json] [--json SUMMARY.json]
+    python3 score_live.py compare --base DIR --new DIR [--noise DIR] [--json SUMMARY.json]
 
 switch: the plan set "switch" (gen_plans.py) measures the same requests with
 the algorithm chosen per request (S-req, cvar.*) and for the launch
@@ -25,7 +26,15 @@ the builder measured and those it did not, for:
   tree (offline)     the algorithm the tuning file picks, timed by truth
   model, per point   the model's own choice, timed by truth
 plus tuned / T(tree's algorithm) (about 1 if MPICH applied the file), and
-the model's own regret estimate for comparison.
+the model's own regret estimate for comparison. The collective is the
+model's (gen_plans.py --set validate --op).
+
+compare: two runs of the same requests with MPICH's own selection, e.g. the
+built-in selection file (--base) and a new one loaded with
+MPIR_CVAR_COLL_SELECTION_JSON_FILE (--new): per collective and size band
+(<= 1 KB, 2-64 KB, >= 128 KB), the geomean and p10/p90 of T(new) / T(base),
+and the points slower than 1.2x. --noise, a second run of --base, gives the
+same table for base against itself: the noise floor.
 """
 import argparse
 import glob
@@ -40,8 +49,9 @@ sys.path.insert(0, os.path.dirname(HERE))
 ALG_CVAR = "MPIR_CVAR_BCAST_INTRA_ALGORITHM"
 
 
-def records(path):
-    """(info env, [ok non-check bcast replies], [check replies], [errors]) of one JSONL file."""
+def records(path, op="bcast"):
+    """(info env, [ok non-check replies of op], [check replies], [errors]) of one JSONL file;
+    op None: every collective."""
     env, ok, checks, errors = {}, [], [], []
     for line in open(path):
         line = line.strip()
@@ -55,7 +65,7 @@ def records(path):
             env = r.get("env", {})
         elif r.get("status") == "error":
             errors.append(r.get("msg", ""))
-        elif r.get("op") == "bcast" and r.get("status") == "ok":
+        elif (op is None or r.get("op") == op) and r.get("op") != "info" and r.get("status") == "ok":
             (checks if "check" in r else ok).append(r)
     return env, ok, checks, errors
 
@@ -138,16 +148,63 @@ def layout_mask(masks, n, q):
     return same.pop() if len(same) == 1 else 0
 
 
-def times(directory):
-    """{(alg or None, N, ppn, m): t} of the result directory, and the launch env."""
+def times(directory, op="bcast"):
+    """{(alg or None, N, ppn, m): t} of op in the result directory, and the launch env."""
     out, env_all = {}, {}
+    cvar = "MPIR_CVAR_%s_INTRA_ALGORITHM" % op.upper()
     for path in sorted(glob.glob(os.path.join(directory, "*.jsonl"))):
-        env, ok, _, _ = records(path)
+        env, ok, _, _ = records(path, op)
         env_all.update(env)
         for r in ok:
-            out[(r.get("cvars", {}).get(ALG_CVAR), r["p"] // r["ppn"], r["ppn"], r["m"])] = \
+            out[(r.get("cvars", {}).get(cvar), r["p"] // r["ppn"], r["ppn"], r["m"])] = \
                 float(np.median(r["t_us"]))
     return out, env_all
+
+
+BANDS = [("<= 1 KB", 0, 1024), ("2-64 KB", 1025, 65536), (">= 128 KB", 65537, 1 << 62)]
+
+
+def by_point(directory):
+    """{(op, inplace, N, ppn, m): t} of every collective in the result directory (the minimum
+    over repeated requests)."""
+    out = {}
+    for path in sorted(glob.glob(os.path.join(directory, "*.jsonl"))):
+        _, ok, _, _ = records(path, None)
+        for r in ok:
+            k = (r["op"], int(r.get("inplace", 0)), r["p"] // r["ppn"], r["ppn"], r["m"])
+            out[k] = min(out.get(k, np.inf), float(np.median(r["t_us"])))
+    return out
+
+
+def compare(a):
+    base, new = by_point(a.base), by_point(a.new)
+    noise = by_point(a.noise) if a.noise else None
+    out = ["# MPICH's own selection: new / base", "",
+           "T(new) / T(base) at the same request; below 1 is faster.", ""]
+    res = {}
+    for name, other in [("new / base", new)] + ([("noise: base2 / base", noise)] if noise else []):
+        out += [f"## {name}", "", "| collective | points | all | " + " | ".join(b[0] for b in BANDS)
+                + " | p10 / p90 | > 1.2x |", "|---|---|---|" + "---|" * len(BANDS) + "---|---|"]
+        for op in sorted({k[0] + (" inplace" if k[1] else "") for k in base}):
+            keys = [k for k in base if k[0] + (" inplace" if k[1] else "") == op and k in other]
+            if not keys:
+                continue
+            r = np.array([other[k] / base[k] for k in keys])
+            m = np.array([k[4] for k in keys])
+            bands = [gm(r[(m >= lo) & (m <= hi)]) for _, lo, hi in BANDS]
+            slow = [k for k, v in zip(keys, r) if v > 1.2]
+            res.setdefault(name, {})[op] = {"points": len(r), "geomean": gm(r), "bands": bands,
+                                            "p10": float(np.quantile(r, .1)), "p90": float(np.quantile(r, .9)),
+                                            "slow": [list(k[2:]) for k in slow]}
+            out.append(f"| {op} | {len(r)} | {gm(r):.3f} | " + " | ".join(
+                "" if b != b else f"{b:.3f}" for b in bands) + f" | {np.quantile(r, .1):.2f} / "
+                f"{np.quantile(r, .9):.2f} | {len(slow)} |")
+        out.append("")
+    print("\n".join(out))
+    if a.json:
+        with open(a.json, "w") as f:
+            json.dump(res, f, indent=1)
+    return 0
 
 
 def summary(r):
@@ -176,9 +233,9 @@ def validate(a):
     op = model.op
     bits = model.conditions
     leaf_alg = {model.leaf(x): x for x in model.algorithms}
-    truth, _ = times(a.truth)
-    default, env_d = times(a.default)
-    tuned, env_t = times(a.tuned)
+    truth, _ = times(a.truth, op)
+    default, env_d = times(a.default, op)
+    tuned, env_t = times(a.tuned, op)
     algs = sorted({k[0] for k in truth if k[0] is not None})
     trees = {"tree (offline)": json.load(open(a.tuning))}
     if a.tuning_node_aware:
@@ -282,11 +339,18 @@ def main():
     v.add_argument("--model", required=True, help="model file of one unit (collmodel/5 or /4)")
     v.add_argument("--tuning-node-aware")
     v.add_argument("--json")
+    c = sub.add_parser("compare")
+    c.add_argument("--base", required=True, help="result directory: MPICH's own selection, the built-in file")
+    c.add_argument("--new", required=True, help="result directory: the same requests with the new file loaded")
+    c.add_argument("--noise", help="a second run of --base: the noise floor")
+    c.add_argument("--json")
     a = ap.parse_args()
     if a.cmd == "switch":
         sys.exit(switch(a))
     if a.cmd == "validate":
         sys.exit(validate(a))
+    if a.cmd == "compare":
+        sys.exit(compare(a))
     ap.print_help()
     sys.exit(2)
 

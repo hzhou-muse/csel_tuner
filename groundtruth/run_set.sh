@@ -29,6 +29,10 @@ log=$outdir/launches.log
     echo "# env:"; env | grep -E '^(MPIR_|MPICH|FI_|PALS|MPISRV)' | sort | sed 's/^/#   /'
 } >> "$outdir/environment.txt"
 
+# device buffers (MEM=device, set by LAUNCH=gpu|device in config.sh): mpisrv --mem device
+memarg=""
+[ "${MEM:-host}" = device ] && memarg="--mem device"
+
 grep -v '^#' "$plans/launches.txt" | while read -r id nodes ppn alg idle plan; do
     [ -z "$id" ] && continue
     if [ -e "$outdir/$id.done" ]; then
@@ -49,7 +53,8 @@ grep -v '^#' "$plans/launches.txt" | while read -r id nodes ppn alg idle plan; d
     env MPIR_CVAR_BCAST_INTRA_ALGORITHM=$alg MPISRV_IDLE=$imode \
         ${ins:+MPISRV_IDLE_NS=$ins} ${ispin:+MPISRV_SPINUP_US=$ispin} \
         timeout $((deadline + LAUNCH_MARGIN / 2)) \
-        bash -c "$(declare -f launch); NODE_CORES='$NODE_CORES' launch $nodes $ppn $MPISRV $MAX_M \
+        bash -c "$(declare -f launch); NODE_CORES='$NODE_CORES' GPU_WRAPPER='${GPU_WRAPPER:-}' \
+            launch $nodes $ppn $MPISRV $MAX_M ${memarg} \
             --plan $plan --out $outdir/$id.jsonl --deadline $deadline --resume" \
         > "$outdir/$id.stdout" 2> "$outdir/$id.stderr" < /dev/null
     rc=$?
