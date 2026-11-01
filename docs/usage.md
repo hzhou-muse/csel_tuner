@@ -478,6 +478,8 @@ predicted regret and the algorithms used.
 | `--node-aware` | off | also split on `num_nodes` and `ppn` (MPICH with pmodels/mpich#8048) |
 | `--features` | `comm_size,msg_size,pof2` | the conditions splits may use, any of `comm_size`, `msg_size`, `pof2`, `num_nodes`, `ppn` (e.g. a default file without node conditions) |
 | `--max-depth` | none | at most this many nested condition levels per subtree, applied while the tree grows; the depth is the smallest up to this whose predicted p90 regret is at most `--depth-p90` (1.10) and within `--depth-slack` (0.02) of the deepest's, else `--max-depth`. The report lists each depth's geomean, p90, max and leaves |
+| `--guard-above P` | none | above comm size P (the largest sampled): each subtree gets a `comm_size(P)` branch with the measured tree, and above it a copy (branches only smaller communicators reach dropped) whose leaves of linear- or unclear-growth algorithms are replaced by the logarithmic-growth candidate with the least regret at the leaf's largest sampled comm size. The classes come from the models' growth anchors (`python3 -m csel_tuner.growth MODEL.json` prints them); an algorithm without anchors stays. A subtree it does not change stays as it is |
+| `--linear-above` | 0.7 | with `--guard-above`: the growth exponent that separates linear from logarithmic |
 | `--into FILE` | | write `--out` as FILE (MPICH's `src/mpi/coll/coll_selection.json`) with this run's subtrees in place of its own: the built collectives' intra subtrees replaced (old ones the run lacks removed), new ones after their collective's, every other entry byte for byte |
 | `--min-fallback-algs` | 3 | a set may call a subset's subtree that uses at least this many algorithms; a smaller one's algorithms are candidates directly |
 | `--stale-tol` | 1.05 | report a compositional algorithm's changed inner choice when the two are predicted more than this apart |
@@ -664,7 +666,7 @@ python3 tests/test_replay.py     # replay end to end; needs pandas and replay da
 python3 tests/test_resume.py     # a cut journal resumes to the same model; same needs
 python3 tests/test_restrict.py   # catalog, precheck, sets, dispatch; the builds with sets need replay data
 python3 tests/test_extend.py     # adding an algorithm and layouts to a model, resume; needs replay data
-python3 tests/test_growth_anchors.py  # growth anchors: point set, fit unchanged, restrictions, top-up, resume
+python3 tests/test_growth_anchors.py  # growth anchors (point set, fit unchanged, top-up, resume), growth classes, guard
 python3 tests/test_gpu.py        # memory-kind restrictions; colltree merging host and device models
 python3 tests/test_kinds.py      # restriction kinds, variants; inner trees in --inner-selection
 python3 tests/test_stages.py     # algorithm stages from inner calls; disabled algorithms, leaf names and parameters

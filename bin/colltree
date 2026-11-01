@@ -72,6 +72,7 @@ are stale, and the algorithm should be measured again with the output
 loaded (bin/collmodel --model ... --algs smp --inner-selection <output>).
 """
 import argparse
+import copy
 import json
 import os
 import sys
@@ -85,6 +86,7 @@ from csel_tuner.kinds import has_msg_size, is_device, measured, variants  # noqa
 from csel_tuner.model import ModelFile, parse_sel, tag_str  # noqa: E402
 from csel_tuner.restrict import GPU, GPU_COLL, role_layout, set_name, set_prefix  # noqa: E402
 from csel_tuner.single import is_pof2  # noqa: E402
+from csel_tuner.growth import classes as growth_classes, table as growth_table  # noqa: E402
 from csel_tuner.tree import (CSEL_NAME, cond_depth, fit_tree, json_choice, json_tree,  # noqa: E402
                              prune_to, regret_stats, select)
 
@@ -296,6 +298,7 @@ class Sets:
         self.trees = {} if trees is None else trees     # mask -> (tree, [options]); an option is an
         self.lines = []                                 # algorithm or ("call", mask)
         self.mine = []              # the masks this model built
+        self.points = {}            # mask -> the feature arrays its tree was fitted on
 
     def p(self, alg, lay):
         if (alg, lay) not in self.pred:
@@ -346,6 +349,7 @@ class Sets:
         opts = list(algs) + [("call", s) for s in calls]
         t, path = fit(X, np.column_stack(cols), self.feats, self.a)
         self.trees[mask] = (t, opts)
+        self.points[mask] = X
         self.mine.append(mask)
         used = sorted({opts[l.alg] if not isinstance(opts[l.alg], tuple) else
                        "call=" + set_name(m.op, opts[l.alg][1], m.mem) for l in t.leaves()})
@@ -359,6 +363,61 @@ class Sets:
             self.lines.append("  depth by p90 (chose %d): " % pick + "; ".join(
                 f"{d}: geomean {g:.4f} p90 {q:.3f} max {x:.2f} ({nl} leaves)" for d, g, q, x, nl in table))
         return True
+
+
+def above(node, P):
+    """The subtree a call with comm size above P reaches: a comm_size(t) split with t < P always
+    takes its right branch (in place)."""
+    while node.split is not None and node.split[0] == "p" and node.split[1] < P:
+        node.split, node.idx, node.alg, node.cost = node.split[3].split, node.split[3].idx, \
+            node.split[3].alg, node.split[3].cost
+    if node.split is not None:
+        above(node.split[2], P)
+        above(node.split[3], P)
+    return node
+
+
+def guarded(t, opts, X, cls, P):
+    """A copy of tree t for communicators above comm size P (the sampled range): the branches
+    only smaller communicators reach dropped (above), then a leaf whose algorithm is in
+    the linear or unclear growth class of its size band (the band of the median size of its
+    points) is replaced by the logarithmic-class candidate with the least regret at the leaf's
+    largest sampled comm size. cls: growth.classes() of the model; an algorithm without anchors
+    and a leaf that calls another subtree stay. Returns (copy, [report lines])."""
+    from csel_tuner.growth import LAT_MAX
+    g = above(copy.deepcopy(t), P)
+    notes = []
+    for leaf in g.leaves():
+        a = opts[leaf.alg]
+        if isinstance(a, tuple):
+            continue
+        band = "lat" if np.median(X["m"][leaf.idx]) <= LAT_MAX else "bw"
+        c = cls.get(a, {}).get(band, (None,))[0]
+        if c is None or c == "logarithmic":
+            continue
+        cand = [j for j, o in enumerate(opts) if not isinstance(o, tuple)
+                and cls.get(o, {}).get(band, (None,))[0] == "logarithmic"]
+        ps = X["p"][leaf.idx]
+        top = leaf.idx[ps == ps.max()]
+        if not cand:
+            notes.append(f"{a} ({c}, {band} band): no logarithmic candidate, kept")
+            continue
+        j = min(cand, key=lambda j: float(t.R[top, j].sum()))
+        notes.append(f"{a} -> {opts[j]} ({c} in the {band} band; scored at p={int(ps.max())}, sizes "
+                     f"{int(X['m'][leaf.idx].min())}..{int(X['m'][leaf.idx].max())})")
+        leaf.alg = j
+
+    def merge(node):
+        """Collapse splits whose two sides now pick the same algorithm."""
+        if node.split is None:
+            return
+        merge(node.split[2])
+        merge(node.split[3])
+        left, right = node.split[2], node.split[3]
+        if left.split is None and right.split is None and left.alg == right.alg:
+            node.split, node.alg = None, left.alg
+    merge(g)
+    return g, notes
 
 
 def variant_base(model):
@@ -550,6 +609,12 @@ def main(argv=None):
     ap.add_argument("--buffer-swap", action="store_true", help="host model only: the file measures buffer_swap "
                     "(device buffers swap to host, then the host tree): <op>-intra-auto is "
                     "{gpu: buffer_swap, any: <host dispatch>}")
+    ap.add_argument("--guard-above", type=int, metavar="P", help="above comm size P (the largest sampled): "
+                    "each subtree's linear- or unclear-growth leaves replaced by logarithmic-growth algorithms, "
+                    "the classes from the models' growth anchors (csel_tuner/growth.py); a subtree it does not "
+                    "change stays as it is")
+    ap.add_argument("--linear-above", type=float, default=0.7, help="with --guard-above: the growth exponent "
+                    "that separates linear from logarithmic (growth.py)")
     ap.add_argument("--into", metavar="FILE", help="write --out as FILE (MPICH's src/mpi/coll/coll_selection.json) "
                     "with this run's subtrees in place of its own: the built collectives' intra subtrees "
                     "replaced, new subtrees after their collective's, every other entry kept byte for byte")
@@ -632,6 +697,7 @@ def main(argv=None):
         return dict(rec, **override.get(alg, {}))
 
     out, built, report = {}, {}, []     # built: {(coll, slot): [(path, model, Sets)]}
+    growth_cls = {}                     # id(model) -> growth.classes(model)
     for op, by_mem in colls.items():
         disp = {}
         for mem in ("host", "device"):
@@ -661,9 +727,24 @@ def main(argv=None):
                     return "call=" + set_name(op, o[1], mem)
                 return ("algorithm=" + m.leaf(o), leaf_params(m, o))
             owner = {mask: m for path, m, S in built[(op, mem)] for mask in S.mine}
+            owner_sets = {mask: S for path, m, S in built[(op, mem)] for mask in S.mine}
             for mask, (t, opts) in sorted(trees.items()):
-                out[f"name={set_name(op, mask, mem)}"] = json_tree(t, opts, lambda o, m=owner[mask]: sub(o, m),
-                                                                   names)
+                key = f"name={set_name(op, mask, mem)}"
+                tree_json = json_tree(t, opts, lambda o, m=owner[mask]: sub(o, m), names)
+                if a.guard_above is not None:
+                    m = owner[mask]
+                    if id(m) not in growth_cls:
+                        growth_cls[id(m)] = growth_classes(m, a.linear_above)
+                        report += growth_table(m, growth_cls[id(m)]) if growth_cls[id(m)] else \
+                            [f"{tag_str(m.tags)}: no growth anchors; --guard-above leaves its subtrees as they are"]
+                    g, notes = guarded(t, opts, owner_sets[mask].points[mask], growth_cls[id(m)], a.guard_above)
+                    if notes:
+                        report += [f"guard {set_name(op, mask, mem)} above comm_size {a.guard_above}:"] + \
+                            ["  " + n for n in notes]
+                    g_json = json_tree(g, opts, lambda o, m=m: sub(o, m), names)
+                    if g_json != tree_json:
+                        tree_json = {"comm_size(%d)" % a.guard_above: tree_json, "any": g_json}
+                out[key] = tree_json
             present = sorted(trees)
             if a.nested_dispatch:
                 disp[mem] = dispatch(op, by_mem[mem][0][1].conditions, present, mem)

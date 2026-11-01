@@ -875,7 +875,11 @@ of forced measurements predicts.
   are units of their own, but no condition tells them apart at run time:
   colltree takes one of them per collective (`--unit`).
 - **Extrapolation beyond the allocation** (N > N_max) is not modeled: the
-  tree's last branch covers it. Growth anchors (§12.1) record the data for
-  growth fits; no tool uses them yet.
+  tree's last branch covers it. Growth anchors (§12.1) record the data
+  for growth fits; `csel_tuner/growth.py` turns them into coarse classes
+  (the exponent of t in p per size band, linear or logarithmic), and
+  `colltree --guard-above` uses the classes to replace linear-growth leaves
+  above the sampled comm size. Finer growth (k log_k p, effects that show
+  only at large p) needs cost models per algorithm.
 - The v1 p90 error estimate is unreliable (few random checks); v2's regret
   estimate is reliable on the replay.

@@ -132,6 +132,48 @@ def test_resume():
         assert r.returncode != 0 and "growth" in r.stderr
 
 
+def test_growth_classes_synthetic():
+    """growth.fit_exponent and classify on exact log p and p - 1 growth, with a single-node
+    offset and per-size intercepts."""
+    import numpy as np
+    from csel_tuner.growth import classify, fit_exponent
+    lays = [(1, 2), (1, 8), (1, 32)] + [(2, q) for q in (1, 2, 4, 8, 16, 32)]
+    for f, want in ((lambda p: np.log2(p) + 1, "logarithmic"), (lambda p: p - 1 + 0.5, "linear")):
+        rows = [(n, q, m, f(n * q) * m * (0.5 if n == 1 else 1.0)) for n, q in lays for m in (1024, 4096)]
+        fit = fit_exponent(rows)
+        assert classify(fit) == want, (want, fit)
+    assert fit_exponent([(2, 1, 1024, 1.0), (2, 2, 1024, 2.0)]) is None     # too few layouts
+
+
+def test_guard_on_replay():
+    """colltree --guard-above: the classes from the anchors (ring linear in the latency band,
+    binomial logarithmic), and with a lower threshold a guarded branch above P whose choice
+    differs from the measured one."""
+    if not have_data():
+        print("skipped: no replay data")
+        return
+    from csel_tuner.growth import classes
+    from csel_tuner.model import Model
+    from csel_tuner.tree import json_choice
+    with tempfile.TemporaryDirectory() as d:
+        m = os.path.join(d, "m.json")
+        run("--algs", "binomial,scatter_ring_allgather,circ_graph", "--budget-node-h", "0.3", "--growth-anchors",
+            "--out", m)
+        cls = classes(Model.load(m))
+        assert cls["scatter_ring_allgather"]["lat"][0] == "linear" and cls["binomial"]["lat"][0] == "logarithmic"
+        t = os.path.join(d, "t.json")
+        r = subprocess.run([sys.executable, os.path.join(REPO, "bin", "colltree"), m, "--out", t, "--max-depth", "4",
+                            "--guard-above", "768", "--linear-above", "0.45"], check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        tree = {k.split("=", 1)[1]: v for k, v in json.load(open(t)).items()}
+        sub = tree["bcast-intra-0"]
+        assert list(sub)[0] == "comm_size(768)", list(sub)
+        assert "guard bcast-intra-0 above comm_size 768" in r.stdout + r.stderr
+        x = lambda p, m: {"p": p, "m": m, "N": p, "ppn": 1, "pof2": 1.0, "cond": {}}
+        assert json_choice(sub, x(4096, 64), tree) != json_choice(sub["comm_size(768)"], x(4096, 64), tree) or \
+            json_choice(sub, x(4096, 1 << 20), tree) != json_choice(sub["comm_size(768)"], x(4096, 1 << 20), tree)
+
+
 if __name__ == "__main__":
     for name, f in list(globals().items()):
         if name.startswith("test_"):
