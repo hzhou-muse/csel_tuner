@@ -144,7 +144,7 @@ sys.path.insert(0, REPO)
 import numpy as np  # noqa: E402
 
 from csel_tuner.algos import GENERAL, Catalog  # noqa: E402
-from csel_tuner.kinds import RECIPES, classify, is_device, is_v  # noqa: E402
+from csel_tuner.kinds import RECIPES, classify, is_device, is_rooted, is_v  # noqa: E402
 from csel_tuner.layouts import axis_values, size_grid  # noqa: E402
 from csel_tuner.stages import Stages  # noqa: E402
 from csel_tuner.model import FORMAT, FORMAT_V4, Model, ModelFile, default_tags, file_hash, tag_key, tag_str  # noqa: E402,E501
@@ -353,6 +353,10 @@ def live(a, shared=None):
     if a.inplace and not coll.get("inplace_ok"):
         srv.close()
         sys.exit(f"--inplace: {a.op} takes no MPI_IN_PLACE")
+    if a.inplace and is_rooted(a.op):
+        srv.close()
+        sys.exit(f"--inplace: {a.op} is rooted (MPI_IN_PLACE at the root only, not the same on every rank), so "
+                 "it has no in-place variant; its one model serves both cases")
     # this unit's op, swept once now and again after a server restart
     srv.warmup_ops = (a.op,)
     srv.warmup(a.op)
@@ -1375,6 +1379,9 @@ def parse_colls(text, counts="uniform"):
             k, eq, v = kv.partition("=")
             if k == "inplace" and v in ("0", "1"):
                 ip = v == "1"
+                if ip and is_rooted(coll):
+                    raise ValueError(f"{item}: {coll} is rooted (MPI_IN_PLACE at the root only): no in-place "
+                                     "variant")
                 if ip and coll not in inplace_colls:
                     raise ValueError(f"{item}: {coll} takes no MPI_IN_PLACE")
             elif k == "counts" and v in ("uniform", "linear", "onebig"):

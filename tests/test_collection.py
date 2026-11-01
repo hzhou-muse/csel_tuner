@@ -201,13 +201,6 @@ def test_size_condition():
         assert "avg_msg_size(" in json.dumps(json.load(open(t))["name=gather-intra-0"])
 
 
-if __name__ == "__main__":
-    test_collection()
-    test_collection_errors()
-    test_variants()
-    test_reduction_variants()
-    test_size_condition()
-    print("ok")
 
 
 def test_splice_into_main_file():
@@ -239,3 +232,29 @@ def test_splice_into_main_file():
     assert new.startswith('{\n    "name=main": "call=auto",\n    "name=bcast-intra-auto": "dispatch=')
     assert new.endswith(text[text.index('    "name=bcast-inter-auto"'):])
     assert ct.splice_into(new, ours, ["bcast"]) == new
+
+
+def test_rooted_inplace_refused():
+    """colltree refuses an in-place unit of a rooted collective (a model measured before they lost
+    their in-place variant): MPI_IN_PLACE at the root only would make the dispatch differ by rank."""
+    import subprocess
+    m = Model("gather", [1, 2], [(2, 1)], {"N": [1, 2], "ppn": [1, 1], "m": [1, 2]}, ["inplace"],
+              tags={"coll": "gather", "variant": {"inplace": 1}, "datatype": "byte", "launch": "host"})
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "g.json")
+        ModelFile([m]).save(path)
+        r = subprocess.run([sys.executable, os.path.join(REPO, "bin", "colltree"), path, "--out",
+                            os.path.join(d, "t.json")], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True)
+        assert r.returncode != 0 and "rooted collective" in r.stderr, r.stderr
+
+
+if __name__ == "__main__":
+    test_collection()
+    test_collection_errors()
+    test_variants()
+    test_reduction_variants()
+    test_size_condition()
+    test_splice_into_main_file()
+    test_rooted_inplace_refused()
+    print("ok")

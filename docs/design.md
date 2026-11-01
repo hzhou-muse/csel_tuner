@@ -602,8 +602,15 @@ how a tuner treats them; that is csel_tuner's policy, in
 `csel_tuner/kinds.py`. An *input* condition is one a request can set (a
 recipe: `inplace` by `MPI_IN_PLACE`, `builtin_op` and `commutative` by
 `MPI_SUM`); each assignment of a collective's input conditions is a variant,
-a model of its own, and an input condition applies wherever MPI allows it,
-whether or not an algorithm restricts on it. Assignments that contradict an
+a model of its own, and an input condition applies wherever MPI allows it
+and every rank of a call sees the same value, whether or not an algorithm
+restricts on it. The rooted collectives (gather, gatherv, scatter, scatterv,
+reduce and their nonblocking forms) have no in-place variant: MPI_IN_PLACE
+is given at the root only, so a dispatch on it would send the root and the
+other ranks into different subtrees, possibly different algorithms. Their
+one tree serves both cases (every algorithm handles MPI_IN_PLACE at the
+root, and no catalog restriction separates them); colltree refuses an
+in-place unit of a rooted collective measured before this rule. Assignments that contradict an
 implication (`builtin_op` without `commutative`) are skipped; those without
 a recipe (user ops) are not measured. Their calls reach subtree 0, whose
 algorithms are the unrestricted ones: restrictions are positive, so these

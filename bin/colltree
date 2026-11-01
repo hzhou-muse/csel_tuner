@@ -82,7 +82,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 import numpy as np  # noqa: E402
 
-from csel_tuner.kinds import has_msg_size, is_device, measured, variants  # noqa: E402
+from csel_tuner.kinds import has_msg_size, is_device, is_rooted, measured, variants  # noqa: E402
 from csel_tuner.model import ModelFile, parse_sel, tag_str  # noqa: E402
 from csel_tuner.restrict import GPU, GPU_COLL, role_layout, set_name, set_prefix  # noqa: E402
 from csel_tuner.single import is_pof2  # noqa: E402
@@ -649,6 +649,10 @@ def main(argv=None):
     # per collective and memory kind (host, or device: launch kind gpu or device), its variant units
     colls = {}
     for path, m in units:
+        if is_rooted(m.op) and (m.tags.get("variant") or {}).get("inplace"):
+            sys.exit(f"{path}: {tag_str(m.tags)}: an in-place unit of a rooted collective (MPI_IN_PLACE at the "
+                     "root only, so a dispatch on it would differ between ranks); leave it out with --unit "
+                     f"coll={m.op},inplace=0, or remeasure without it")
         slot = "device" if is_device(m.mem) else "host"
         colls.setdefault(m.op, {}).setdefault(slot, []).append((path, m))
     missing = [x for x in want if x not in colls]

@@ -33,13 +33,18 @@ def test_variants():
     assert variants("bcast", BITS) == [{}] and variants("barrier", BITS) == [{}]
     assert variants("alltoall", BITS) == [{"inplace": 0}, {"inplace": 1}]
     assert variants("ialltoall", BITS) == variants("alltoall", BITS)
-    red = variants("reduce", BITS)
+    red = variants("allreduce", BITS)
     # builtin_op implies commutative: 3 op cases, with and without in-place
     assert len(red) == 6 and {"inplace": 0, "commutative": 0, "builtin_op": 1} not in red
     meas = [v for v in red if measured(v)]
     assert meas == [{"inplace": 0, "commutative": 1, "builtin_op": 1},
                     {"inplace": 1, "commutative": 1, "builtin_op": 1}]
     assert request(meas[0]) == {"op": "sum"} and request(meas[1]) == {"inplace": 1, "op": "sum"}
+    # rooted collectives: MPI_IN_PLACE at the root only, so no in-place variant
+    for c in ("gather", "gatherv", "scatter", "scatterv", "igather", "iscatterv"):
+        assert variants(c, BITS) == [{}], c
+    assert [v for v in variants("reduce", BITS) if measured(v)] == [{"commutative": 1, "builtin_op": 1}]
+    assert all("inplace" not in v for v in variants("ireduce", BITS))
     # only the conditions in the catalog count
     assert variants("reduce", ["commutative"]) == [{"commutative": 0}, {"commutative": 1}]
 

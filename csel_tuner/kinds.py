@@ -12,9 +12,10 @@ treats a condition is its own policy (docs/design.md, section 11):
 - input: a property of the call's arguments that a request can set (RECIPES).
   Each assignment of a collective's input conditions is a variant, a model
   of its own. An input condition applies to a collective where MPI allows it
-  (in-place where the collective takes MPI_IN_PLACE, the op conditions for
-  the reductions), whether or not an algorithm restricts on it, because it
-  changes the algorithms' curves.
+  and every rank of a call sees the same value (in-place where all ranks
+  pass MPI_IN_PLACE, not for the rooted collectives, where only the root
+  does; the op conditions for the reductions), whether or not an algorithm
+  restricts on it, because it changes the algorithms' curves.
 - launch: decided by how the ranks are started (LAUNCH): `gpu` and
   `gpu_coll` on device buffers. The launch kind is a tag of its own.
 - set: everything else, the layout conditions (pof2, hierarchical, ...) and
@@ -30,8 +31,19 @@ warning: it may be a new input condition that needs a recipe.
 REDUCTIONS = ["reduce", "allreduce", "reduce_scatter", "reduce_scatter_block", "scan", "exscan"]
 # the v-operations: their blocks follow mpisrv's counts= pattern (a tag of their models)
 VCOUNTS = ["allgatherv", "alltoallv", "gatherv", "scatterv", "reduce_scatter"]
-INPLACE = ["gather", "gatherv", "scatter", "scatterv", "allgather", "allgatherv", "alltoall", "alltoallv",
-           "alltoallw"] + REDUCTIONS
+# rooted collectives: MPI_IN_PLACE is given at the root only, so "in place" differs between the ranks
+# of one call and cannot be a selection condition (restriction rule 2 in coll_algorithms.txt: the same
+# on every rank); they get no in-place variant, and their one tree serves both cases (every algorithm
+# handles MPI_IN_PLACE at the root; no catalog restriction separates the two)
+ROOTED = ["gather", "gatherv", "scatter", "scatterv", "reduce"]
+# the collectives whose in-place variant is a variant of its own: every rank passes MPI_IN_PLACE or none
+INPLACE = ["allgather", "allgatherv", "alltoall", "alltoallv", "alltoallw"] + [c for c in REDUCTIONS
+                                                                               if c not in ROOTED]
+
+
+def is_rooted(coll):
+    """gather, gatherv, scatter, scatterv, reduce and their i- forms."""
+    return coll in ROOTED or (coll.startswith("i") and coll[1:] in ROOTED)
 
 
 def _with_nb(colls):
