@@ -50,16 +50,31 @@ input conditions, the one with the fewest builds set 0 from its
 unrestricted algorithms.
 
 Several models, one per memory kind of the buffers (a model's "mem": host,
-or device from bin/collmodel --mem device), go into one file with
-subtrees of their own: the host model's as above, the device model's as
-"name=<op>-intra-gpu-<S in hex>" with its own dispatch,
-"dispatch=<op>-intra-gpu(<bits>)", whose fallback is
-"<op>-intra-gpu-0", never a host subtree. In the device model the gpu
-restriction always holds, so it is left out of S and of the algorithms'
-restrictions (an algorithm restricted to gpu alone, e.g. buffer_swap, is
-unrestricted there). "name=<op>-intra-auto" then starts with the gpu
-condition: {"gpu": <device dispatch>, "any": <host dispatch>}. A host model
-is required; each memory kind at most once.
+or gpu from bin/collmodel --launch gpu), go into one file. The two device
+conditions shape the file differently, because all ranks of a call must reach
+the same algorithm:
+
+- gpu_coll is the same on all ranks, so it selects subtrees of their own: the
+  gpu model's as "name=<op>-intra-gpu-<S in hex>" with its own dispatch,
+  "dispatch=<op>-intra-gpu(<bits>)", whose fallback is "<op>-intra-gpu-0", never
+  a host subtree. Both conditions hold in the whole model, so they are left out
+  of S and of the algorithms' restrictions (an algorithm restricted to gpu alone,
+  e.g. buffer_swap, is unrestricted there). "name=<op>-intra-auto" is
+  {"gpu_coll": <gpu dispatch>, "any": <host dispatch>}.
+- gpu_local can differ between ranks, so MPICH allows it only in the tree main
+  reaches, to choose between call=auto and buffer_swap, which clears the flags and
+  continues in auto. A device call without gpu_coll therefore runs the host tree's
+  algorithm, directly or after a swap. Where the gpu model predicts buffer_swap
+  faster than the host tree's choice at some point, the file has
+  "name=<op>-intra-main": {"gpu_coll": "call=auto", "gpu_local": <a tree whose
+  leaves are buffer_swap or call=auto>, "any": "call=auto"}, and "name=main" sends
+  the collective there. gpu_coll comes first, because it implies gpu_local and
+  has a tree of its own. Above --guard-above the choice is call=auto, and a point
+  whose algorithm has no curve in the gpu model is reported and not counted.
+  Only a user's call reaches main; the inner calls of a compositional algorithm
+  select from auto, so they don't swap.
+
+A host model is required; each memory kind at most once.
 
 A compositional algorithm (e.g. smp) was measured with a tuning file
 selecting its inner calls. Where the output chooses it, colltree compares
@@ -82,13 +97,15 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 import numpy as np  # noqa: E402
 
-from csel_tuner.kinds import has_msg_size, is_device, is_rooted, measured, variants  # noqa: E402
+from csel_tuner.kinds import canon_condition, has_msg_size, is_device, is_rooted, measured, variants  # noqa: E402
 from csel_tuner.model import ModelFile, parse_sel, tag_str  # noqa: E402
-from csel_tuner.restrict import GPU, GPU_COLL, role_layout, set_name, set_prefix  # noqa: E402
+from csel_tuner.restrict import GPU_COLL, GPU_LOCAL, role_layout, set_name, set_prefix  # noqa: E402
 from csel_tuner.single import is_pof2  # noqa: E402
 from csel_tuner.growth import classes as growth_classes, table as growth_table  # noqa: E402
 from csel_tuner.tree import (CSEL_NAME, cond_depth, fit_tree, json_choice, json_tree,  # noqa: E402
                              prune_to, regret_stats, select)
+
+SWAP, SWAP_LEAF = "buffer_swap", "MPIR_Coll_buffer_swap"
 
 # Leaf parameters (coll_algorithms.txt extra_params) come from the model, which
 # records the CVAR values the server ran with (collmodel alg_info). This table
@@ -489,18 +506,19 @@ def x_of(m, lay, size):
     n, q = lay
     mk = m.masks.get(lay, 0)
     cond = {b: bool(mk >> k & 1) for k, b in enumerate(m.conditions)}
-    cond[GPU] = is_device(m.mem)    # left out of a device model's masks (drop_bit)
+    cond[GPU_LOCAL] = is_device(m.mem)      # left out of a device model's masks (drop_bit)
+    cond["gpu"] = cond[GPU_LOCAL]           # its old name, in inner selection files of older runs
     if m.mem == "gpu":
         cond[GPU_COLL] = True
     return {"p": n * q, "m": size, "N": n, "ppn": q, "pof2": float(is_pof2(n * q)), "cond": cond}
 
 
 def parse_inner(text):
-    """"bcast-intra@node_comm", "bcast-intra@comm[gpu=0]" -> (coll, comm, {cond: value})."""
+    """"bcast-intra@node_comm", "bcast-intra@comm[gpu_local=0]" -> (coll, comm, {cond: value})."""
     sec, _, rest = text.partition("@")
     comm, _, cond = rest.partition("[")
     conds = dict(kv.split("=", 1) for kv in cond.rstrip("]").split(",") if kv)
-    return sec.rsplit("-", 1)[0], comm, {k: int(v) for k, v in conds.items()}
+    return sec.rsplit("-", 1)[0], comm, {canon_condition(k): int(v) for k, v in conds.items()}
 
 
 def pick_variant(units, caller):
@@ -522,7 +540,10 @@ def stale(model, S, out, built, tol):
     makes that the output selects differently from the file the algorithm was
     measured under, and where the inner collective's model predicts the two
     choices more than `tol` apart: [(alg, inner, inner layout, [sizes], new, old, ratio)].
-    built: {(coll, "host"|"device"): [(model, Sets)]} of this output."""
+    built: {(coll, "host"|"device"): [(model, Sets)]} of this output. An inner call with [gpu_local=0]
+    has host buffers. One with [gpu_coll=0] has this unit's buffers but selects without gpu_coll,
+    so it reaches the host tree's choices, and is timed by the model of those buffers. Inner calls
+    select from auto: only a user's call can swap, in main."""
     m = model
     trees = {k[len("name="):]: v for k, v in out.items()}
     slot = "device" if is_device(m.mem) else "host"
@@ -543,7 +564,8 @@ def stale(model, S, out, built, tol):
         old = {k[len("name="):]: v for k, v in json.loads(m.inner_files[h]).items()}
         for inner in m.algorithms[c]["inner"]:
             coll, comm, cond = parse_inner(inner)
-            target = pick_variant(built.get((coll, "host" if cond.get(GPU) == 0 else slot)), m)
+            local = cond.get(GPU_COLL) == 0 and slot == "device"
+            target = pick_variant(built.get((coll, "host" if cond.get(GPU_LOCAL) == 0 else slot)), m)
             if target is None:
                 notes.append(f"{c}: inner {inner}: {coll}'s tree is not in this output; not checked")
                 continue
@@ -565,6 +587,8 @@ def stale(model, S, out, built, tol):
                     if size not in idx:
                         continue
                     x = x_of(mi, r, size)
+                    if local:
+                        x["cond"][GPU_COLL] = False
                     new = by_leaf.get(json_choice(trees[auto], x, trees, mi.conditions))
                     was = by_leaf.get(json_choice(old[auto], x, old, mi.conditions)) if auto in old else None
                     if new == was or new is None or was is None or was not in mi.curves:
@@ -578,6 +602,58 @@ def stale(model, S, out, built, tol):
                     found.append((c, inner, r, [size for size, _ in v], new, was,
                                   float(np.exp(np.mean(np.log(rs))))))
     return found, notes
+
+
+def swap_tree(op, host, gpu_units, feats, a):
+    """The choice of device buffers without gpu_coll, which run the host tree's algorithm directly
+    or swap first: (fitted tree over [direct, buffer_swap], [report lines]), the tree None if
+    nothing swaps. Fitted on the gpu models' curves. host: [(model, Sets)]."""
+    X = {k: [] for k in ("N", "ppn", "p", "m", "pof2")}
+    direct, swap, missing, skipped = [], [], {}, set()
+    for path, gm in gpu_units:
+        hm, S = pick_variant(host, gm)
+        for lay in gm.layouts:
+            if lay not in hm.masks:
+                skipped.add(lay)
+                continue
+            have = gm.set_algs(gm.masks.get(lay, 0))
+            if SWAP not in have:
+                continue
+            times, swap_t = {}, gm.predict(SWAP, *lay)
+            for i, size in enumerate(gm.sizes):
+                x = x_of(hm, lay, size)
+                alg = S.choose(S.effective(hm.masks[lay]), x)
+                if alg not in have:
+                    missing.setdefault(alg, set()).add(lay)
+                    continue
+                if alg not in times:
+                    times[alg] = gm.predict(alg, *lay)
+                for k in X:
+                    X[k].append(x[k])
+                direct.append(times[alg][i])
+                swap.append(swap_t[i])
+    lines = []
+    for alg, lays in sorted(missing.items()):
+        lines.append(f"{op}: {alg} has no curve on device buffers: not in the swap choice "
+                     f"({len(lays)} layouts); measure it with --launch gpu")
+    if skipped:
+        lines.append(f"{op}: {len(skipped)} layouts of the gpu model are not in the host model: no swap choice")
+    if not direct:
+        return None, lines
+    t, _ = fit({k: np.array(v, float) for k, v in X.items()}, np.column_stack([direct, swap]), feats, a)
+    n = sum(len(l.idx) for l in t.leaves() if l.alg == 1)
+    lines.append(f"{op}: device buffers without gpu_coll swap at {n} of {len(direct)} points, "
+                 f"{len(t.leaves())} leaves")
+    return (t if n else None), lines
+
+
+def main_tree(keys):
+    """name=main from the <op>-intra-main subtrees among keys, or None if there are none."""
+    ops = sorted(k[len("name="):-len("-intra-main")] for k in keys
+                 if k.startswith("name=") and k.endswith("-intra-main"))
+    if not ops:
+        return None
+    return dict({f"collective={op}-intra": f"call={op}-intra-main" for op in ops}, any="call=auto")
 
 
 def main(argv=None):
@@ -616,7 +692,7 @@ def main(argv=None):
                     "conditions (for an MPICH without dispatch=, pmodels/mpich#8048)")
     ap.add_argument("--buffer-swap", action="store_true", help="host model only: the file measures buffer_swap "
                     "(device buffers swap to host, then the host tree): <op>-intra-auto is "
-                    "{gpu: buffer_swap, any: <host dispatch>}")
+                    "everywhere; <op>-intra-main is {gpu_local: buffer_swap, any: call=auto}")
     ap.add_argument("--guard-above", type=int, metavar="P", help="above comm size P (the largest sampled): "
                     "each subtree's linear- or unclear-growth leaves replaced by logarithmic-growth algorithms, "
                     "the classes from the models' growth anchors (csel_tuner/growth.py); a subtree it does not "
@@ -653,6 +729,9 @@ def main(argv=None):
             sys.exit(f"{path}: {tag_str(m.tags)}: an in-place unit of a rooted collective (MPI_IN_PLACE at the "
                      "root only, so a dispatch on it would differ between ranks); leave it out with --unit "
                      f"coll={m.op},inplace=0, or remeasure without it")
+        if m.mem == "device":
+            sys.exit(f"{path}: {tag_str(m.tags)}: launch kind device has no gpu_coll subtree to build; measure "
+                     "device buffers with --launch gpu")
         slot = "device" if is_device(m.mem) else "host"
         colls.setdefault(m.op, {}).setdefault(slot, []).append((path, m))
     missing = [x for x in want if x not in colls]
@@ -663,13 +742,14 @@ def main(argv=None):
         if "host" not in by_mem:
             sys.exit(f"{op}: no unit of host buffers (the run-time fallback)")
         for path, m in by_mem.get("device", []):
-            if GPU not in m.conditions:
-                sys.exit(f"{path}: a model of device buffers, but its catalog has no {GPU} restriction "
+            if GPU_LOCAL not in m.conditions:
+                sys.exit(f"{path}: a model of device buffers, but its catalog has no {GPU_LOCAL} restriction "
                          "(MPICH cannot tell device buffers apart)")
-            drop_bit(m, 1 << m.conditions.index(GPU))
-            # launch kind gpu: gpu_coll holds in the whole unit too (MPIR_CVAR_ENABLE_GPU_COLL=1)
-            if m.mem == "gpu" and GPU_COLL in m.conditions:
-                drop_bit(m, 1 << m.conditions.index(GPU_COLL))
+            if GPU_COLL not in m.conditions:
+                sys.exit(f"{path}: a model of device buffers, but its catalog has no {GPU_COLL} restriction")
+            drop_bit(m, 1 << m.conditions.index(GPU_LOCAL))
+            # gpu_coll holds in the whole unit too (MPIR_CVAR_ENABLE_GPU_COLL=1)
+            drop_bit(m, 1 << m.conditions.index(GPU_COLL))
         for slot, ums in by_mem.items():
             seen = {}
             for path, m in ums:
@@ -733,6 +813,16 @@ def main(argv=None):
             if 0 not in trees:
                 sys.exit(f"{op}: no unrestricted algorithm with a model")
             report += variant_report(op, mem, [m for path, m in by_mem[mem]], trees)
+            if mem == "host" and "device" in by_mem:
+                host_units = [(m, S) for path, m, S in built[(op, mem)]]
+                swap_t, lines = swap_tree(op, host_units, by_mem["device"], fs, a)
+                report += lines
+                if swap_t is not None:
+                    branch = json_tree(swap_t, ["direct", "swap"], lambda o: "call=auto" if o == "direct"
+                                       else ("algorithm=" + SWAP_LEAF, {}), names)
+                    if a.guard_above is not None:
+                        branch = {"comm_size(%d)" % a.guard_above: branch, "any": "call=auto"}
+                    out[f"name={op}-intra-main"] = {GPU_COLL: "call=auto", GPU_LOCAL: branch, "any": "call=auto"}
 
             def sub(o, m):
                 if isinstance(o, tuple):
@@ -767,24 +857,30 @@ def main(argv=None):
                     bits |= s
                 disp[mem] = "dispatch=%s(0x%x)" % (set_prefix(op, mem), bits) if bits else \
                     "call=" + set_name(op, 0, mem)
-        out[f"name={op}-intra-auto"] = {GPU: disp["device"], "any": disp["host"]} if "device" in disp else \
+        out[f"name={op}-intra-auto"] = {GPU_COLL: disp["device"], "any": disp["host"]} if "device" in disp else \
             disp["host"]
         if a.buffer_swap:
-            out[f"name={op}-intra-auto"] = {GPU: {"algorithm=MPIR_Coll_buffer_swap": {}}, "any": disp["host"]}
+            out[f"name={op}-intra-main"] = {GPU_LOCAL: {"algorithm=" + SWAP_LEAF: {}}, "any": "call=auto"}
     written = dict(out)
     mine = tuple(f"name={op}-intra-" for op in colls)
     for path in a.with_files:
         with open(path) as f:
             other = json.load(f)
         for k, v in other.items():
-            if not k.startswith(mine):
+            if not k.startswith(mine) and k != "name=main":
                 written[k] = v
+    entry = main_tree(written)
+    if entry is not None:
+        written["name=main"] = entry
     depth = json_depth(written)
     if depth > 64:
         sys.exit(f"tree nests {depth} levels; MPICH's parser allows 64 (try a larger --tol)")
     if a.into:
         with open(a.into) as f:
-            text = splice_into(f.read(), out, colls)
+            text = f.read()
+        keep = [k for k in json.loads(text) if not k.startswith(mine)]
+        entry = main_tree(list(out) + keep)
+        text = splice_into(text, dict(out, **{"name=main": entry}) if entry else out, colls)
         with open(a.out, "w") as f:
             f.write(text)
     else:

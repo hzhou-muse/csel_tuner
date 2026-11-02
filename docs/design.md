@@ -513,7 +513,7 @@ subset of S, so whatever runs in a set also runs in any larger one. A
 layout's mask comes from the precheck: the bits of every algorithm that
 ran; an algorithm that failed with all but one of its bits known true
 makes that one false; a bit no algorithm decides is taken as false and
-reported. The conditions the launch kind decides (`gpu`, `gpu_coll`) are
+reported. The conditions the launch kind decides (`gpu_local`, `gpu_coll`) are
 known before the precheck, and colltree sets a unit's input conditions
 (`inplace`, ...) in all its masks from its variant (§12.3). The model file
 records the bit names. The subtree `<op>-intra-<mask>` serves calls whose
@@ -549,7 +549,7 @@ bcast-intra@node_comm`. The general algorithms are compositional too, their
 calls written relative to the caller (pmodels/mpich#8073: `$coll`, `comm`,
 `[k=v]` setting a condition on the inner call; an older catalog gets the
 same calls): `nb` runs `i<op>-intra@comm`, the nonblocking collective's
-tree, and `buffer_swap` runs `<op>-intra@comm[gpu=0]`, the collective's own
+tree, and `buffer_swap` runs `<op>-intra@comm[gpu_local=0]`, the collective's own
 tree on host buffers. Its time depends on the trees those calls select
 from, so it is measured with a file of them loaded (`--inner-selection`,
 via `MPIR_CVAR_COLL_SELECTION_JSON_FILE`), and collmodel refuses one whose
@@ -562,7 +562,7 @@ calls select from are complete; a tree, (collective, launch kind), is
 complete at the largest stage of its algorithms, leaving out those whose
 inner calls lead back into the chain (smp's bcast tree has no smp: smp
 needs `hierarchical`, which neither inner communicator has) and those the
-launch kind rules out (`buffer_swap`, restricted to `gpu`, is in no host
+launch kind rules out (`buffer_swap`, restricted to `gpu_local`, is in no host
 tree). With MPICH's catalog: host bcast `nb` 2 (ibcast's tree is plain),
 `smp` 3 (its bcast tree has `nb`); on a gpu launch `buffer_swap` 4, `smp` 5;
 host allreduce `smp` 4. `collmodel --plan` prints each unit's algorithms by
@@ -582,20 +582,25 @@ precheck masks of the inner layouts (`node_comm` gives (1, ppn),
 `node_roots_comm` (N, 1), both in every grid), so one inner file is enough.
 With pmodels/mpich#8048 a single-node communicator is not `hierarchical`,
 so user layouts and inner communicators of the same shape have the same
-conditions, and a forced algorithm whose restriction fails on an internal
-sub-communicator falls back to the selection even with
-`MPIR_CVAR_COLLECTIVE_FALLBACK=error`, so forcing `smp` measures it with
-its inner calls selected by the loaded file.
+conditions. Algorithm CVARs apply to the user's call only, so forcing `smp`
+measures it with its inner calls selected by the loaded file.
 
 colltree places `nb` and `buffer_swap` like any algorithm: as leaves of
 the `<op>-intra-<mask>` subtrees under `<op>-intra-auto`, each scored per
 layout and size, not as fixed wrappers ahead of the selection. They cannot
 loop there, because their own code changes the call before it selects
 again: `nb` turns it into the nonblocking collective, `buffer_swap` clears
-the gpu condition (and is restricted to it). This fits MPICH's planned
+the gpu_local condition (and is restricted to it). This fits MPICH's planned
 split into a `main` tree for user calls and an `auto` tree for every
-internal call: `main` stays `call=auto`, and `smp`'s inner calls on device
-buffers can still pick `buffer_swap` at their own level.
+internal call. `main` chooses whether a device call swaps (§12.3); inner calls
+select from `auto` and don't swap, and `buffer_swap` as a leaf of a `gpu_coll`
+subtree still applies to a user's call.
+
+An algorithm that mixes the user's buffers with host temporaries (reduce and
+scan `smp`) clears `gpu_coll` on its inner calls, which then select from the host
+tree. A catalog that shows this as `[gpu_coll=0]` lets the stale check time such a
+call correctly; its stage is computed as for a plain call into the unit's tree,
+which at worst waits longer than it must.
 
 **Kinds of restrictions.** The catalog lists restrictions without saying
 how a tuner treats them; that is csel_tuner's policy, in
@@ -619,7 +624,7 @@ is scored on builtin-op timings). User ops and derived datatypes are too
 varied to model as a whole, since their cost depends on the actual op and
 type; the way to tune a common case among them is a narrow restrictive
 condition in MPICH (a vector datatype, a specific op), which joins as a
-black-box set condition, measured in a later enhancement run. *Launch* conditions (`gpu`,
+black-box set condition, measured in a later enhancement run. *Launch* conditions (`gpu_local`,
 `gpu_coll`) are decided by how the ranks are started. Everything else is a
 *set* condition: the layout conditions (`pof2`, `hierarchical`, ...) and the
 black-box ones (`MPIDI_CH4_release_gather`), found by the precheck and
@@ -819,19 +824,35 @@ import from their journals.
   message size the same on every rank build trees without size splits.
 - **Several memory kinds, one file.** Host and device buffers have their
   own model each, because an algorithm's cost on device buffers says
-  little about its cost on host buffers. A device call must therefore
-  never fall back to a host subtree. colltree builds each model's sets on
-  their own.
-  - The device model's subtrees have the prefix `<op>-intra-gpu`. Its
-    `gpu` bit holds everywhere, so it is dropped from the masks. An
-    algorithm restricted to `gpu` alone (`buffer_swap`) is unrestricted
-    there, and `<op>-intra-gpu-0` is that model's fallback.
-  - `<op>-intra-auto` tests `gpu` first:
-    `{"gpu": "dispatch=<op>-intra-gpu(<bits>)", "any": <host dispatch>}`.
+  little about its cost on host buffers. colltree builds each model's sets
+  on their own. All ranks of a call must reach the same algorithm, which
+  decides how each device condition can shape the file:
+  - `gpu_coll` is the same on all ranks, so it selects the device model's own
+    subtrees, with the prefix `<op>-intra-gpu`. A `gpu_coll` call never falls
+    back to a host subtree. `gpu_local` and `gpu_coll` hold everywhere in the
+    model (`--launch gpu`), so they are dropped from the masks. An algorithm
+    restricted to them alone (`buffer_swap`) is unrestricted there, and
+    `<op>-intra-gpu-0` is that model's fallback.
+  - `<op>-intra-auto` tests `gpu_coll` first:
+    `{"gpu_coll": "dispatch=<op>-intra-gpu(<bits>)", "any": <host dispatch>}`.
+  - `gpu_local` can differ between ranks, and MPICH allows it only in the tree
+    `main` reaches, choosing between `call=auto` and an algorithm restricted on
+    it. So a device call without `gpu_coll` runs the host tree's algorithm A,
+    directly or after a swap, and ranks converge either way, because the swap
+    clears the condition and continues in `auto`, reaching A. colltree fits this
+    two-way choice per collective, on the device model's curves for A and
+    `buffer_swap`: `<op>-intra-main` is `{"gpu_coll": "call=auto", "gpu_local":
+    <the choice>, "any": "call=auto"}`, and `main` sends the collective there.
+    `gpu_coll` comes first because it implies `gpu_local` and has its own tree.
+    Keeping the choice out of the host tree costs host calls only a flag test.
+    The device collection already holds both curves, so this needs no collection
+    of its own. `--launch gpu` has `gpu_coll` set, so where A is compositional and
+    keeps `gpu_coll` on its inner calls (allreduce `smp`), its curve used the device
+    trees for them, while a call without `gpu_coll` uses the host trees: there the
+    choice is an approximation.
   - MPICH's `dispatch=` only looks up `<prefix>-<hex>` names, so the
     prefixes keep the two kinds' subtrees apart, including their subset
-    fallbacks. For example, without `MPIR_CVAR_ENABLE_GPU_COLL`, a set
-    that needs `gpu_coll` falls back to its device subset.
+    fallbacks.
 
 ### 12.4 Batch strategies
 

@@ -27,15 +27,17 @@ Catalogs without those inner keys get the same calls (GENERAL).
 """
 import re
 
+from .kinds import canon_condition
+
 INNER_RE = re.compile(r"([\w$-]+)@(\w+)(?:\[(\w+)=([01])\])?$")
 # the general algorithms of a blocking collective: model name -> (function, inner calls if the catalog has none)
 GENERAL = {"nb": ("MPIR_Coll_nb", "i$coll-intra@comm"),
-           "buffer_swap": ("MPIR_Coll_buffer_swap", "$coll-intra@comm[gpu=0]")}
+           "buffer_swap": ("MPIR_Coll_buffer_swap", "$coll-intra@comm[gpu_local=0]")}
 
 
 class Inner:
     """An inner call: the section it selects from, the communicator (node_comm, node_roots_comm,
-    or comm: the caller's own) and the restrictions it sets, e.g. {"gpu": 0}."""
+    or comm: the caller's own) and the restrictions it sets, e.g. {"gpu_local": 0}."""
 
     def __init__(self, section, comm, cond=None):
         self.section, self.comm, self.cond = section, comm, cond or {}
@@ -45,7 +47,7 @@ class Inner:
         m = INNER_RE.match(text.replace(" ", ""))
         if not m:
             raise ValueError("inner %s is not <section>@<communicator>[k=v]" % text)
-        cond = {m.group(3): int(m.group(4))} if m.group(3) else {}
+        cond = {canon_condition(m.group(3)): int(m.group(4))} if m.group(3) else {}
         return cls(m.group(1).replace("$coll", coll), m.group(2), cond)
 
     def __eq__(self, other):
@@ -60,7 +62,7 @@ class Inner:
 class Alg:
     def __init__(self, op, name, keys):
         self.op, self.name, self.keys = op, name, keys
-        self.restrictions = [r.strip() for r in keys.get("restrictions", "").split(",") if r.strip()]
+        self.restrictions = [canon_condition(r.strip()) for r in keys.get("restrictions", "").split(",") if r.strip()]
         self.extra_params = [p.strip() for p in keys.get("extra_params", "").split(",") if p.strip()]
         self.cvar_params = [p.strip() for p in keys.get("cvar_params", "").split(",") if p.strip()]
         # inner: the calls a compositional algorithm makes through the selection
@@ -127,8 +129,9 @@ class Catalog:
                 m = re.match(r"(\d+)\s+-\s+(\w+):", s)
                 if not m:
                     raise ValueError("%s: restriction entry is not 'index - name: func': %s" % (path, s))
-                indexed[int(m.group(1))] = m.group(2)
-                conditions[m.group(2)] = False
+                name = canon_condition(m.group(2))
+                indexed[int(m.group(1))] = name
+                conditions[name] = False
             elif cur == "conditions":
                 name = s.split(":", 1)[0].strip()
                 m = re.match(r"(\w+)\((\w+)\)$", name)

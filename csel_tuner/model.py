@@ -31,7 +31,7 @@ import os
 
 import numpy as np
 
-from .kinds import datatype, is_v, run_variant
+from .kinds import canon_condition, datatype, is_v, run_variant
 from .restrict import infer_mask, mem_known
 from .single import LayoutModel
 
@@ -146,7 +146,11 @@ class Model:
     def from_dict(cls, d, path="", tags=None):
         """A unit of a collmodel/5 file, or a whole collmodel/4 file (with tags given)."""
         tags = tags or d["tags"]
-        self = cls(tags["coll"], d["sizes"], d["layouts"], d["domain"], d["conditions"], d["algorithms"],
+        conditions = [canon_condition(c) for c in d["conditions"]]
+        for info in d["algorithms"].values():
+            if info.get("restrictions"):
+                info["restrictions"] = [canon_condition(r) for r in info["restrictions"]]
+        self = cls(tags["coll"], d["sizes"], d["layouts"], d["domain"], conditions, d["algorithms"],
                    tags["launch"], tags)
         self.masks = {(n, q): m for n, q, m in d["layout_masks"]}
         self.left_out = d.get("left_out", [])

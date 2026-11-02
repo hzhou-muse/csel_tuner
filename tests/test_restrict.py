@@ -105,9 +105,9 @@ def test_general_inner():
     cat = catalog(text.replace("# ----\nbcast-intra", GENERAL + "# ----\nbcast-intra"))
     algs = {a.name: a for a in cat.algorithms("bcast")}
     assert [str(x) for x in algs["nb"].inner] == ["ibcast-intra@comm"]
-    assert [str(x) for x in algs["buffer_swap"].inner] == ["bcast-intra@comm[gpu=0]"]
-    assert algs["buffer_swap"].restrictions == ["gpu"] and algs["buffer_swap"].leaf == "MPIR_Coll_buffer_swap"
-    assert algs["buffer_swap"].inner[0].cond == {"gpu": 0} and algs["nb"].leaf == "MPIR_Coll_nb"
+    assert [str(x) for x in algs["buffer_swap"].inner] == ["bcast-intra@comm[gpu_local=0]"]
+    assert algs["buffer_swap"].restrictions == ["gpu_local"] and algs["buffer_swap"].leaf == "MPIR_Coll_buffer_swap"
+    assert algs["buffer_swap"].inner[0].cond == {"gpu_local": 0} and algs["nb"].leaf == "MPIR_Coll_nb"
     assert [a.name for a in catalog().algorithms("bcast")][-1] == "nb"
     assert [str(x) for x in catalog().algorithms("bcast")[-1].inner] == ["ibcast-intra@comm"]
     # neither nb (another op's tree) nor buffer_swap (host buffers) can make smp's inner calls stale

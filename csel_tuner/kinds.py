@@ -16,7 +16,7 @@ treats a condition is its own policy (docs/design.md, section 11):
   pass MPI_IN_PLACE, not for the rooted collectives, where only the root
   does; the op conditions for the reductions), whether or not an algorithm
   restricts on it, because it changes the algorithms' curves.
-- launch: decided by how the ranks are started (LAUNCH): `gpu` and
+- launch: decided by how the ranks are started (LAUNCH): `gpu_local` and
   `gpu_coll` on device buffers. The launch kind is a tag of its own.
 - set: everything else, the layout conditions (pof2, hierarchical, ...) and
   the black-box conditions (MPIDI_CH4_release_gather, ...). The precheck
@@ -58,12 +58,12 @@ RECIPES = {
     "builtin_op": (_with_nb(REDUCTIONS), {0: None, 1: {"op": "sum"}}),
 }
 # (if, then): an assignment with the first true and the second false is impossible
-IMPLIES = [("builtin_op", "commutative"), ("gpu_coll", "gpu")]
+IMPLIES = [("builtin_op", "commutative"), ("gpu_coll", "gpu_local")]
 # launch kind (the model's memory kind) -> the conditions it decides
 # gpu: device buffers with MPIR_CVAR_ENABLE_GPU_COLL=1 (Q4); device: device buffers without it (the
 # launch of --mem device, before launch kinds)
-LAUNCH = {"host": {"gpu": 0, "gpu_coll": 0}, "gpu": {"gpu": 1, "gpu_coll": 1}, "device": {"gpu": 1}}
-LAUNCH_CONDITIONS = ["gpu", "gpu_coll"]
+LAUNCH = {"host": {"gpu_local": 0, "gpu_coll": 0}, "gpu": {"gpu_local": 1, "gpu_coll": 1}, "device": {"gpu_local": 1}}
+LAUNCH_CONDITIONS = ["gpu_local", "gpu_coll"]
 # the set conditions of the current catalog, so that a new restriction is noticed
 KNOWN_SET = ["pof2", "hierarchical", "node_consecutive", "node_regular", "displs_ordered", "block_regular",
              "MPIDI_CH4_release_gather"]
@@ -151,4 +151,10 @@ def datatype(coll):
 
 def is_device(launch):
     """Whether a launch kind measures device buffers (mpisrv --mem device)."""
-    return LAUNCH.get(launch, {}).get("gpu") == 1
+    return LAUNCH.get(launch, {}).get("gpu_local") == 1
+
+
+def canon_condition(name):
+    """A restriction's current name: MPICH's gpu became gpu_local (pmodels/mpich#8089), and older
+    catalogs and model files still say gpu."""
+    return "gpu_local" if name == "gpu" else name

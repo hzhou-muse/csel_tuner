@@ -17,13 +17,13 @@ from csel_tuner.kinds import classify, launch_known, measured, request, variants
 
 # the restrictions of MPICH's catalog after pmodels/mpich#8065, in index order
 BITS = ["inplace", "pof2", "commutative", "builtin_op", "hierarchical", "node_consecutive", "node_regular",
-        "displs_ordered", "block_regular", "MPIDI_CH4_release_gather", "gpu", "gpu_coll"]
+        "displs_ordered", "block_regular", "MPIDI_CH4_release_gather", "gpu_local", "gpu_coll"]
 
 
 def test_classify():
     kinds, notes = classify(BITS)
     assert [r for r in BITS if kinds[r] == "input"] == ["inplace", "commutative", "builtin_op"]
-    assert [r for r in BITS if kinds[r] == "launch"] == ["gpu", "gpu_coll"]
+    assert [r for r in BITS if kinds[r] == "launch"] == ["gpu_local", "gpu_coll"]
     assert kinds["displs_ordered"] == kinds["MPIDI_CH4_release_gather"] == "set" and notes == []
     kinds, notes = classify(BITS + ["datatype_contig"])
     assert kinds["datatype_contig"] == "set" and len(notes) == 1 and "datatype_contig" in notes[0]
@@ -50,7 +50,7 @@ def test_variants():
 
 
 def test_launch_known():
-    gpu, gpu_coll = 1 << BITS.index("gpu"), 1 << BITS.index("gpu_coll")
+    gpu, gpu_coll = 1 << BITS.index("gpu_local"), 1 << BITS.index("gpu_coll")
     assert launch_known(BITS, "device") == (gpu, 0)
     assert launch_known(BITS, "host") == (0, gpu | gpu_coll)
     assert launch_known(["hierarchical"], "device") == (0, 0)

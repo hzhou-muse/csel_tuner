@@ -320,7 +320,7 @@ Also `--log`, `--resume`, `--deadline`, `--checkpoint-every` (§6.5) and
 | `--counts` | `uniform` | v-operations: the per-member blocks, `uniform`, `linear` or `onebig`, with `m` the mean block (mpisrv `counts=`) |
 | `--inplace` | off | measure with `MPI_IN_PLACE` (mpisrv `inplace=1`), for the operations that allow it |
 | `--colls` | | several units in one run, one after another: `COLL`, `COLL:all` (every in-place setting the collective takes), or `COLL:K=V+K=V` with `inplace=0\|1`, `counts=uniform\|linear\|onebig`; e.g. `allreduce:all,alltoallv:counts=linear,barrier`. Needs `--algs all`; `--log` is then a directory with one journal per unit (alias `--coll`) |
-| `--launch` | `--mem` | launch kinds, one server launch each, its units one after another: `host`, `gpu` (device buffers, one GPU per rank, `MPIR_CVAR_ENABLE_GPU_COLL=1`), `device` (device buffers without `GPU_COLL`, the older `--mem device`); with `--site` it sets `LAUNCH` for `launch/config.sh`. The unit's `launch` tag |
+| `--launch` | `--mem` | launch kinds, one server launch each, its units one after another: `host`, `gpu` (device buffers, one GPU per rank, `MPIR_CVAR_ENABLE_GPU_COLL=1`), `device` (device buffers without `GPU_COLL`, the older `--mem device`, which colltree does not take: use `gpu`); with `--site` it sets `LAUNCH` for `launch/config.sh`. The unit's `launch` tag |
 | `--plan` | | print each unit's algorithms by stage (from the catalog's `inner` keys: a compositional algorithm is 1 + the stage at which the trees it selects from are complete) and the trees each one needs, then exit; needs `--catalog` |
 | `--max-stage` | none | add only algorithms up to this stage (`--plan`); an explicit `--algs` above it is refused. A stage-k algorithm needs an `--inner-selection` file built (colltree) from the units' stages below k |
 | `--growth-anchors` | off | after the sampling, measure every modeled algorithm at a fixed point set for scaling fits (§6.2); with `--model` alone, top up a model's anchors |
@@ -400,8 +400,9 @@ bin/collmodel --mem device --algs all --catalog $MPICH_SRC/src/mpi/coll/coll_alg
   share one. `--ppn` is at most the site's `GPU_DEVICES`. mpisrv stops on
   every rank if the binding failed, and lists shared GPUs in
   `topology_warnings`.
-- The memory kind decides the `gpu` and `gpu_coll` restrictions, if the
-  catalog has them. `gpu` holds on device buffers, and neither holds on
+- The memory kind decides the `gpu_local` and `gpu_coll` restrictions, if the
+  catalog has them (a catalog or model from before pmodels/mpich#8089 says `gpu`,
+  read as `gpu_local`). `gpu_local` holds on device buffers, and neither holds on
   host buffers. The precheck reports algorithms that ran or failed against
   that.
 - The `gpu_coll` restriction also needs `MPIR_CVAR_ENABLE_GPU_COLL=1` in
@@ -521,13 +522,25 @@ scored at the set's own layouts. To see which algorithms ran, set
 `MPIR_CVAR_DUMP_COLL_ALGO_COUNTERS=0` (rank 0 prints its counts at
 finalize).
 
-With a model of device buffers too, the file also has that model's
-subtrees, named `bcast-intra-gpu-<mask>`. In them the `gpu` restriction is
-left out of the mask, because it holds everywhere in that model. The file
+With a model of device buffers (`--launch gpu`) too, the file also has that
+model's subtrees, named `bcast-intra-gpu-<mask>`. In them `gpu_local` and `gpu_coll`
+are left out of the mask, because they hold everywhere in that model. The file
 also has a dispatch of its own, and `name=bcast-intra-auto` becomes
-`{"gpu": "dispatch=bcast-intra-gpu(...)", "any": <the host dispatch>}`. A
-call on device buffers falls back to `bcast-intra-gpu-0`, never to a host
-subtree. The device model's catalog must have the `gpu` restriction.
+`{"gpu_coll": "dispatch=bcast-intra-gpu(...)", "any": <the host dispatch>}`. A
+`gpu_coll` call falls back to `bcast-intra-gpu-0`, never to a host subtree. The
+model's catalog must have both restrictions.
+
+`gpu_local` can differ between the ranks of a call, so MPICH allows it only in
+the tree `main` reaches, to choose between `call=auto` and `buffer_swap`
+(pmodels/mpich#8089). A device-buffer call without `gpu_coll` therefore runs
+the host tree's algorithm, directly or after a swap. colltree makes that choice
+from the same model: where `buffer_swap` is predicted faster than the host tree's
+choice, the file has `name=bcast-intra-main`, `{"gpu_coll": "call=auto",
+"gpu_local": <buffer_swap or call=auto, by size and layout>, "any": "call=auto"}`,
+and a `name=main` that sends the collective there. A host call pays one flag test.
+No extra collection is needed. It reports how many points swap, and the
+algorithms with no curve on device buffers, whose points it leaves out. Above
+`--guard-above` there is no swap data, so the choice there is `call=auto`.
 
 Several variant units of one collective (in-place and not, §6.4 `--colls
 COLL:all`) go into the same file. Each unit's input conditions (`inplace`,
@@ -667,7 +680,7 @@ python3 tests/test_resume.py     # a cut journal resumes to the same model; same
 python3 tests/test_restrict.py   # catalog, precheck, sets, dispatch; the builds with sets need replay data
 python3 tests/test_extend.py     # adding an algorithm and layouts to a model, resume; needs replay data
 python3 tests/test_growth_anchors.py  # growth anchors (point set, fit unchanged, top-up, resume), growth classes, guard
-python3 tests/test_gpu.py        # memory-kind restrictions; colltree merging host and device models
+python3 tests/test_gpu.py        # memory-kind restrictions; colltree merging host and gpu models, swap choices
 python3 tests/test_kinds.py      # restriction kinds, variants; inner trees in --inner-selection
 python3 tests/test_stages.py     # algorithm stages from inner calls; disabled algorithms, leaf names and parameters
 python3 tests/test_collection.py  # colltree over several collectives and variants, --colls, --with, staleness

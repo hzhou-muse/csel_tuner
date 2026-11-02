@@ -1,6 +1,6 @@
 """Device buffers: the restrictions the memory kind decides, and bin/colltree
-merging a host and a device model into one tuning file whose device calls
-never reach a host subtree."""
+merging a host and a gpu model into one tuning file: gpu_coll selects the gpu
+model's subtrees, and gpu_local only chooses a swap, in the tree main reaches."""
 import io
 import json
 import os
@@ -17,7 +17,7 @@ from csel_tuner.model import Model  # noqa: E402
 from csel_tuner.restrict import infer_mask, mem_known  # noqa: E402
 from csel_tuner.tree import json_choice  # noqa: E402
 
-BITS = ["hierarchical", "gpu", "gpu_coll"]
+BITS = ["hierarchical", "gpu_local", "gpu_coll"]
 HIER, GPU, GPU_COLL = 1, 2, 4
 LAYOUTS = [(1, 2), (1, 4), (1, 8), (2, 1), (2, 2), (2, 4), (4, 1), (4, 2), (4, 4)]
 SIZES = [2 ** k for k in range(0, 21, 2)]
@@ -61,13 +61,33 @@ def device_model(conditions=BITS):
         conditions)
 
 
-def gpu_model():
+def gpu_model(conditions=BITS, without=()):
     """Launch kind gpu (MPIR_CVAR_ENABLE_GPU_COLL=1): gpu and gpu_coll hold at every layout."""
-    m = device_model()
-    m = model("gpu", m.algorithms, {l: GPU | GPU_COLL for l in LAYOUTS}, {
-        "binomial": (10.0, 1e3, lambda l: True), "scatter": (30.0, 1e4, lambda l: True),
-        "buffer_swap": (40.0, 1e6, lambda l: True), "ipc_read": (0.5, 1e7, lambda l: l[0] == 1)})
-    return m
+    m = device_model(conditions)
+    curves = {"binomial": (10.0, 1e3, lambda l: True), "scatter": (30.0, 1e4, lambda l: True),
+              "buffer_swap": (40.0, 1e6, lambda l: True), "ipc_read": (0.5, 1e7, lambda l: l[0] == 1)}
+    return model("gpu", m.algorithms, {l: GPU | GPU_COLL for l in LAYOUTS},
+                 {k: v for k, v in curves.items() if k not in without}, conditions)
+
+
+def local_keys(obj):
+    """The values of every gpu_local key in a tuning file object."""
+    if not isinstance(obj, dict):
+        return []
+    out = [v for k, v in obj.items() if k.lstrip("!") == "gpu_local"]
+    for v in obj.values():
+        out += local_keys(v)
+    return out
+
+
+def leaves(obj):
+    """The leaves of a tree object: call= strings and algorithm keys."""
+    if isinstance(obj, str):
+        return {obj}
+    out = set()
+    for k, v in obj.items():
+        out |= {k} if k.startswith("algorithm=") else leaves(v)
+    return out
 
 
 def colltree(argv):
@@ -101,56 +121,109 @@ def test_model_mem_roundtrip():
 
 def test_merge():
     with tempfile.TemporaryDirectory() as tmp:
-        h, d, t = (os.path.join(tmp, x) for x in ("h.json", "d.json", "t.json"))
+        h, g, t = (os.path.join(tmp, x) for x in ("h.json", "g.json", "t.json"))
         host_model().save(h)
-        device_model().save(d)
-        colltree([h, d, "--out", t, "--node-aware"])
+        gpu_model().save(g)
+        colltree([h, g, "--out", t, "--node-aware"])
         out = json.load(open(t))
-        names = sorted(out)
-        assert names == ["name=bcast-intra-0", "name=bcast-intra-auto", "name=bcast-intra-gpu-0",
-                         "name=bcast-intra-gpu-4"], names
-        assert out["name=bcast-intra-auto"] == {"gpu": "dispatch=bcast-intra-gpu(0x4)", "any": "call=bcast-intra-0"}
+        assert sorted(out) == ["name=bcast-intra-0", "name=bcast-intra-auto", "name=bcast-intra-gpu-0",
+                               "name=bcast-intra-main", "name=main"], sorted(out)
+        assert out["name=bcast-intra-auto"] == {"gpu_coll": "call=bcast-intra-gpu-0", "any": "call=bcast-intra-0"}
+        assert out["name=main"] == {"collective=bcast-intra": "call=bcast-intra-main", "any": "call=auto"}
+        # gpu_coll first: it implies gpu_local and has its own tree. gpu_local only in main's tree,
+        # ending in buffer_swap or call=auto, with call=auto next
+        entry = out["name=bcast-intra-main"]
+        assert list(entry) == ["gpu_coll", "gpu_local", "any"], entry
+        assert entry["gpu_coll"] == "call=auto" and entry["any"] == "call=auto"
+        assert leaves(entry["gpu_local"]) == {"call=auto", "algorithm=MPIR_Coll_buffer_swap"}, entry
+        assert len(local_keys(out)) == 1
+
         trees = {k[len("name="):]: v for k, v in out.items()}
+        trees["auto"] = trees["bcast-intra-auto"]
         host_leaves = {"MPIR_Bcast_intra_binomial", "MPIR_Bcast_intra_scatter"}
-        device_only = {"MPIR_Coll_buffer_swap", "MPIDI_IPC_bcast_ipc_read"}
 
         def choose(lay, m, gpu, gpu_coll):
             x = {"p": lay[0] * lay[1], "m": m, "N": lay[0], "ppn": lay[1],
                  "pof2": float(lay[0] * lay[1] & (lay[0] * lay[1] - 1) == 0),
-                 "cond": {"hierarchical": False, "gpu": gpu, "gpu_coll": gpu_coll}}
-            return json_choice(trees["bcast-intra-auto"], x, trees, BITS)
+                 "cond": {"hierarchical": False, "gpu_local": gpu, "gpu_coll": gpu_coll}}
+            return json_choice(entry, x, trees, BITS)
         for lay in LAYOUTS:
             for m in SIZES:
-                assert choose(lay, m, False, False) in host_leaves
-                # device buffers, without MPIR_CVAR_ENABLE_GPU_COLL, and with it (where the
-                # model has gpu_coll: one node)
-                for coll in {False, lay[0] == 1}:
-                    leaf = choose(lay, m, True, coll)
-                    if not coll:
-                        assert leaf != "MPIDI_IPC_bcast_ipc_read"
-                    if m == SIZES[-1]:
-                        assert leaf in device_only, (lay, m, coll, leaf)
-            assert choose(lay, 1, True, lay[0] == 1) == ("MPIDI_IPC_bcast_ipc_read" if lay[0] == 1
-                                                         else "MPIR_Bcast_intra_binomial")
-        # --nested-dispatch: the device dispatch as nested conditions
-        colltree([h, d, "--out", t, "--nested-dispatch"])
-        auto = json.load(open(t))["name=bcast-intra-auto"]
-        assert auto == {"gpu": {"gpu_coll": "call=bcast-intra-gpu-4", "any": "call=bcast-intra-gpu-0"},
-                        "any": "call=bcast-intra-0"}, auto
+                host = choose(lay, m, False, False)
+                assert host in host_leaves
+                # without gpu_coll, a device rank runs the host tree's algorithm or swaps, and the
+                # swap continues in auto with the flags clear, reaching that same algorithm
+                assert choose(lay, m, True, False) in (host, "MPIR_Coll_buffer_swap")
+            assert choose(lay, SIZES[0], True, False) == "MPIR_Bcast_intra_binomial"    # direct: no copy cost
+            assert choose(lay, SIZES[-1], True, False) == "MPIR_Coll_buffer_swap"       # swap: far faster
+            if lay[0] == 1:
+                assert choose(lay, 1, True, True) == "MPIDI_IPC_bcast_ipc_read"     # the gpu_coll subtree
+        # above the sampled range there is no swap data
+        colltree([h, g, "--out", t, "--node-aware", "--guard-above", "32"])
+        entry = json.load(open(t))["name=bcast-intra-main"]["gpu_local"]
+        assert list(entry) == ["comm_size(32)", "any"] and entry["any"] == "call=auto", entry
         # one model alone: today's output
         colltree([h, "--out", t])
         assert sorted(json.load(open(t))) == ["name=bcast-intra-0", "name=bcast-intra-auto"]
 
 
+def test_no_swap():
+    """With no point where the swap wins, or without its curve, main stays as it is."""
+    with tempfile.TemporaryDirectory() as tmp:
+        h, g, t = (os.path.join(tmp, x) for x in ("h.json", "g.json", "t.json"))
+        host_model().save(h)
+        gpu_model(without=("buffer_swap",)).save(g)
+        colltree([h, g, "--out", t, "--node-aware"])
+        out = json.load(open(t))
+        assert "name=main" not in out and local_keys(out) == []
+        slow = model("gpu", gpu_model().algorithms, {l: GPU | GPU_COLL for l in LAYOUTS}, {
+            "binomial": (10.0, 1e3, lambda l: True), "scatter": (30.0, 1e4, lambda l: True),
+            "buffer_swap": (1e6, 1e3, lambda l: True), "ipc_read": (0.5, 1e7, lambda l: l[0] == 1)})
+        slow.save(g)
+        text = colltree([h, g, "--out", t, "--node-aware"])
+        assert "name=main" not in json.load(open(t)), text
+        assert "swap at 0 of" in text, text
+
+
+def test_swap_needs_curves():
+    """A point whose host algorithm the gpu model lacks is reported."""
+    with tempfile.TemporaryDirectory() as tmp:
+        h, g, t = (os.path.join(tmp, x) for x in ("h.json", "g.json", "t.json"))
+        host_model().save(h)
+        gpu_model(without=("scatter",)).save(g)
+        text = colltree([h, g, "--out", t, "--node-aware"])
+        assert "scatter has no curve on device buffers" in text, text
+
+
+def test_old_names():
+    """A model recorded when the condition was named gpu still loads, as gpu_local."""
+    with tempfile.TemporaryDirectory() as tmp:
+        h, g, t = (os.path.join(tmp, x) for x in ("h.json", "g.json", "t.json"))
+        host_model().save(h)
+        gpu_model().save(g)
+        d = json.load(open(g))
+        for u in d["units"]:
+            u["conditions"] = ["hierarchical", "gpu", "gpu_coll"]
+            u["algorithms"]["buffer_swap"]["restrictions"] = ["gpu"]
+        json.dump(d, open(g, "w"))
+        assert Model.load(g).conditions == BITS
+        colltree([h, g, "--out", t, "--node-aware"])
+        assert "name=bcast-intra-main" in json.load(open(t))
+
+
 def test_merge_errors():
     with tempfile.TemporaryDirectory() as tmp:
-        h, d, d2, t = (os.path.join(tmp, x) for x in ("h.json", "d.json", "d2.json", "t.json"))
+        h, g, d, d2, d3, t = (os.path.join(tmp, x) for x in ("h.json", "g.json", "d.json", "d2.json", "d3.json", "t.json"))
         host_model().save(h)
+        gpu_model().save(g)
         device_model().save(d)
-        device_model(["hierarchical", "other", "gpu_coll"]).save(d2)
-        for argv, msg in [([d, "--out", t], "no unit of host buffers"),
+        gpu_model(["hierarchical", "other", "gpu_coll"]).save(d2)
+        gpu_model(["hierarchical", "gpu_local", "other"]).save(d3)
+        for argv, msg in [([g, "--out", t], "no unit of host buffers"),
                           ([h, h, "--out", t], "a second bcast unit of host buffers"),
-                          ([h, d2, "--out", t], "has no gpu restriction")]:
+                          ([h, d2, "--out", t], "has no gpu_local restriction"),
+                          ([h, d3, "--out", t], "has no gpu_coll restriction"),
+                          ([h, d, "--out", t], "measure device buffers with --launch gpu")]:
             try:
                 colltree(argv)
             except SystemExit as e:
@@ -193,23 +266,6 @@ def test_warmup_no_zero():
     assert min(warmup_sizes(1)) == 1
 
 
-def test_gpu_launch():
-    """A unit of launch kind gpu: both device conditions drop out of its masks, so its
-    subtree is one set, reached by the gpu condition."""
-    with tempfile.TemporaryDirectory() as tmp:
-        h, g, t = (os.path.join(tmp, x) for x in ("h.json", "g.json", "t.json"))
-        host_model().save(h)
-        gpu_model().save(g)
-        colltree([h, g, "--out", t, "--node-aware"])
-        out = json.load(open(t))
-        assert sorted(out) == ["name=bcast-intra-0", "name=bcast-intra-auto", "name=bcast-intra-gpu-0"], sorted(out)
-        assert out["name=bcast-intra-auto"] == {"gpu": "call=bcast-intra-gpu-0", "any": "call=bcast-intra-0"}
-        trees = {k[len("name="):]: v for k, v in out.items()}
-        x = {"p": 2, "m": 1, "N": 1, "ppn": 2, "pof2": 1.0,
-             "cond": {"hierarchical": False, "gpu": True, "gpu_coll": True}}
-        assert json_choice(trees["bcast-intra-auto"], x, trees, BITS) == "MPIDI_IPC_bcast_ipc_read"
-
-
 if __name__ == "__main__":
     test_mem_known()
     test_model_mem_roundtrip()
@@ -217,5 +273,7 @@ if __name__ == "__main__":
     test_merge_errors()
     test_precheck_known()
     test_warmup_no_zero()
-    test_gpu_launch()
+    test_no_swap()
+    test_swap_needs_curves()
+    test_old_names()
     print("ok")

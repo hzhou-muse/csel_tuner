@@ -8,11 +8,14 @@
 A plain algorithm is stage 1. A compositional algorithm (one with inner calls)
 is 1 + the largest stage of the trees its inner calls select from, a tree
 being (collective, launch kind): an inner call selects from the collective's
-own tree on the caller's launch, or with [gpu=0] from its host tree. A tree
+own tree on the caller's launch, or with [gpu_local=0] from its host tree. With
+[gpu_coll=0] (an inner call mixing the user's buffers with host temporaries)
+it reaches the host tree, and is counted as a plain call into the caller's unit's
+tree, which at worst waits longer than it must. A tree
 is complete at the largest stage of its algorithms, with two kinds left out:
 those whose inner calls lead back into the chain being computed (a cycle:
 smp's inner bcast calls cannot run smp, so smp's bcast tree is bcast without
-smp), and those the launch kind rules out (buffer_swap, restricted to gpu,
+smp), and those the launch kind rules out (buffer_swap, restricted to gpu_local,
 is in no host tree). So for host bcast with nb and smp: the plain algorithms
 are stage 1, nb 2 (ibcast's tree is plain), smp 3 (its bcast tree has nb),
 and on a gpu launch buffer_swap 4 (the host tree is complete at 3).
@@ -43,7 +46,7 @@ class Stages:
         """The trees an algorithm's inner calls select from: [(coll, launch)], in order, unique."""
         out = []
         for i in alg.inner:
-            d = (i.section.rsplit("-", 1)[0], "host" if i.cond.get("gpu") == 0 else launch)
+            d = (i.section.rsplit("-", 1)[0], "host" if i.cond.get("gpu_local") == 0 else launch)
             if d not in out:
                 out.append(d)
         return out

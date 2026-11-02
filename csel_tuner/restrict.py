@@ -11,8 +11,8 @@ a failed restriction is an error, not a silent fallback). A layout's mask is
 the set of conditions true there: the bits of every algorithm that ran; an
 algorithm that failed with all but one of its bits known true makes that
 one false. Bits the algorithms do not decide are taken as false and
-reported. The bits the buffers' memory kind decides (mem_known: `gpu` on
-device buffers; `gpu` and `gpu_coll` off on host buffers) are set as known
+reported. The bits the buffers' memory kind decides (mem_known: `gpu_local` on
+device buffers; `gpu_local` and `gpu_coll` off on host buffers) are set as known
 instead.
 
 Set 0 holds the unrestricted algorithms and is built on every layout: it is
@@ -26,7 +26,7 @@ section 11.
 
 from .kinds import launch_known
 
-GPU, GPU_COLL = "gpu", "gpu_coll"       # MPICH's restrictions for device buffers (gpu_coll implies gpu)
+GPU_LOCAL, GPU_COLL = "gpu_local", "gpu_coll"   # MPICH's restrictions for device buffers (gpu_coll implies gpu_local)
 
 
 def mem_known(bits, mem):
@@ -113,17 +113,17 @@ def fixed_point(algs2, feas2, op):
     file for their inner calls when no inner call can run a compositional
     algorithm of its own op: (problems, notes). Checked on the precheck: a
     compositional algorithm that ran at an inner call's layout."""
-    # the algorithms whose curves depend on this op's tree: an inner call into it without conditions
-    # (buffer_swap's call has host buffers, where buffer_swap itself is restricted away; nb's goes to
-    # the nonblocking op's tree)
-    names = {a.name for a in algs2 if any(x.section == op + "-intra" and not x.cond for x in a.inner)}
+    # the algorithms whose curves depend on this op's tree: an inner call into it, other than on host
+    # buffers (buffer_swap's call has host buffers, where buffer_swap itself is restricted away; nb's
+    # goes to the nonblocking op's tree)
+    names = {a.name for a in algs2 if any(x.section == op + "-intra" and x.cond.get(GPU_LOCAL) != 0 for x in a.inner)}
     problems, notes = [], []
     for a in algs2:
         for x in a.inner:
             if x.section != op + "-intra":
                 notes.append("%s: inner %s is another op; not checked here" % (a.name, x))
                 continue
-            if x.cond:          # buffer_swap: its inner call has host buffers, so `gpu` fails there
+            if x.cond.get(GPU_LOCAL) == 0:      # buffer_swap: its inner call has host buffers, so `gpu_local` fails there
                 continue
             for lay, ok in sorted(feas2.items()):
                 if a.name not in ok:

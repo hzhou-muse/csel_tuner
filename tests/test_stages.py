@@ -67,6 +67,17 @@ def test_stages():
     assert stages(Stages(catalog(), ["nb"]), "bcast", "host") == {"binomial": 1, "smp": 2}
 
 
+def test_inner_without_gpu_coll():
+    """An inner call with [gpu_coll=0] is counted as a plain call into the caller's unit's tree."""
+    text = CATALOG.replace("inner: bcast-intra@node_comm, bcast-intra@node_roots_comm",
+                           "inner: bcast-intra@node_comm[gpu_coll=0], bcast-intra@node_roots_comm[gpu_coll=0]")
+    text = text.replace("2  - gpu:   ", "2  - gpu_local:   ").replace("restrictions: gpu\n", "restrictions: gpu_local\n")
+    assert text != CATALOG and "gpu_local" in text
+    st = Stages(catalog(text))
+    assert stages(st, "bcast", "gpu") == {"binomial": 1, "smp": 5, "nb": 2, "buffer_swap": 4}
+    assert stages(st, "bcast", "host") == {"binomial": 1, "smp": 3, "nb": 2}
+
+
 def test_catalog_details():
     cat = catalog()
     # disabled: MPICH refuses it forced and in a tuning file
@@ -94,5 +105,6 @@ def test_catalog_details():
 
 if __name__ == "__main__":
     test_stages()
+    test_inner_without_gpu_coll()
     test_catalog_details()
     print("ok")
