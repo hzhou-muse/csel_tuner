@@ -12,6 +12,7 @@ starts a fresh one.
 """
 import json
 import os
+import signal
 import selectors
 import subprocess
 import time
@@ -55,8 +56,11 @@ class Server:
         self.start()
 
     def start(self):
+        # a session of its own, so kill() reaches the launcher's children (a site's launch
+        # runs mpiexec under bash; killing bash alone left mpiexec and every rank running)
         self.p = subprocess.Popen(self.cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  universal_newlines=True, env=self.env, bufsize=1)
+                                  universal_newlines=True, env=self.env, bufsize=1,
+                                  start_new_session=True)
         self.buf = b""
         self.last = time.time()     # end of the last reply: driver idle time starts here
         self.sel = selectors.DefaultSelector()
@@ -148,10 +152,30 @@ class Server:
                 continue
             self.request(op=op, m=m, batches=1, target_us=200, tag="warmup", **layout)
 
-    def kill(self):
-        if self.p.poll() is None:
-            self.p.kill()
-            self.p.wait()
+    def kill(self, grace=10):
+        """Stop the launcher's whole process group (start() gives it a session of its own):
+        SIGTERM, which mpiexec passes on to the ranks on every node, and SIGKILL to what is
+        left of the group after `grace` seconds."""
+        def group_alive():
+            try:
+                os.killpg(self.p.pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+            except PermissionError:      # a member changed user (not expected): treat as alive
+                return True
+        if group_alive():
+            os.killpg(self.p.pid, signal.SIGTERM)
+            end = time.time() + grace
+            while time.time() < end and group_alive():
+                self.p.poll()            # reap the launcher, or its zombie keeps the group alive
+                time.sleep(0.2)
+            if group_alive():
+                try:
+                    os.killpg(self.p.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        self.p.wait()
 
     def close(self, wait=30):
         """Ask the server to quit (it first answers the requests already
