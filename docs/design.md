@@ -853,6 +853,11 @@ import from their journals.
     keeps `gpu_coll` on its inner calls (allreduce `smp`), its curve used the device
     trees for them, while a call without `gpu_coll` uses the host trees: there the
     choice is an approximation.
+  - A more restricted tree is written only if it is unique. No algorithm requires
+    `gpu_coll` today, so the `gpu_coll` subtrees differ only where their free choice
+    among all algorithms beats the host tree's algorithm with the swap choice; if it
+    never chooses differently they and their keys are left out. Likewise a
+    restricted subtree that chooses like its dispatch fallback.
   - MPICH does not define `gpu_coll` for gatherv, scatterv and alltoallv (a rank
     may have no buffer to query), and refuses a file that splits on it there. They
     have no device subtrees: their device model only serves the swap choice.

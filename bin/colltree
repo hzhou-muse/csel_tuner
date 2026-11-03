@@ -73,6 +73,11 @@ the same algorithm:
   whose algorithm has no curve in the gpu model is reported and not counted.
   MPICH does not define gpu_coll for gatherv, scatterv and alltoallv, so they have
   no gpu subtrees and no gpu_coll key: their gpu model only serves the swap choice.
+
+A more restricted tree is written only if it is unique: a subtree that chooses like
+its dispatch fallback at every point it was fitted on, and the gpu subtrees with their
+gpu_coll keys if they choose like the host tree and the swap choice at every point
+of the gpu models. These are reported.
   Only a user's call reaches main; the inner calls of a compositional algorithm
   select from auto, so they don't swap.
 
@@ -610,6 +615,41 @@ def stale(model, S, out, built, tol):
     return found, notes
 
 
+def same_as_subset(trees, owner_sets):
+    """{mask: subset} of the restricted subtrees that choose like their fallback (the dispatch's
+    largest other subset) at every point they were fitted on: a more restricted tree is only
+    worth writing if it is unique. Smallest masks first, so a fallback is one that stays."""
+    dropped = {}
+    for mask in sorted(trees, key=lambda s: (bin(s).count("1"), s)):
+        rest = [s for s in trees if s != mask and s & ~mask == 0 and s not in dropped]
+        if not rest or mask not in owner_sets:
+            continue
+        f = max(rest, key=lambda s: (bin(s).count("1"), -s))
+        S, X = owner_sets[mask], owner_sets[mask].points[mask]
+        n = len(X["p"])
+        if all(S.choose(mask, {k: v[i] for k, v in X.items()}) == S.choose(f, {k: v[i] for k, v in X.items()})
+               for i in range(n)):
+            dropped[mask] = f
+    return dropped
+
+
+def gpu_coll_is_unique(host, gpu_built, swap_t):
+    """Whether the gpu subtrees choose differently from what a device call gets without gpu_coll,
+    the host tree's algorithm or a swap, at some point of the gpu models."""
+    for gm, G in gpu_built:
+        hm, S = pick_variant(host, gm)
+        for lay in gm.layouts:
+            if lay not in hm.masks:
+                return True
+            for size in gm.sizes:
+                x = x_of(gm, lay, size)
+                local = SWAP if swap_t is not None and select(swap_t, x) == 1 else \
+                    S.choose(S.effective(hm.masks[lay]), x_of(hm, lay, size))
+                if G.choose(G.effective(gm.masks.get(lay, 0)), x) != local:
+                    return True
+    return False
+
+
 def swap_tree(op, host, gpu_units, feats, a):
     """The choice of device buffers without gpu_coll, which run the host tree's algorithm directly
     or swap first: (fitted tree over [direct, buffer_swap], [report lines]), the tree None if
@@ -795,6 +835,7 @@ def main(argv=None):
         return dict(rec, **override.get(alg, {}))
 
     out, built, report = {}, {}, []     # built: {(coll, slot): [(path, model, Sets)]}
+    swap_fit = {}                       # op -> its swap choice's fitted tree, or None
     growth_cls = {}                     # id(model) -> growth.classes(model)
     for op, by_mem in colls.items():
         disp = {}
@@ -826,6 +867,7 @@ def main(argv=None):
                 host_units = [(m, S) for path, m, S in built[(op, mem)]]
                 swap_t, lines = swap_tree(op, host_units, by_mem["device"], fs, a)
                 report += lines
+                swap_fit[op] = swap_t
                 if swap_t is not None:
                     branch = json_tree(swap_t, ["direct", "swap"], lambda o: "call=auto" if o == "direct"
                                        else ("algorithm=" + SWAP_LEAF, {}), names)
@@ -834,13 +876,25 @@ def main(argv=None):
                     first = {GPU_COLL: "call=auto"} if has_gpu_coll(op) else {}
                     out[f"name={op}-intra-main"] = dict(first, **{GPU_LOCAL: branch, "any": "call=auto"})
 
-            def sub(o, m):
-                if isinstance(o, tuple):
-                    return "call=" + set_name(op, o[1], mem)
-                return ("algorithm=" + m.leaf(o), leaf_params(m, o))
             owner = {mask: m for path, m, S in built[(op, mem)] for mask in S.mine}
             owner_sets = {mask: S for path, m, S in built[(op, mem)] for mask in S.mine}
+            dropped = same_as_subset(trees, owner_sets)
+            if dropped:
+                report.append(f"{set_prefix(op, mem)}: not written, same choices as a subset's subtree: "
+                              + ", ".join(set_name(op, s, mem) for s in sorted(dropped)))
+
+            def kept(s):
+                while s in dropped:
+                    s = dropped[s]
+                return s
+
+            def sub(o, m):
+                if isinstance(o, tuple):
+                    return "call=" + set_name(op, kept(o[1]), mem)
+                return ("algorithm=" + m.leaf(o), leaf_params(m, o))
             for mask, (t, opts) in sorted(trees.items()):
+                if mask in dropped:
+                    continue
                 key = f"name={set_name(op, mask, mem)}"
                 tree_json = json_tree(t, opts, lambda o, m=owner[mask]: sub(o, m), names)
                 if a.guard_above is not None:
@@ -858,7 +912,7 @@ def main(argv=None):
                     if g_json != tree_json:
                         tree_json = {"comm_size(%d)" % a.guard_above: tree_json, "any": g_json}
                 out[key] = tree_json
-            present = sorted(trees)
+            present = sorted(s for s in trees if s not in dropped)
             if a.nested_dispatch:
                 disp[mem] = dispatch(op, by_mem[mem][0][1].conditions, present, mem)
             else:
@@ -867,6 +921,15 @@ def main(argv=None):
                     bits |= s
                 disp[mem] = "dispatch=%s(0x%x)" % (set_prefix(op, mem), bits) if bits else \
                     "call=" + set_name(op, 0, mem)
+        if "device" in disp and not gpu_coll_is_unique([(m, S) for path, m, S in built[(op, "host")]],
+                                                       [(m, S) for path, m, S in built[(op, "device")]],
+                                                       swap_fit.get(op)):
+            report.append(f"{op}: gpu_coll selects the same as without it: its subtrees are not written")
+            del disp["device"]
+            for key in [k for k in out if k.startswith(f"name={set_prefix(op, 'gpu')}-")]:
+                del out[key]
+            if f"name={op}-intra-main" in out:
+                out[f"name={op}-intra-main"].pop(GPU_COLL, None)
         out[f"name={op}-intra-auto"] = {GPU_COLL: disp["device"], "any": disp["host"]} if "device" in disp else \
             disp["host"]
         if a.buffer_swap:

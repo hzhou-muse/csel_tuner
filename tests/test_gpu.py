@@ -238,6 +238,34 @@ def test_no_gpu_coll_collective():
         assert list(out["name=gatherv-intra-main"]) == ["gpu_local", "any"], out["name=gatherv-intra-main"]
 
 
+def test_only_unique_trees():
+    """No gpu_coll subtree where it would choose like the host tree with the swap choice; no
+    restricted subtree where it chooses like its fallback."""
+    with tempfile.TemporaryDirectory() as tmp:
+        h, g, t = (os.path.join(tmp, x) for x in ("h.json", "g.json", "t.json"))
+        host_model().save(h)
+        same = model("gpu", {"binomial": alg(0), "scatter": alg(0), "buffer_swap": alg(GPU, "MPIR_Coll_buffer_swap")},
+                     {l: GPU | GPU_COLL for l in LAYOUTS},
+                     {"binomial": (1.0, 1e3, lambda l: True), "scatter": (3.0, 1e4, lambda l: True),
+                      "buffer_swap": (1e6, 1e2, lambda l: True)})
+        same.save(g)
+        text = colltree([h, g, "--out", t, "--node-aware"])
+        assert "gpu_coll selects the same as without it" in text, text
+        out = json.load(open(t))
+        assert sorted(out) == ["name=bcast-intra-0", "name=bcast-intra-auto"], sorted(out)
+        assert out["name=bcast-intra-auto"] == "call=bcast-intra-0"
+        # a restricted algorithm that never wins leaves its set's tree the same as set 0's
+        slow = model("host", {"binomial": alg(0), "scatter": alg(0), "smp": dict(alg(HIER), inner=[])},
+                     {l: HIER if l[0] > 1 and l[1] > 1 else 0 for l in LAYOUTS},
+                     {"binomial": (1.0, 1e3, lambda l: True), "scatter": (3.0, 1e4, lambda l: True),
+                      "smp": (1e6, 1e2, lambda l: l[0] > 1 and l[1] > 1)})
+        slow.save(h)
+        text = colltree([h, "--out", t, "--node-aware"])
+        out = json.load(open(t))
+        assert "name=bcast-intra-1" not in out and "not written" in text, (sorted(out), text)
+        assert out["name=bcast-intra-auto"] == "call=bcast-intra-0"
+
+
 def test_old_names():
     """A model recorded when the condition was named gpu still loads, as gpu_local."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -320,5 +348,6 @@ if __name__ == "__main__":
     test_swap_needs_curves()
     test_stale_either_tree()
     test_no_gpu_coll_collective()
+    test_only_unique_trees()
     test_old_names()
     print("ok")

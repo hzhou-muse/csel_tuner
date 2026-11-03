@@ -542,7 +542,10 @@ No extra collection is needed. It reports how many points swap, and the
 algorithms with no curve on device buffers, whose points it leaves out. Above
 `--guard-above` there is no swap data, so the choice there is `call=auto`.
 gatherv, scatterv and alltoallv have no `gpu_coll` in MPICH, so they get no device
-subtrees, only the swap choice.
+subtrees, only the swap choice. A more restricted tree is written only if it is
+unique: colltree reports a subtree that chooses like its dispatch fallback, and
+`gpu_coll` subtrees that choose like the host tree with the swap choice, and leaves
+them out.
 
 Several variant units of one collective (in-place and not, §6.4 `--colls
 COLL:all`) go into the same file. Each unit's input conditions (`inplace`,
