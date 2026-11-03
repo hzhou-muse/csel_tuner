@@ -119,6 +119,7 @@ class Model:
         self.prechecks = []             # [{"alg", "N", "ppn", "ok", "msg", "job"}]
         self.inner_files = {}           # hash -> content of a tuning file loaded for inner calls
         self.curves = {}                # alg -> {layout: log2 T on the grid}
+        self._inner_at = None           # (alg, N, ppn) -> inner selection, built by inner_at
         self.fit_inner = {}             # compositional alg -> hash of the inner selection its curves ran under
         self.runs = []                  # per collmodel run: settings, stop, estimate (results, not model)
         self._lm = {}
@@ -200,6 +201,7 @@ class Model:
             rec["anchor"] = True
         if growth:
             rec["growth"] = True
+        self._inner_at = None
         self.measurements.append(rec)
 
     def add_precheck(self, job, alg, n, ppn, ok, msg=""):
@@ -209,6 +211,16 @@ class Model:
         h = file_hash(text)
         self.inner_files[h] = text
         return h
+
+    def inner_at(self, alg, lay):
+        """The inner selection a compositional algorithm's curve at lay ran under: that of its
+        latest measurement there (a model grown over several jobs mixes them), else fit_inner."""
+        if self._inner_at is None:
+            self._inner_at = {}
+            for r in self.measurements:
+                if r.get("inner") and not r.get("anchor") and not r.get("growth"):
+                    self._inner_at[(r["alg"], r["N"], r["ppn"])] = r["inner"]
+        return self._inner_at.get((alg, lay[0], lay[1]), self.fit_inner.get(alg))
 
     def feasible(self):
         """{layout: set of algorithms that ran there}, the latest precheck of each (alg, layout)."""
@@ -258,6 +270,24 @@ class Model:
         if self.op.startswith("i") and alg.startswith("tsp_"):     # gen_coll.py's name for tsp algorithms
             return "MPIR_TSP_%s_sched_intra_%s" % (Op, alg[4:])
         return "MPIR_%s_intra_%s" % (Op, alg)
+
+    def extend_layouts(self, lays):
+        """Layouts beyond the model's (a job on a larger allocation)."""
+        self.layouts = sorted(set(self.layouts) | {tuple(l) for l in lays})
+        self.domain["N"][1] = max(self.domain["N"][1], max(n for n, _ in self.layouts))
+
+    def trim_layouts(self, lays):
+        """Forget those of lays where nothing was measured (a run cut short)."""
+        have = set(self.measured_layouts())
+        self.layouts = [l for l in self.layouts if l in have or l not in {tuple(x) for x in lays}]
+        self.domain["N"][1] = max(n for n, _ in self.layouts)
+
+    def anchor_mask(self, lay, algs):
+        """The conditions at a layout outside the model (growth anchors only), from its precheck."""
+        on, off = mem_known(self.conditions, self.mem)
+        m, _ = infer_mask(self.feasible().get(tuple(lay), set()), algs, self.conditions)
+        self.masks[tuple(lay)] = (m | on) & ~off
+        return self.masks[tuple(lay)]
 
     def update_masks(self, algs):
         """Masks from the precheck: the conditions true at each layout, inferred

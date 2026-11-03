@@ -82,13 +82,13 @@ def test_missing_inner():
                                cvar_values=None)
         fail = lambda *x: sys.exit("probed")
         try:
-            collmodel.extend(a, m, fail, fail, None, None, 1, None, None, None)
+            collmodel.extend(a, m, fail, fail, None, None, 1, None, None, None, None)
             assert False, "added nb without the ibcast tree"
         except SystemExit as e:
             assert "nb" in str(e) and "ibcast-intra" in str(e), e
         a.algs = ["all"]
         try:
-            collmodel.extend(a, m, fail, fail, None, None, 1, None, None, None)
+            collmodel.extend(a, m, fail, fail, None, None, 1, None, None, None, None)
         except SystemExit as e:     # nb is left out of "all"; the plain algorithms go on to the precheck
             assert str(e) == "probed", e
 

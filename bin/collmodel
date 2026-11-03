@@ -168,8 +168,9 @@ OLD_OPS = {"bcast": 1, "allreduce": 4, "reduce": 4, "ireduce": 4, "iallreduce": 
 # settings that change which requests the builder makes: a resumed job must keep them
 SAME_ON_RESUME = ["mode", "op", "algs", "seed", "batches", "sync", "prune", "nodes", "ppn_max", "max_m", "counts", "inplace",
                   "compositional", "probe_m", "base", "inner", "layouts", "anchors", "mem", "exclude_algs",
-                  "growth"]
-RESUME_DEFAULTS = {"mem": "host", "exclude_algs": "", "counts": "uniform", "inplace": False}       # for journals written before the setting existed
+                  "growth", "grid_nodes", "max_stage"]
+RESUME_DEFAULTS = {"mem": "host", "exclude_algs": "", "counts": "uniform", "inplace": False, "grid_nodes": None,
+                   "max_stage": None}       # for journals written before the setting existed
 
 
 class Terminated(Exception):
@@ -347,9 +348,17 @@ def live(a, shared=None):
     elem = coll["elem"]
     # m is the per-member block; with p blocks per buffer the largest layout must fit max_m
     # (one grid for all layouts for now: smaller layouts could go further)
-    cap = info["max_m"] // (nodes * ppn_max) if coll.get("sbuf_p") or coll.get("rbuf_p") else info["max_m"]
+    blocks = coll.get("sbuf_p") or coll.get("rbuf_p")
+    if a.grid_nodes and a.grid_nodes < nodes and not a.model:
+        srv.close()
+        sys.exit(f"--grid-nodes {a.grid_nodes}: smaller than the allocation ({nodes} nodes) when creating a model")
+    # --grid-nodes: the grid of that allocation, so that models grown over job sizes keep one grid
+    cap = info["max_m"] // ((a.grid_nodes or nodes) * ppn_max) if blocks else info["max_m"]
     sizes = [0] if coll.get("no_data") else size_grid(cap, unit=elem)
-    rewarm_m = 0 if coll.get("no_data") else min(1 << 20, cap) // elem * elem
+    own_cap = info["max_m"] // (nodes * ppn_max) if blocks else info["max_m"]
+    rewarm_m = 0 if coll.get("no_data") else min(1 << 20, own_cap) // elem * elem
+    # whether a request is beyond the server's buffers (coll_buf_bytes in the server)
+    a.over_limit = (lambda p, m: m // elem * elem * p > info["max_m"]) if blocks else None
     if a.inplace and not coll.get("inplace_ok"):
         srv.close()
         sys.exit(f"--inplace: {a.op} takes no MPI_IN_PLACE")
@@ -416,6 +425,10 @@ def replay(a):
     except NoData as e:
         sys.exit(str(e))
     layouts = sorted({(n, p) for n, p in zip(gt.N, gt.ppn)})
+    nodes = NODES
+    if a.replay_nodes:          # an allocation of this many nodes, as if the others were not there
+        nodes = a.replay_nodes
+        layouts = [(n, p) for n, p in layouts if n <= nodes]
     sizes = sorted(int(m) for m in gt.m.unique())
     rep = Replay2(load_sessions(), a.seed)
     # --replay-alias NAME=REC@single|multi|hier: NAME replays REC's data and runs only on such
@@ -447,7 +460,7 @@ def replay(a):
             ok = req["alg"] in FIXED + ["auto"]
         return {"status": "ok" if ok else "error", "msg": "" if ok else "not in the recorded data", "wall_us": 0.0}
     meta = {"replay": {"data": "replay/data", "seed": a.seed}}
-    return send, make_req, probe, layouts, sizes, NODES, max(p for _, p in layouts), max(sizes), meta, None
+    return send, make_req, probe, layouts, sizes, nodes, max(p for _, p in layouts), max(sizes), meta, None
 
 
 def make_measure(journal, send, make_req, on_reply=None):
@@ -702,8 +715,8 @@ def layout_order(lays):
 class Extender:
     """Sample algorithms into a model, one layout at a time (docs/design.md, section 12)."""
 
-    def __init__(self, a, model, measure, inner_of):
-        self.a, self.model, self.measure, self.inner_of = a, model, measure, inner_of
+    def __init__(self, a, model, measure):
+        self.a, self.model, self.measure = a, model, measure
         self.wall_us, self.n_meas, self.layouts = 0.0, 0, []
 
     def prior(self, alg, lay):
@@ -730,7 +743,7 @@ class Extender:
             self.wall_us += sum(w for _, w in out)
             self.n_meas += len(ms)
             return [t for t, _ in out]
-        known = {x: known_sampler(lambda ms, x=x: m1(x, ms), m.sizes, m.values(x, lay, self.inner_of(x)),
+        known = {x: known_sampler(lambda ms, x=x: m1(x, ms), m.sizes, m.values(x, lay, m.inner_at(x, lay) if m.is_compositional(x) else None),
                                   m.curves[x][lay]) for x in algs if x not in sample}
         prior = {x: self.prior(x, lay) for x in todo}
         s = MultiSampler(m1, algs, m.sizes, prior=prior, prune=self.a.prune or 1e9, known=known).run()
@@ -776,7 +789,32 @@ def anchors(a, model, measure, jobs_before):
             "ratio_max": round(float(np.exp(lr[np.argmax(np.abs(lr))])), 4)}
 
 
-def extend(a, model, measure, probe, inner_hash, clock, nodes, on_layout, stop_check, cost):
+def layout_algs(a, m, sample, by_name, stage, inner_text):
+    """The algorithms to measure at --layouts: those of --algs the model has, else all it has (then
+    --algs names only new ones); up to --max-stage, none that --exclude-algs leaves out of the catalog,
+    and a compositional one only with an --inner-selection that holds its inner trees. The ones in
+    sample always."""
+    named = [x for x in a.algs if x in m.algorithms and x not in sample] if a.algs != ["all"] else []
+    out = set(sample)
+    for x in named or [y for y in m.algorithms if y not in sample]:
+        if x in m.left_out or (by_name and x not in by_name):
+            continue
+        if a.max_stage is not None and stage.get(x, 1) > a.max_stage:
+            continue
+        if m.is_compositional(x):
+            if not inner_text:
+                print(f"{x}: compositional, not measured at --layouts without --inner-selection", file=sys.stderr)
+                continue
+            miss = missing_inner(by_name[x], inner_text) if x in by_name and not a.replay else []
+            if miss:
+                print(f"{x}: not measured at --layouts, --inner-selection has no tree for {', '.join(miss)}",
+                      file=sys.stderr)
+                continue
+        out.add(x)
+    return out
+
+
+def extend(a, model, measure, probe, inner_hash, clock, nodes, allocation, on_layout, stop_check, cost):
     """Add algorithms (a.algs) or layouts (a.layouts) to the model. Returns the run record."""
     m = model
     algs, bits = catalog_algs(a)
@@ -827,20 +865,30 @@ def extend(a, model, measure, probe, inner_hash, clock, nodes, on_layout, stop_c
             m.algorithms[name] = alg_info(by_name[name], bits, a.cvar_values) if name in by_name else \
                 {"leaf": None, "restrictions": [], "mask": 0, "inner": []}
             sample.add(name)
-        elif m.is_compositional(name) and m.fit_inner.get(name) != inner_hash:
+        elif a.layouts:
+            pass        # in the model: measured at --layouts only (layout_algs)
+        elif m.is_compositional(name) and any(m.inner_at(name, l) != inner_hash for l in m.curves.get(name, {})):
             print(f"{name}: measured under another inner selection; its curves are replaced", file=sys.stderr)
             m.drop_curves(name)
             sample.add(name)
         else:
             print(f"{name}: in the model already (give --layouts to measure it at more layouts)", file=sys.stderr)
     # precheck what has none: the new algorithms everywhere, every algorithm at new layouts
-    new_lays = parse_layouts(a.layouts, set(m.layouts)) if a.layouts else []
+    new_lays = parse_layouts(a.layouts, set(allocation)) if a.layouts else []
+    lay_what = layout_algs(a, m, sample, by_name, stage, inner_text) if new_lays else set()
+    if new_lays and getattr(a, "over_limit", None):
+        over = [f"{n}x{q}" for n, q in new_lays if a.over_limit(n * q, m.sizes[-1])]
+        if over:
+            sys.exit(f"--layouts: {', '.join(over)}: the model's largest size does not fit the server's buffers "
+                     "there (--max-m, or a larger --grid-nodes when the model is created)")
+    if new_lays:
+        m.extend_layouts(new_lays)
     if by_name:
         for lay in m.layouts:
             for name in m.algorithms:
                 if name in m.left_out or m.prechecked(name, lay) or name not in by_name:
                     continue
-                if name in sample or lay in new_lays:
+                if name in sample or (lay in new_lays and name in lay_what):
                     probe(lay[0], lay[1], name)
         cat_algs = [by_name[x] for x in m.algorithms if x in by_name]
         for n in m.update_masks(cat_algs):
@@ -872,11 +920,11 @@ def extend(a, model, measure, probe, inner_hash, clock, nodes, on_layout, stop_c
         if abs(np.log(x["ratio_max"])) > np.log(a.drift_tol):
             print(f"warning: an anchor moved more than {a.drift_tol}x since the earlier jobs; consider "
                   "remeasuring rather than mixing", file=sys.stderr)
-    ext = Extender(a, m, measure, lambda x: inner_hash if m.is_compositional(x) else None)
+    ext = Extender(a, m, measure)
     ext.clock_spent = lambda: clock() * nodes / 3600
     run["stop"] = "done"
     plan = [(lay, sample) for lay in layout_order(m.measured_layouts())] + \
-        [(lay, set(m.algorithms) - set(m.left_out)) for lay in new_lays]
+        [(lay, lay_what) for lay in new_lays]
     try:
         for lay, what in plan:
             why = stop_check()
@@ -893,6 +941,8 @@ def extend(a, model, measure, probe, inner_hash, clock, nodes, on_layout, stop_c
     except Terminated:
         run["stop"] = "terminated"
         print("SIGTERM: writing the model from the finished layouts", file=sys.stderr)
+    if new_lays:
+        m.trim_layouts(new_lays)
     for x in sample:
         if m.is_compositional(x):
             m.fit_inner[x] = inner_hash
@@ -956,14 +1006,26 @@ def growth_spec(a):
     return {"n": a.growth_n, "ppn": a.growth_ppn, "sizes": a.growth_sizes}
 
 
-def growth_anchors(a, model, measure, inner_hash, stop_check, on_layout, cost):
+def growth_anchors(a, model, measure, inner_hash, stop_check, on_layout, cost, allocation=None, probe=None):
     """Measure the growth anchors: every modeled algorithm at every anchor layout and size where
-    it may run, points with a growth record in the model left out. Returns the run record's
+    it may run, points with a growth record in the model left out. The layouts come from the job's
+    allocation; one outside the model gets its precheck here and stays out of the model's layouts.
+    Points beyond the server's buffers are left out and counted. Returns the run record's
     "growth_anchors" entry."""
     m = model
-    lays, ns, qs = growth_layouts(a, m.layouts)
+    lays, ns, qs = growth_layouts(a, allocation or m.layouts)
     sizes = growth_sizes(a, m.sizes)
+    outside = [l for l in lays if l not in m.layouts]
+    if outside and probe and a.catalog:
+        cat = [x for x in catalog_algs(a)[0] if x.name in m.algorithms]
+        for lay in outside:
+            for x in cat:
+                if x.name not in m.left_out and not m.prechecked(x.name, lay) and (not x.inner or inner_hash):
+                    probe(lay[0], lay[1], x.name)
+            m.anchor_mask(lay, cat)
     feas = m.feasible() if m.prechecks else None
+    over_limit = getattr(a, "over_limit", None)
+    n_over = 0
     have = {(r["alg"], r["N"], r["ppn"], r["m"]) for r in m.measurements if r.get("growth")}
     skipped, plan = [], []
     for lay in lays:
@@ -972,18 +1034,25 @@ def growth_anchors(a, model, measure, inner_hash, stop_check, on_layout, cost):
             why = "left out" if x in m.left_out else \
                 "restriction" if not m.allowed(x, mask) else \
                 "precheck" if feas is not None and x not in feas.get(lay, ()) else \
-                "inner selection" if m.is_compositional(x) and m.fit_inner.get(x) != inner_hash else None
+                "inner selection" if m.is_compositional(x) and (
+                    not inner_hash or (lay in m.curves.get(x, {}) and m.inner_at(x, lay) != inner_hash)) else None
             if why:
                 skipped.append({"alg": x, "N": lay[0], "ppn": lay[1], "why": why})
                 continue
             ms = [s for s in sizes if (x, lay[0], lay[1], s) not in have]
+            if over_limit:
+                fits = [s for s in ms if not over_limit(lay[0] * lay[1], s)]
+                n_over += len(ms) - len(fits)
+                ms = fits
             if ms:
                 plan.append((lay, x, ms))
     rec = {"N": ns, "ppn": qs, "sizes": sizes, "layouts": [list(l) for l in lays],
-           "points": sum(len(ms) for _, _, ms in plan), "skipped": skipped, "measured": 0, "stop": "done"}
+           "points": sum(len(ms) for _, _, ms in plan), "skipped": skipped, "measured": 0, "stop": "done",
+           "over_limit": n_over}
     print(f"growth anchors: {len(lays)} layouts (N {','.join(map(str, ns))} x ppn {','.join(map(str, qs))}), "
           f"sizes {','.join(map(str, sizes))}: {rec['points']} points to measure, "
-          f"{len(skipped)} (algorithm, layout) pairs left out", file=sys.stderr)
+          f"{len(skipped)} (algorithm, layout) pairs left out, "
+          f"{n_over} points beyond the server's buffers left out", file=sys.stderr)
     c0 = cost()
     try:
         last = None
@@ -1180,8 +1249,12 @@ def parse_args(argv):
     ap.add_argument("--model", metavar="MODEL", help="add to this run's unit (the one with its tags: --op, "
                     "--inplace, --counts, --mem) in this model file (collmodel/4 or /5): the algorithms of "
                     "--algs that it does not have, and the layouts of --layouts")
-    ap.add_argument("--layouts", metavar="NxPPN,...", help="with --model: measure every algorithm at these "
-                    "layouts too")
+    ap.add_argument("--layouts", metavar="NxPPN,...", help="with --model: layouts of this allocation, also beyond "
+                    "the model's, at which to measure its algorithms: those --algs names if it has them, else all, "
+                    "up to --max-stage, a compositional one only with --inner-selection")
+    ap.add_argument("--grid-nodes", type=int, metavar="N", help="the size grid of a collective with p blocks per "
+                    "buffer as on an allocation of N nodes, whatever this job's: the same value in every job of a "
+                    "model grown over job sizes, the largest that will sample it")
     ap.add_argument("--anchors", type=int, default=3, help="with --model: layouts at which to remeasure a few "
                     "points of the best algorithms, for the drift between jobs (0: none)")
     ap.add_argument("--drift-tol", type=float, default=1.10, help="warn when an anchor moved more than this")
@@ -1254,6 +1327,7 @@ def parse_args(argv):
                    help="seconds of driver idle time after which a batch starts with a re-warm request")
     g = ap.add_argument_group("replay")
     g.add_argument("--replay", action="store_true", help="replay recorded data in replay/data (see replay/README.md)")
+    g.add_argument("--replay-nodes", type=int, metavar="N", help="replay as on an allocation of N nodes")
     g.add_argument("--replay-alias", action="append", default=[], metavar="NAME=REC@single|multi|hier",
                    help="replay algorithm NAME from the recorded REC, runnable only on single-node, multi-node, "
                         "or multi-node layouts with several ranks per node (hier); e.g. release_gather=auto@single "
@@ -1493,7 +1567,8 @@ def run_unit(a, tags, t_job, shared):
                "compositional": a.compositional, "exclude_algs": a.exclude_algs, "probe_m": a.probe_m,
                "base": base_hash, "inner": inner_hash,
                "layouts": a.layouts, "anchors": a.anchors if a.model else None, "mem": a.launch,
-               "counts": a.counts, "inplace": a.inplace, "tags": tags, "growth": growth_spec(a)}
+               "counts": a.counts, "inplace": a.inplace, "tags": tags, "growth": growth_spec(a),
+               "grid_nodes": a.grid_nodes, "max_stage": a.max_stage}
         if journal.jobs:
             first = journal.jobs[0]
             err, dropped = resume_check(journal.jobs, job)
@@ -1515,9 +1590,13 @@ def run_unit(a, tags, t_job, shared):
         if not v1:
             if base is not None:
                 model = base
-                if model.sizes != [int(x) for x in sizes][:len(model.sizes)] or set(layouts) != set(model.layouts):
-                    sys.exit(f"--model {a.model}: its layouts or sizes differ from this allocation's (add to a "
-                             "model on an allocation of the same size)")
+                if model.sizes != [int(x) for x in sizes][:len(model.sizes)]:
+                    sys.exit(f"--model {a.model}: its size grid is not this allocation's (a collective with p "
+                             "blocks per buffer has a grid per allocation: give every job of the model the same "
+                             "--grid-nodes)")
+                if ppn_max != max(q for _, q in model.layouts) or not set(model.layouts) <= set(layouts):
+                    sys.exit(f"--model {a.model}: its layouts are not all in this allocation's (add to a model "
+                             "on an allocation with its ranks per node and at least its nodes)")
             else:
                 cat, bits = catalog_algs(a)
                 model = Model(a.op, sizes, layouts, {"N": [1, nodes], "ppn": [1, ppn_max],
@@ -1578,12 +1657,13 @@ def run_unit(a, tags, t_job, shared):
             return None
         prober = make_probe(journal, probe, make_req, a.probe_m, on_reply)
         if base is not None:
-            run = extend(a, model, measure, prober, inner_hash, clock, nodes, on_layout, stop_check, cost)
+            run = extend(a, model, measure, prober, inner_hash, clock, nodes, layouts, on_layout, stop_check, cost)
             if a.growth_anchors:
                 if run["stop"] in ("terminated", "deadline"):
                     growth = {"stop": "not started: " + run["stop"]}
                 else:
-                    growth = growth_anchors(a, model, measure, inner_hash, stop_check, on_layout, cost)
+                    growth = growth_anchors(a, model, measure, inner_hash, stop_check, on_layout, cost,
+                                            allocation=layouts, probe=prober)
                     if growth["stop"] != "done":
                         run["stop"] = growth["stop"]
                 run["growth_anchors"] = growth

@@ -401,6 +401,13 @@ def above(node, P):
     return node
 
 
+def guard_comm_size(a, models):
+    """--guard-above's comm size: the number, or (auto) the largest measured among the models."""
+    if a.guard_above != "auto":
+        return int(a.guard_above)
+    return max(n * q for m in models for n, q in m.measured_layouts())
+
+
 def guarded(t, opts, X, cls, P, linear_above):
     """A copy of tree t for communicators above comm size P (the sampled range): the branches
     only smaller communicators reach dropped (above), then a leaf whose algorithm is in the
@@ -565,53 +572,57 @@ def stale(model, S, out, built, tol):
                     uses.setdefault(lay, set()).add(size)
         if not uses:
             continue
-        h = m.fit_inner.get(c)
-        if not h or h not in m.inner_files:
-            notes.append(f"{c}: no inner selection recorded; not checked")
-            continue
-        old = {k[len("name="):]: v for k, v in json.loads(m.inner_files[h]).items()}
-        for inner in m.algorithms[c]["inner"]:
-            coll, comm, cond = parse_inner(inner)
-            on_device = slot == "device" and cond.get(GPU_LOCAL) != 0
-            target = pick_variant(built.get((coll, "host" if cond.get(GPU_LOCAL) == 0 else slot)), m)
-            if target is None:
-                notes.append(f"{c}: inner {inner}: {coll}'s tree is not in this output; not checked")
+        # a model grown over job sizes has run c under several inner selections, each at its own layouts
+        by_hash = {}
+        for lay in uses:
+            by_hash.setdefault(m.inner_at(c, lay), []).append(lay)
+        for h, lays in by_hash.items():
+            if not h or h not in m.inner_files:
+                notes.append(f"{c}: no inner selection recorded; not checked")
                 continue
-            if comm not in ("node_comm", "node_roots_comm", "comm", "self"):
-                notes.append(f"{c}: inner {inner}: unknown communicator; not checked")
-                continue
-            mi, Si = target
-            by_leaf = {mi.leaf(x): x for x in mi.algorithms}
-            idx = {size: i for i, size in enumerate(mi.sizes)}
-            auto = f"{coll}-intra-auto"
-            at = {}             # inner layout -> sizes at which some outer call uses c
-            for lay, sizes in uses.items():
-                r = role_layout(lay, comm)
-                if r[0] * r[1] > 1:
-                    at.setdefault(r, set()).update(sizes)
-            for r, sizes in sorted(at.items()):
-                diff = {}
-                for size in sorted(sizes):
-                    if size not in idx:
-                        continue
-                    for gpu_coll in ((True, False) if on_device else (None,)):
-                        x = x_of(mi, r, size)
-                        if gpu_coll is not None:
-                            x["cond"][GPU_COLL] = gpu_coll
-                        new = by_leaf.get(json_choice(trees[auto], x, trees, mi.conditions))
-                        was = by_leaf.get(json_choice(old[auto], x, old, mi.conditions)) if auto in old else None
-                        if new == was or new is None or was is None or was not in mi.curves:
+            old = {k[len("name="):]: v for k, v in json.loads(m.inner_files[h]).items()}
+            for inner in m.algorithms[c]["inner"]:
+                coll, comm, cond = parse_inner(inner)
+                on_device = slot == "device" and cond.get(GPU_LOCAL) != 0
+                target = pick_variant(built.get((coll, "host" if cond.get(GPU_LOCAL) == 0 else slot)), m)
+                if target is None:
+                    notes.append(f"{c}: inner {inner}: {coll}'s tree is not in this output; not checked")
+                    continue
+                if comm not in ("node_comm", "node_roots_comm", "comm", "self"):
+                    notes.append(f"{c}: inner {inner}: unknown communicator; not checked")
+                    continue
+                mi, Si = target
+                by_leaf = {mi.leaf(x): x for x in mi.algorithms}
+                idx = {size: i for i, size in enumerate(mi.sizes)}
+                auto = f"{coll}-intra-auto"
+                at = {}             # inner layout -> sizes at which some outer call uses c
+                for lay, sizes in ((x, uses[x]) for x in lays):
+                    r = role_layout(lay, comm)
+                    if r[0] * r[1] > 1:
+                        at.setdefault(r, set()).update(sizes)
+                for r, sizes in sorted(at.items()):
+                    diff = {}
+                    for size in sorted(sizes):
+                        if size not in idx:
                             continue
-                        i = idx[size]
-                        ratio = 2 ** (Si.p(new, r)[i] - Si.p(was, r)[i])
-                        if abs(np.log(ratio)) > np.log(tol):
-                            v = diff.setdefault((new, was), [])
-                            if not v or v[-1][0] != size:
-                                v.append((size, ratio))
-                for (new, was), v in diff.items():
-                    rs = [q for _, q in v]
-                    found.append((c, inner, r, [size for size, _ in v], new, was,
-                                  float(np.exp(np.mean(np.log(rs))))))
+                        for gpu_coll in ((True, False) if on_device else (None,)):
+                            x = x_of(mi, r, size)
+                            if gpu_coll is not None:
+                                x["cond"][GPU_COLL] = gpu_coll
+                            new = by_leaf.get(json_choice(trees[auto], x, trees, mi.conditions))
+                            was = by_leaf.get(json_choice(old[auto], x, old, mi.conditions)) if auto in old else None
+                            if new == was or new is None or was is None or was not in mi.curves:
+                                continue
+                            i = idx[size]
+                            ratio = 2 ** (Si.p(new, r)[i] - Si.p(was, r)[i])
+                            if abs(np.log(ratio)) > np.log(tol):
+                                v = diff.setdefault((new, was), [])
+                                if not v or v[-1][0] != size:
+                                    v.append((size, ratio))
+                    for (new, was), v in diff.items():
+                        rs = [q for _, q in v]
+                        found.append((c, inner, r, [size for size, _ in v], new, was,
+                                      float(np.exp(np.mean(np.log(rs))))))
     return found, notes
 
 
@@ -739,7 +750,8 @@ def main(argv=None):
     ap.add_argument("--buffer-swap", action="store_true", help="host model only: the file measures buffer_swap "
                     "(device buffers swap to host, then the host tree): <op>-intra-auto is "
                     "everywhere; <op>-intra-main is {gpu_local: buffer_swap, any: call=auto}")
-    ap.add_argument("--guard-above", type=int, metavar="P", help="above comm size P (the largest sampled): "
+    ap.add_argument("--guard-above", metavar="P|auto", help="above comm size P (the largest sampled; auto: each "
+                    "unit's own largest measured comm size): "
                     "each subtree's linear- or unclear-growth leaves replaced by logarithmic-growth algorithms, "
                     "the classes from the models' growth anchors (csel_tuner/growth.py); a subtree it does not "
                     "change stays as it is")
@@ -872,7 +884,8 @@ def main(argv=None):
                     branch = json_tree(swap_t, ["direct", "swap"], lambda o: "call=auto" if o == "direct"
                                        else ("algorithm=" + SWAP_LEAF, {}), names)
                     if a.guard_above is not None:
-                        branch = {"comm_size(%d)" % a.guard_above: branch, "any": "call=auto"}
+                        branch = {"comm_size(%d)" % guard_comm_size(a, [m for path, m in by_mem["device"]]): branch,
+                                  "any": "call=auto"}
                     first = {GPU_COLL: "call=auto"} if has_gpu_coll(op) else {}
                     out[f"name={op}-intra-main"] = dict(first, **{GPU_LOCAL: branch, "any": "call=auto"})
 
@@ -903,14 +916,14 @@ def main(argv=None):
                         growth_cls[id(m)] = growth_classes(m, a.linear_above)
                         report += growth_table(m, growth_cls[id(m)]) if growth_cls[id(m)] else \
                             [f"{tag_str(m.tags)}: no growth anchors; --guard-above leaves its subtrees as they are"]
-                    g, notes = guarded(t, opts, owner_sets[mask].points[mask], growth_cls[id(m)], a.guard_above,
-                                       a.linear_above)
+                    P = guard_comm_size(a, [m])
+                    g, notes = guarded(t, opts, owner_sets[mask].points[mask], growth_cls[id(m)], P, a.linear_above)
                     if notes:
-                        report += [f"guard {set_name(op, mask, mem)} above comm_size {a.guard_above}:"] + \
+                        report += [f"guard {set_name(op, mask, mem)} above comm_size {P}:"] + \
                             ["  " + n for n in notes]
                     g_json = json_tree(g, opts, lambda o, m=m: sub(o, m), names)
                     if g_json != tree_json:
-                        tree_json = {"comm_size(%d)" % a.guard_above: tree_json, "any": g_json}
+                        tree_json = {"comm_size(%d)" % P: tree_json, "any": g_json}
                 out[key] = tree_json
             present = sorted(s for s in trees if s not in dropped)
             if a.nested_dispatch:

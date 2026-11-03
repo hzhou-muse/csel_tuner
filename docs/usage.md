@@ -208,9 +208,9 @@ The budget counts every job of the run; the deadline is this job's
 ### 6.2 Add to a model
 
 `--model` adds algorithms, or layouts, to a model, measuring only what is
-new (design.md §12). The allocation must have the model's size; write to a
-new file (`--out` must not be the `--model` file, so that `--resume` finds
-the model the run started from).
+new (design.md §12). The allocation must have the model's ranks per node and
+at least its nodes; write to a new file (`--out` must not be the `--model`
+file, so that `--resume` finds the model the run started from).
 
 ```sh
 CAT=$MPICH_SRC/src/mpi/coll/coll_algorithms.txt
@@ -228,11 +228,45 @@ bin/collmodel --model bcast.json --layouts 4x24,16x8 --catalog $CAT ... --out bc
   `--prune` slower than the model's best, it is refined where it comes near
   the best, and at its crossovers with the model's algorithms both are
   measured. The model's earlier measurements are kept as they are.
-- A new layout gets every algorithm allowed there.
+- A new layout gets every algorithm allowed there, or those of `--algs` the
+  model already has (an `--algs` naming only new algorithms still means every
+  algorithm), up to `--max-stage`, without those of `--exclude-algs`. A
+  compositional algorithm needs an `--inner-selection` with its inner trees,
+  else it is left out and a line says so. Algorithms the model has keep their
+  curves at the other layouts.
 - Each run first remeasures a few points of the model's best algorithms at
   `--anchors` layouts (3) and prints the ratio to the earlier values, the
   drift between jobs; above `--drift-tol` (1.10) it warns. Anchors are kept
   in the data, flagged, and not used for the fit.
+
+**Growing a model over job sizes.** Small layouts cost less on a small
+allocation, because every point bills the whole allocation. So measure N <= 8
+on 8 nodes, then add only the larger N on larger allocations:
+
+```sh
+G="--grid-nodes 32 --catalog $CAT --site aurora --ppn 96"
+bin/collmodel --colls bcast --algs all --max-stage 1 $G --nodes 8 --out a.json ...
+L16=12x1,12x2,...,16x96
+bin/collmodel --model a.json --layouts $L16 --max-stage 1 $G --nodes 16 --out b.json ...
+bin/colltree b.json --out tb.json
+bin/collmodel --model b.json --layouts $L16 --algs all --max-stage 2 --inner-selection tb.json $G --nodes 16 --out c.json ...
+```
+
+- Give every job of the model the same `--grid-nodes`, the largest allocation
+  that will sample it. A collective with p blocks per buffer has a size grid
+  that stops at max_m / (N x ppn), and without the option each job size would
+  have its own; a job refuses a model whose grid differs.
+- A stage at the new layouts is a run of its own, like the stages of a create
+  (§6.7). A compositional algorithm runs under that run's inner selection, and
+  the model records it per layout, so the same algorithm can have run under an
+  earlier tree at smaller layouts; colltree's stale check compares each layout
+  with the tree it ran under.
+- A new layout where a run measured nothing (budget, deadline) stays out of
+  the model.
+- The drift anchors of §6.2 compare each job with the earlier ones, also
+  across job sizes.
+- Growth anchors (below) take their default ladder from the job's allocation,
+  so a larger job adds the new N and skips the points the model has.
 
 **Growth anchors** (`--growth-anchors`, design.md §12.1): a fixed set of
 points for fits of how each algorithm's time grows with N and ppn, measured
@@ -255,6 +289,11 @@ bin/collmodel --model bcast.json --growth-anchors --site aurora --nodes 32 --ppn
   run's inner selection is the one its curves ran under. The run record
   (`runs[-1].growth_anchors`) lists the points, what was measured and the
   (algorithm, layout) pairs left out with the reason.
+- N beyond the model's layouts (up to the job's allocation) are allowed, for
+  scaling data without new curves: such a layout gets its precheck and stays
+  out of the model's layouts. Points beyond the server's buffers (m x p above
+  `--max-m`, for a collective with p blocks per buffer) are left out and
+  counted in `over_limit`.
 - The records carry `growth: true`; the fit and the drift anchors skip
   them, so the sampling, the curves and the tree are the same with or
   without anchors. A top-up does not remeasure points the model has.
@@ -323,6 +362,7 @@ Also `--log`, `--resume`, `--deadline`, `--checkpoint-every` (§6.5) and
 | `--launch` | `--mem` | launch kinds, one server launch each, its units one after another: `host`, `gpu` (device buffers, one GPU per rank, `MPIR_CVAR_ENABLE_GPU_COLL=1`), `device` (device buffers without `GPU_COLL`, the older `--mem device`, which colltree does not take: use `gpu`); with `--site` it sets `LAUNCH` for `launch/config.sh`. The unit's `launch` tag |
 | `--plan` | | print each unit's algorithms by stage (from the catalog's `inner` keys: a compositional algorithm is 1 + the stage at which the trees it selects from are complete) and the trees each one needs, then exit; needs `--catalog` |
 | `--max-stage` | none | add only algorithms up to this stage (`--plan`); an explicit `--algs` above it is refused. A stage-k algorithm needs an `--inner-selection` file built (colltree) from the units' stages below k |
+| `--grid-nodes N` | the allocation | the size grid of a collective with p blocks per buffer as on N nodes; the same in every job of a model grown over job sizes (§6.2) |
 | `--growth-anchors` | off | after the sampling, measure every modeled algorithm at a fixed point set for scaling fits (§6.2); with `--model` alone, top up a model's anchors |
 | `--growth-n`, `--growth-ppn`, `--growth-sizes` | powers of two; 1, 2^⌊log2 √ppn_max⌋, ppn_max; 1k,4k,16k, max/16, max/4 | the anchors' node counts, ranks per node and sizes |
 | `--budget-h` | none | per unit: stop after this many wall-clock hours, all jobs |
@@ -479,7 +519,7 @@ predicted regret and the algorithms used.
 | `--node-aware` | off | also split on `num_nodes` and `ppn` (MPICH with pmodels/mpich#8048) |
 | `--features` | `comm_size,msg_size,pof2` | the conditions splits may use, any of `comm_size`, `msg_size`, `pof2`, `num_nodes`, `ppn` (e.g. a default file without node conditions) |
 | `--max-depth` | none | at most this many nested condition levels per subtree, applied while the tree grows; the depth is the smallest up to this whose predicted p90 regret is at most `--depth-p90` (1.10) and within `--depth-slack` (0.02) of the deepest's, else `--max-depth`. The report lists each depth's geomean, p90, max and leaves |
-| `--guard-above P` | none | above comm size P (the largest sampled): each subtree gets a `comm_size(P)` branch with the measured tree, and above it a copy (branches only smaller communicators reach dropped) whose leaves of linear-growth algorithms are replaced by the candidate with the least regret at the leaf's largest sampled comm size, among those not linear whose exponent is below `--linear-above`; leaves of unclear class are kept and reported. The classes come from the models' growth anchors (`python3 -m csel_tuner.growth MODEL.json` prints them); an algorithm without anchors stays. A subtree it does not change stays as it is |
+| `--guard-above P\|auto` | none | above comm size P (the largest sampled; `auto`: each unit's own largest measured comm size, since it differs by launch kind and by how far a unit got): each subtree gets a `comm_size(P)` branch with the measured tree, and above it a copy (branches only smaller communicators reach dropped) whose leaves of linear-growth algorithms are replaced by the candidate with the least regret at the leaf's largest sampled comm size, among those not linear whose exponent is below `--linear-above`; leaves of unclear class are kept and reported. The classes come from the models' growth anchors (`python3 -m csel_tuner.growth MODEL.json` prints them); an algorithm without anchors stays. A subtree it does not change stays as it is |
 | `--linear-above` | 0.7 | with `--guard-above`: the growth exponent that separates linear from logarithmic |
 | `--into FILE` | | write `--out` as FILE (MPICH's `src/mpi/coll/coll_selection.json`) with this run's subtrees in place of its own: the built collectives' intra subtrees replaced (old ones the run lacks removed), new ones after their collective's, every other entry byte for byte |
 | `--min-fallback-algs` | 3 | a set may call a subset's subtree that uses at least this many algorithms; a smaller one's algorithms are candidates directly |
@@ -685,6 +725,7 @@ python3 tests/test_resume.py     # a cut journal resumes to the same model; same
 python3 tests/test_restrict.py   # catalog, precheck, sets, dispatch; the builds with sets need replay data
 python3 tests/test_extend.py     # adding an algorithm and layouts to a model, resume; needs replay data
 python3 tests/test_growth_anchors.py  # growth anchors (point set, fit unchanged, top-up, resume), growth classes, guard
+python3 tests/test_grow.py           # a model grown over job sizes (layouts beyond the model, stages, anchors beyond it, guard auto)
 python3 tests/test_gpu.py        # memory-kind restrictions; colltree merging host and gpu models, swap choices
 python3 tests/test_kinds.py      # restriction kinds, variants; inner trees in --inner-selection
 python3 tests/test_stages.py     # algorithm stages from inner calls; disabled algorithms, leaf names and parameters

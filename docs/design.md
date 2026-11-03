@@ -753,7 +753,11 @@ import from their journals.
 - **Refining existing algorithms.** New layouts (`--layouts`, or the
   layout loop of §5 continuing) get every allowed algorithm, pruned against
   the prediction; their measurements merge into `data` and the fit is
-  redone.
+  redone. The layouts may lie beyond the model's, up to the job's allocation,
+  so a model grows over job sizes and each size pays only for its new N. The
+  size grid must stay one (`--grid-nodes`). A compositional algorithm's inner
+  selection is then per layout (its latest measurement there), since the
+  later layouts run under later trees.
 - **Incremental precheck.** Only (algorithm, layout) pairs without a
   precheck record are probed. Restriction bits are matched by name: a
   catalog that appends conditions is compatible (old masks keep their
