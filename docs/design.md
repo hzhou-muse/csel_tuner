@@ -853,6 +853,9 @@ import from their journals.
     keeps `gpu_coll` on its inner calls (allreduce `smp`), its curve used the device
     trees for them, while a call without `gpu_coll` uses the host trees: there the
     choice is an approximation.
+  - MPICH does not define `gpu_coll` for gatherv, scatterv and alltoallv (a rank
+    may have no buffer to query), and refuses a file that splits on it there. They
+    have no device subtrees: their device model only serves the swap choice.
   - MPICH's `dispatch=` only looks up `<prefix>-<hex>` names, so the
     prefixes keep the two kinds' subtrees apart, including their subset
     fallbacks.

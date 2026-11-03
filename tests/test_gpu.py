@@ -219,6 +219,25 @@ def test_stale_either_tree():
         assert "stale: bcast smp's inner bcast-intra@node_comm" in text, text
 
 
+def test_no_gpu_coll_collective():
+    """MPICH refuses gpu_coll under gatherv, scatterv and alltoallv: no key and no gpu subtrees."""
+    with tempfile.TemporaryDirectory() as tmp:
+        h, g, t = (os.path.join(tmp, x) for x in ("h.json", "g.json", "t.json"))
+        fast = model("gpu", gpu_model().algorithms, {l: GPU | GPU_COLL for l in LAYOUTS}, {
+            "binomial": (10.0, 1e3, lambda l: True), "scatter": (30.0, 1e4, lambda l: True),
+            "buffer_swap": (0.1, 1e8, lambda l: True)})
+        for path, m in ((h, host_model()), (g, fast)):
+            d = m.to_dict()
+            d["tags"] = dict(d["tags"], coll="gatherv")
+            json.dump({"format": "collmodel/5", "units": [d]}, open(path, "w"))
+        text = colltree([h, g, "--out", t, "--node-aware"])
+        assert "gatherv: no gpu_coll in MPICH" in text, text
+        out = json.load(open(t))
+        assert not [k for k in out if "-intra-gpu" in k], sorted(out)
+        assert out["name=gatherv-intra-auto"] == "call=gatherv-intra-0", out["name=gatherv-intra-auto"]
+        assert list(out["name=gatherv-intra-main"]) == ["gpu_local", "any"], out["name=gatherv-intra-main"]
+
+
 def test_old_names():
     """A model recorded when the condition was named gpu still loads, as gpu_local."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -300,5 +319,6 @@ if __name__ == "__main__":
     test_no_swap()
     test_swap_needs_curves()
     test_stale_either_tree()
+    test_no_gpu_coll_collective()
     test_old_names()
     print("ok")

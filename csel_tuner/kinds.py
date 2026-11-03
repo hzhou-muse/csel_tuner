@@ -154,6 +154,12 @@ def is_device(launch):
     return LAUNCH.get(launch, {}).get("gpu_local") == 1
 
 
+def has_gpu_coll(coll):
+    """Whether MPICH defines gpu_coll for a collective: a rank of these three may have no buffer to
+    query, so a tuning file that splits on it there fails to load (pmodels/mpich#8089)."""
+    return coll not in _with_nb(["gatherv", "scatterv", "alltoallv"])
+
+
 def canon_condition(name):
     """A restriction's current name: MPICH's gpu became gpu_local (pmodels/mpich#8089), and older
     catalogs and model files still say gpu."""

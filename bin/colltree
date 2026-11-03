@@ -71,6 +71,8 @@ the same algorithm:
   the collective there. gpu_coll comes first, because it implies gpu_local and
   has a tree of its own. Above --guard-above the choice is call=auto, and a point
   whose algorithm has no curve in the gpu model is reported and not counted.
+  MPICH does not define gpu_coll for gatherv, scatterv and alltoallv, so they have
+  no gpu subtrees and no gpu_coll key: their gpu model only serves the swap choice.
   Only a user's call reaches main; the inner calls of a compositional algorithm
   select from auto, so they don't swap.
 
@@ -97,7 +99,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 import numpy as np  # noqa: E402
 
-from csel_tuner.kinds import canon_condition, has_msg_size, is_device, is_rooted, measured, variants  # noqa: E402
+from csel_tuner.kinds import canon_condition, has_gpu_coll, has_msg_size, is_device, is_rooted, measured, variants  # noqa: E402
 from csel_tuner.model import ModelFile, parse_sel, tag_str  # noqa: E402
 from csel_tuner.restrict import GPU_COLL, GPU_LOCAL, role_layout, set_name, set_prefix  # noqa: E402
 from csel_tuner.single import is_pof2  # noqa: E402
@@ -799,6 +801,9 @@ def main(argv=None):
         for mem in ("host", "device"):
             if mem not in by_mem:
                 continue
+            if mem == "device" and not has_gpu_coll(op):
+                report.append(f"{op}: no gpu_coll in MPICH: no gpu subtrees; its gpu model only serves the swap choice")
+                continue
             trees, jobs = {}, []        # jobs: (mask, layouts, Sets), built in order of increasing mask
             fs = feats if has_msg_size(op) else [f for f in feats if f != "m"]
             for path, m in by_mem[mem]:
@@ -826,7 +831,8 @@ def main(argv=None):
                                        else ("algorithm=" + SWAP_LEAF, {}), names)
                     if a.guard_above is not None:
                         branch = {"comm_size(%d)" % a.guard_above: branch, "any": "call=auto"}
-                    out[f"name={op}-intra-main"] = {GPU_COLL: "call=auto", GPU_LOCAL: branch, "any": "call=auto"}
+                    first = {GPU_COLL: "call=auto"} if has_gpu_coll(op) else {}
+                    out[f"name={op}-intra-main"] = dict(first, **{GPU_LOCAL: branch, "any": "call=auto"})
 
             def sub(o, m):
                 if isinstance(o, tuple):
