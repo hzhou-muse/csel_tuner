@@ -67,15 +67,16 @@ def test_stages():
     assert stages(Stages(catalog(), ["nb"]), "bcast", "host") == {"binomial": 1, "smp": 2}
 
 
-def test_inner_without_gpu_coll():
-    """An inner call with [gpu_coll=0] is counted as a plain call into the caller's unit's tree."""
-    text = CATALOG.replace("inner: bcast-intra@node_comm, bcast-intra@node_roots_comm",
-                           "inner: bcast-intra@node_comm[gpu_coll=0], bcast-intra@node_roots_comm[gpu_coll=0]")
-    text = text.replace("2  - gpu:   ", "2  - gpu_local:   ").replace("restrictions: gpu\n", "restrictions: gpu_local\n")
-    assert text != CATALOG and "gpu_local" in text
-    st = Stages(catalog(text))
+def test_inner_needs_both_trees():
+    """An algorithm decides in its code whether an inner call keeps gpu_coll, so on a device launch
+    an inner call on a sub-communicator needs the host tree too, even without buffer_swap's wait."""
+    deps = {x.name: d for _, x, d in Stages(catalog()).unit_stages("bcast", "gpu")}
+    assert deps["smp"] == [("bcast", "gpu"), ("bcast", "host")]
+    assert deps["buffer_swap"] == [("bcast", "host")]
+    st = Stages(catalog())
     assert stages(st, "bcast", "gpu") == {"binomial": 1, "smp": 5, "nb": 2, "buffer_swap": 4}
-    assert stages(st, "bcast", "host") == {"binomial": 1, "smp": 3, "nb": 2}
+    # without buffer_swap, the gpu tree alone is complete at 2, but the host tree only at 3
+    assert stages(Stages(catalog(), ["buffer_swap"]), "bcast", "gpu")["smp"] == 4
 
 
 def test_catalog_details():
@@ -105,6 +106,6 @@ def test_catalog_details():
 
 if __name__ == "__main__":
     test_stages()
-    test_inner_without_gpu_coll()
+    test_inner_needs_both_trees()
     test_catalog_details()
     print("ok")

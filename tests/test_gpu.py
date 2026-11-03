@@ -195,6 +195,30 @@ def test_swap_needs_curves():
         assert "scatter has no curve on device buffers" in text, text
 
 
+def test_stale_either_tree():
+    """An inner call of a device unit may select with or without gpu_coll, so a change in the host
+    tree alone is reported for it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        h, g, t = (os.path.join(tmp, x) for x in ("h.json", "g.json", "t.json"))
+        host_model().save(h)
+        base = gpu_model()
+        algs = dict(base.algorithms, smp=dict(alg(HIER), inner=["bcast-intra@node_comm"]))
+        masks = {l: GPU | GPU_COLL | (HIER if l[0] > 1 and l[1] > 1 else 0) for l in LAYOUTS}
+        m = model("gpu", algs, masks, {
+            "binomial": (10.0, 1e3, lambda l: True), "scatter": (30.0, 1e4, lambda l: True),
+            "buffer_swap": (40.0, 1e6, lambda l: True), "ipc_read": (0.5, 1e7, lambda l: l[0] == 1),
+            "smp": (0.1, 1e8, lambda l: l[0] > 1 and l[1] > 1)})
+        m.save(g)
+        colltree([h, g, "--out", t, "--node-aware"])
+        old = json.load(open(t))
+        # the gpu trees are the same; the host subtree was another algorithm
+        old["name=bcast-intra-0"] = {"algorithm=MPIR_Bcast_intra_scatter": {}}
+        m.fit_inner["smp"] = m.add_inner_file(json.dumps(old))
+        m.save(g)
+        text = colltree([h, g, "--out", t, "--node-aware"])
+        assert "stale: bcast smp's inner bcast-intra@node_comm" in text, text
+
+
 def test_old_names():
     """A model recorded when the condition was named gpu still loads, as gpu_local."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -275,5 +299,6 @@ if __name__ == "__main__":
     test_warmup_no_zero()
     test_no_swap()
     test_swap_needs_curves()
+    test_stale_either_tree()
     test_old_names()
     print("ok")

@@ -596,11 +596,14 @@ internal call. `main` chooses whether a device call swaps (§12.3); inner calls
 select from `auto` and don't swap, and `buffer_swap` as a leaf of a `gpu_coll`
 subtree still applies to a user's call.
 
-An algorithm that mixes the user's buffers with host temporaries (reduce and
-scan `smp`) clears `gpu_coll` on its inner calls, which then select from the host
-tree. A catalog that shows this as `[gpu_coll=0]` lets the stale check time such a
-call correctly; its stage is computed as for a plain call into the unit's tree,
-which at worst waits longer than it must.
+Whether an inner call on device buffers keeps `gpu_coll` is the algorithm's own
+decision, made in its code, and the catalog does not say. Today reduce and scan
+`smp` clear it because they use host temporaries; with device temporaries they
+could keep it. So the tuner assumes neither: such an inner call needs both the
+device tree and the host tree (the stages), and the stale check compares its
+choices with and without `gpu_coll`, which can report a change in the tree the
+call doesn't use. An inner selection file holds both trees, so the measurement
+uses whichever the algorithm reaches.
 
 **Kinds of restrictions.** The catalog lists restrictions without saying
 how a tuner treats them; that is csel_tuner's policy, in

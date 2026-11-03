@@ -8,10 +8,10 @@
 A plain algorithm is stage 1. A compositional algorithm (one with inner calls)
 is 1 + the largest stage of the trees its inner calls select from, a tree
 being (collective, launch kind): an inner call selects from the collective's
-own tree on the caller's launch, or with [gpu_local=0] from its host tree. With
-[gpu_coll=0] (an inner call mixing the user's buffers with host temporaries)
-it reaches the host tree, and is counted as a plain call into the caller's unit's
-tree, which at worst waits longer than it must. A tree
+own tree on the caller's launch, or with [gpu_local=0] from its host tree. On a
+launch of device buffers an inner call can also reach the host tree without
+that: the algorithm decides in its code whether its inner calls keep gpu_coll,
+and the catalog does not say. So it needs both trees. A tree
 is complete at the largest stage of its algorithms, with two kinds left out:
 those whose inner calls lead back into the chain being computed (a cycle:
 smp's inner bcast calls cannot run smp, so smp's bcast tree is bcast without
@@ -24,7 +24,7 @@ A stage-k algorithm is measured with an inner selection file
 (--inner-selection) holding the trees it depends on, built from algorithms
 up to stage k - 1: stage 1 needs none.
 """
-from .kinds import LAUNCH
+from .kinds import LAUNCH, is_device
 
 
 class Stages:
@@ -46,9 +46,13 @@ class Stages:
         """The trees an algorithm's inner calls select from: [(coll, launch)], in order, unique."""
         out = []
         for i in alg.inner:
-            d = (i.section.rsplit("-", 1)[0], "host" if i.cond.get("gpu_local") == 0 else launch)
-            if d not in out:
-                out.append(d)
+            coll = i.section.rsplit("-", 1)[0]
+            kinds = ["host"] if i.cond.get("gpu_local") == 0 else [launch]
+            if is_device(launch) and "host" not in kinds:
+                kinds.append("host")
+            for d in [(coll, k) for k in kinds]:
+                if d not in out:
+                    out.append(d)
         return out
 
     def alg_stage(self, coll, launch, alg, stack=frozenset()):

@@ -541,9 +541,10 @@ def stale(model, S, out, built, tol):
     measured under, and where the inner collective's model predicts the two
     choices more than `tol` apart: [(alg, inner, inner layout, [sizes], new, old, ratio)].
     built: {(coll, "host"|"device"): [(model, Sets)]} of this output. An inner call with [gpu_local=0]
-    has host buffers. One with [gpu_coll=0] has this unit's buffers but selects without gpu_coll,
-    so it reaches the host tree's choices, and is timed by the model of those buffers. Inner calls
-    select from auto: only a user's call can swap, in main."""
+    has host buffers. Any other inner call of a device unit may select with or without gpu_coll,
+    which the algorithm decides in its code (it may clear the condition for host temporaries, or
+    keep it with device ones), so both choices are compared, each timed by the unit's model. Inner
+    calls select from auto: only a user's call can swap, in main."""
     m = model
     trees = {k[len("name="):]: v for k, v in out.items()}
     slot = "device" if is_device(m.mem) else "host"
@@ -564,7 +565,7 @@ def stale(model, S, out, built, tol):
         old = {k[len("name="):]: v for k, v in json.loads(m.inner_files[h]).items()}
         for inner in m.algorithms[c]["inner"]:
             coll, comm, cond = parse_inner(inner)
-            local = cond.get(GPU_COLL) == 0 and slot == "device"
+            on_device = slot == "device" and cond.get(GPU_LOCAL) != 0
             target = pick_variant(built.get((coll, "host" if cond.get(GPU_LOCAL) == 0 else slot)), m)
             if target is None:
                 notes.append(f"{c}: inner {inner}: {coll}'s tree is not in this output; not checked")
@@ -586,17 +587,20 @@ def stale(model, S, out, built, tol):
                 for size in sorted(sizes):
                     if size not in idx:
                         continue
-                    x = x_of(mi, r, size)
-                    if local:
-                        x["cond"][GPU_COLL] = False
-                    new = by_leaf.get(json_choice(trees[auto], x, trees, mi.conditions))
-                    was = by_leaf.get(json_choice(old[auto], x, old, mi.conditions)) if auto in old else None
-                    if new == was or new is None or was is None or was not in mi.curves:
-                        continue
-                    i = idx[size]
-                    ratio = 2 ** (Si.p(new, r)[i] - Si.p(was, r)[i])
-                    if abs(np.log(ratio)) > np.log(tol):
-                        diff.setdefault((new, was), []).append((size, ratio))
+                    for gpu_coll in ((True, False) if on_device else (None,)):
+                        x = x_of(mi, r, size)
+                        if gpu_coll is not None:
+                            x["cond"][GPU_COLL] = gpu_coll
+                        new = by_leaf.get(json_choice(trees[auto], x, trees, mi.conditions))
+                        was = by_leaf.get(json_choice(old[auto], x, old, mi.conditions)) if auto in old else None
+                        if new == was or new is None or was is None or was not in mi.curves:
+                            continue
+                        i = idx[size]
+                        ratio = 2 ** (Si.p(new, r)[i] - Si.p(was, r)[i])
+                        if abs(np.log(ratio)) > np.log(tol):
+                            v = diff.setdefault((new, was), [])
+                            if not v or v[-1][0] != size:
+                                v.append((size, ratio))
                 for (new, was), v in diff.items():
                     rs = [q for _, q in v]
                     found.append((c, inner, r, [size for size, _ in v], new, was,
