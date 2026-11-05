@@ -133,13 +133,15 @@ def internal(node):
     return [node] + internal(node.split[2]) + internal(node.split[3])
 
 
-def prune_to(root, tol=0.005, max_regret=1.5):
+def prune_to(root, tol=0.005, max_regret=1.5, leaf_cost=None):
     """Weakest-link pruning to the smallest tree whose predicted geomean
     regret is within tol of the full tree's. A split is never merged if the
     merged leaf would give some point a predicted regret above max_regret
     (unless that point already has it), so the few expensive mistakes that
     a geomean hides are kept out. Returns the pruned root (in place) and the
-    path [(leaves, geomean regret)]."""
+    path [(leaves, geomean regret)]. With leaf_cost (the mean log2 regret over the tree's points
+    that one leaf must buy) pruning stops at that price instead of at tol, so subtrees pruned at
+    one price spend their leaves where they buy the most."""
     n, R = root.n, root.R
     gm = lambda: 2 ** (root.subtree_cost() / n)
     full = gm()
@@ -160,10 +162,12 @@ def prune_to(root, tol=0.005, max_regret=1.5):
             cand.append(((node.cost - node.subtree_cost()) / (nl - 1), id(node), node))
         if not cand:
             break
-        _, _, weakest = min(cand)
+        price, _, weakest = min(cand)
+        if leaf_cost is not None and price / n > leaf_cost:
+            break
         keep = weakest.split
         weakest.split = None
-        if gm() > full * (1 + tol):
+        if leaf_cost is None and gm() > full * (1 + tol):
             weakest.split = keep           # one step too far: undo and stop
             break
         path.append((len(root.leaves()), gm()))

@@ -105,7 +105,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 import numpy as np  # noqa: E402
 
 from csel_tuner.kinds import canon_condition, has_gpu_coll, has_msg_size, is_device, is_rooted, measured, variants  # noqa: E402
-from csel_tuner.model import ModelFile, parse_sel, tag_str  # noqa: E402
+from csel_tuner.model import ModelFile, parse_sel, tag_key, tag_str  # noqa: E402
 from csel_tuner.restrict import GPU_COLL, GPU_LOCAL, role_layout, set_name, set_prefix  # noqa: E402
 from csel_tuner.single import is_pof2  # noqa: E402
 from csel_tuner.growth import classes as growth_classes, table as growth_table  # noqa: E402
@@ -179,6 +179,9 @@ def top_entries(text):
     return out
 
 
+COMPACT = False         # --compact
+
+
 def format_main(v, indent):
     """A subtree value in the style of MPICH's coll_selection.json: the brace on the line after
     its key, the first level of conditions 8 columns in, deeper ones 4 more, an algorithm leaf
@@ -186,11 +189,23 @@ def format_main(v, indent):
     if isinstance(v, str):
         return json.dumps(v)
 
+    def inline(k, x):
+        return json.dumps(k) + ": " + json.dumps(x, separators=(", ", ": "))
+
+    def is_leaf(x):
+        return isinstance(x, dict) and len(x) == 1 and next(iter(x)).startswith("algorithm=")
+
     def obj(o, ind, step):
         lines = []
         for i, (k, x) in enumerate(o.items()):
             sep = "," if i < len(o) - 1 else ""
-            if k.startswith("algorithm="):
+            if COMPACT and k.startswith("algorithm="):
+                lines.append(" " * ind + inline(k, x) + sep)
+            elif COMPACT and is_leaf(x):
+                lines.append(" " * ind + json.dumps(k) + ": {" + inline(*next(iter(x.items()))) + "}" + sep)
+            elif COMPACT and isinstance(x, dict):
+                lines.append(" " * ind + json.dumps(k) + ": {\n" + obj(x, ind + 4, 4) + "\n" + " " * ind + "}" + sep)
+            elif k.startswith("algorithm="):
                 if x:
                     body = ",\n".join(" " * (ind + 4) + "%s: %s" % (json.dumps(pk), json.dumps(pv))
                                        for pk, pv in x.items())
@@ -271,20 +286,35 @@ def points(layouts, sizes):
     return {k: np.array(v, float) for k, v in X.items()}
 
 
+def on_grid(v, base):
+    """Each value rounded up to a power of base: a split can then only fall on such a power,
+    and v <= t for t on the grid is the same test on the true value."""
+    powers = np.array([float(base ** k) for k in range(64) if base ** k < 2 ** 62])
+    return powers[np.searchsorted(powers, np.maximum(v, 1))]
+
+
 def fit(X, L, feats, a):
     """The pruned tree and its pruning path; with --max-depth, the depth chosen by p90 (the
     smallest depth up to --max-depth whose predicted p90 regret is at most --depth-p90 and within
     --depth-slack of the deepest's), its table [(depth, geomean, p90, max, leaves)] in t.depths."""
+    X = dict(X)
+    if a.msg_grid:
+        X["m"] = on_grid(X["m"], a.msg_grid)
+    if a.comm_grid:
+        X["p"] = on_grid(X["p"], a.comm_grid)
     if a.max_depth is None:
-        t, path = prune_to(fit_tree(X, L, feats, max_leaves=a.max_leaves), a.tol, a.max_regret)
+        t, path = prune_to(fit_tree(X, L, feats, max_leaves=a.max_leaves), a.tol, a.max_regret, a.leaf_cost)
         t.depths = None
         return t, path
-    fits = {d: prune_to(fit_tree(X, L, feats, max_leaves=a.max_leaves, max_depth=d), a.tol, a.max_regret)
+    fits = {d: prune_to(fit_tree(X, L, feats, max_leaves=a.max_leaves, max_depth=d), a.tol, a.max_regret, a.leaf_cost)
             for d in range(1, a.max_depth + 1)}
     table = [(d, *regret_stats(t), len(t.leaves())) for d, (t, _) in fits.items()]
     deepest = table[-1][2]
-    pick = next((d for d, gm, p90, mx, nl in table if p90 <= a.depth_p90 and p90 <= deepest + a.depth_slack),
-                a.max_depth)
+    if a.leaf_cost is not None:         # the depth that is worth its leaves at the same price
+        pick = min(table, key=lambda r: np.log2(r[1]) + a.leaf_cost * r[4])[0]
+    else:
+        pick = next((d for d, gm, p90, mx, nl in table if p90 <= a.depth_p90 and p90 <= deepest + a.depth_slack),
+                    a.max_depth)
     t, path = fits[pick]
     t.depths = (pick, table)
     return t, path
@@ -329,6 +359,18 @@ class Sets:
             self.pred[(alg, lay)] = self.m.predict(alg, *lay)
         return self.pred[(alg, lay)]
 
+    def also_p(self, O):
+        """Like p(), of an --also model; NaN where it has no curve."""
+        def p(alg, lay):
+            k = (id(O), alg, lay)
+            if k not in self.pred:
+                try:
+                    self.pred[k] = np.asarray(O.predict(alg, *lay), float)
+                except (KeyError, ValueError):
+                    self.pred[k] = np.full(len(O.sizes), np.nan)
+            return self.pred[k]
+        return p
+
     def effective(self, mask):
         """The subtree MPICH's dispatch uses for a layout of this mask: its largest built subset."""
         return max((s for s in self.trees if s & ~mask == 0), key=lambda s: (bin(s).count("1"), -s))
@@ -361,17 +403,30 @@ class Sets:
         have = set(algs)
         calls = [s for s in sorted(self.trees) if s != mask and s & ~mask == 0
                  and len(self.algs_used(s)) >= self.a.min_fallback_algs and self.algs_used(s) <= have]
-        X = points(lays, self.sizes)
-        cols = [np.concatenate([self.p(x, lay) for lay in lays]) for x in algs]
+        # the points of this model, then of each --also model at the layouts of this set
+        parts = [(self.sizes, lays, self.p)]
+        for O in getattr(m, "also", ()):
+            ol = list(O.layouts) if mask == self.base or mask == 0 else unit_sets(O, self.base).get(mask, [])
+            if ol:
+                parts.append((np.array(O.sizes), ol, self.also_p(O)))
+        Xs = [points(ol, sz) for sz, ol, _ in parts]
+        X = {k: np.concatenate([x[k] for x in Xs]) for k in Xs[0]}
+        cols = [np.concatenate([p(x, lay) for sz, ol, p in parts for lay in ol]) for x in algs]
         for s in calls:
-            col = np.empty(len(X["p"]))
-            for i in range(len(col)):
-                x = {k: v[i] for k, v in X.items()}
-                lay = (int(x["N"]), int(x["ppn"]))
-                col[i] = self.p(self.choose(s, x), lay)[i % len(self.sizes)]
-            cols.append(col)
+            col = []
+            for (sz, ol, p), Xp in zip(parts, Xs):
+                for i in range(len(Xp["p"])):
+                    x = {k: v[i] for k, v in Xp.items()}
+                    lay = (int(x["N"]), int(x["ppn"]))
+                    col.append(p(self.choose(s, x), lay)[i % len(sz)])
+            cols.append(np.array(col))
         opts = list(algs) + [("call", s) for s in calls]
-        t, path = fit(X, np.column_stack(cols), self.feats, self.a)
+        L = np.column_stack(cols)
+        bad = ~np.isfinite(L)
+        if bad.any():                   # no curve in one model: costs twice the slowest it has there
+            top = np.nanmax(np.where(bad, np.nan, L), axis=1) + 1
+            L[bad] = top[np.nonzero(bad)[0]]
+        t, path = fit(X, L, self.feats, self.a)
         self.trees[mask] = (t, opts)
         self.points[mask] = X
         self.mine.append(mask)
@@ -735,6 +790,16 @@ def main(argv=None):
                     "predicted p90 regret is at most this ...")
     ap.add_argument("--depth-slack", type=float, default=0.02, help="... and within this of the deepest "
                     "tree's p90; otherwise --max-depth")
+    ap.add_argument("--also", action="append", default=[], metavar="MODEL", help="fit jointly with this model of "
+                    "another network: every tree minimizes the regret over the points of both; the positional model's "
+                    "layouts decide the guard and the swap, so give the one with the most layouts first")
+    ap.add_argument("--leaf-cost", type=float, help="prune by price instead of --tol: a leaf stays only if it lowers "
+                    "its subtree's mean log2 regret by this much; one price across subtrees spends the leaves where "
+                    "they buy the most")
+    ap.add_argument("--msg-grid", type=int, metavar="B", help="size thresholds only at powers of B (readable numbers)")
+    ap.add_argument("--comm-grid", type=int, metavar="B", help="comm size thresholds only at powers of B")
+    ap.add_argument("--compact", action="store_true", help="with --into: a leaf-only branch on one line, parameters "
+                    "inline, the brace on the key's line")
     ap.add_argument("--features", metavar="COND,...", help="the CSEL conditions splits may use, from comm_size, "
                     "msg_size, pof2, num_nodes, ppn (default: comm_size, msg_size, pof2; with --node-aware also "
                     "num_nodes, ppn)")
@@ -820,6 +885,23 @@ def main(argv=None):
                              f"({tag_str(m.tags)}; the first: {tag_str(seen[base][1].tags)} in {seen[base][0]}); "
                              "select one with --unit")
                 seen[base] = (path, m)
+    for path in a.also:
+        try:
+            bytag = {tag_key(u.tags): u for u in ModelFile.load(path).units}
+        except (OSError, ValueError) as e:
+            sys.exit(str(e))
+        for by_mem in colls.values():
+            for slot, ums in by_mem.items():
+                for p, m in ums:
+                    O = bytag.get(tag_key(m.tags))
+                    if O is None:
+                        print(f"{path}: no unit like {tag_str(m.tags)}; not in the joint fit", file=sys.stderr)
+                        continue
+                    if slot == "device":
+                        drop_bit(O, 1 << O.conditions.index(GPU_LOCAL))
+                        drop_bit(O, 1 << O.conditions.index(GPU_COLL))
+                    variant_base(O)
+                    m.also = getattr(m, "also", []) + [O]
     if a.buffer_swap and any("device" in by_mem for by_mem in colls.values()):
         sys.exit("--buffer-swap: give host models only")
     feats = ["N", "ppn", "p", "m", "pof2"] if a.node_aware else ["p", "m", "pof2"]
@@ -877,7 +959,8 @@ def main(argv=None):
             report += variant_report(op, mem, [m for path, m in by_mem[mem]], trees)
             if mem == "host" and "device" in by_mem:
                 host_units = [(m, S) for path, m, S in built[(op, mem)]]
-                swap_t, lines = swap_tree(op, host_units, by_mem["device"], fs, a)
+                swap_t, lines = swap_tree(op, host_units, by_mem["device"] + [(p, O) for p, m in by_mem["device"]
+                                                                              for O in getattr(m, "also", ())], fs, a)
                 report += lines
                 swap_fit[op] = swap_t
                 if swap_t is not None:
@@ -961,6 +1044,8 @@ def main(argv=None):
     depth = json_depth(written)
     if depth > 64:
         sys.exit(f"tree nests {depth} levels; MPICH's parser allows 64 (try a larger --tol)")
+    global COMPACT
+    COMPACT = a.compact
     if a.into:
         with open(a.into) as f:
             text = f.read()
