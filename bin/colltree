@@ -179,13 +179,10 @@ def top_entries(text):
     return out
 
 
-COMPACT = False         # --compact
-
-
 def format_main(v, indent):
-    """A subtree value in the style of MPICH's coll_selection.json: the brace on the line after
-    its key, the first level of conditions 8 columns in, deeper ones 4 more, an algorithm leaf
-    "algorithm=...":{} (its parameters indented under it)."""
+    """A subtree value for coll_selection.json: the brace on the line after its top-level key, the
+    first level of conditions 8 columns in, deeper ones 4 more with the brace on the key's line, and
+    an algorithm leaf or a branch that is only a leaf on one line, parameters inline."""
     if isinstance(v, str):
         return json.dumps(v)
 
@@ -199,24 +196,14 @@ def format_main(v, indent):
         lines = []
         for i, (k, x) in enumerate(o.items()):
             sep = "," if i < len(o) - 1 else ""
-            if COMPACT and k.startswith("algorithm="):
+            if k.startswith("algorithm="):
                 lines.append(" " * ind + inline(k, x) + sep)
-            elif COMPACT and is_leaf(x):
+            elif is_leaf(x):
                 lines.append(" " * ind + json.dumps(k) + ": {" + inline(*next(iter(x.items()))) + "}" + sep)
-            elif COMPACT and isinstance(x, dict):
-                lines.append(" " * ind + json.dumps(k) + ": {\n" + obj(x, ind + 4, 4) + "\n" + " " * ind + "}" + sep)
-            elif k.startswith("algorithm="):
-                if x:
-                    body = ",\n".join(" " * (ind + 4) + "%s: %s" % (json.dumps(pk), json.dumps(pv))
-                                       for pk, pv in x.items())
-                    lines.append(" " * ind + json.dumps(k) + ":{\n" + body + "\n" + " " * ind + "}" + sep)
-                else:
-                    lines.append(" " * ind + json.dumps(k) + ":{}" + sep)
             elif isinstance(x, str):
                 lines.append(" " * ind + "%s: %s" % (json.dumps(k), json.dumps(x)) + sep)
             else:
-                lines.append(" " * ind + json.dumps(k) + ":\n" + " " * ind + "{\n" + obj(x, ind + step, 4)
-                             + "\n" + " " * ind + "}" + sep)
+                lines.append(" " * ind + json.dumps(k) + ": {\n" + obj(x, ind + 4, 4) + "\n" + " " * ind + "}" + sep)
         return "\n".join(lines)
     return "{\n" + obj(v, indent + 8, 4) + "\n" + " " * indent + "}"
 
@@ -798,8 +785,6 @@ def main(argv=None):
                     "they buy the most")
     ap.add_argument("--msg-grid", type=int, metavar="B", help="size thresholds only at powers of B (readable numbers)")
     ap.add_argument("--comm-grid", type=int, metavar="B", help="comm size thresholds only at powers of B")
-    ap.add_argument("--compact", action="store_true", help="with --into: a leaf-only branch on one line, parameters "
-                    "inline, the brace on the key's line")
     ap.add_argument("--features", metavar="COND,...", help="the CSEL conditions splits may use, from comm_size, "
                     "msg_size, pof2, num_nodes, ppn (default: comm_size, msg_size, pof2; with --node-aware also "
                     "num_nodes, ppn)")
@@ -1044,8 +1029,6 @@ def main(argv=None):
     depth = json_depth(written)
     if depth > 64:
         sys.exit(f"tree nests {depth} levels; MPICH's parser allows 64 (try a larger --tol)")
-    global COMPACT
-    COMPACT = a.compact
     if a.into:
         with open(a.into) as f:
             text = f.read()
