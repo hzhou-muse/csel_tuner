@@ -532,10 +532,14 @@ predicted regret and the algorithms used.
 | `--max-regret` | 1.5 | pruning never lets a point's predicted regret exceed this |
 | `--node-aware` | off | also split on `num_nodes` and `ppn` (MPICH with pmodels/mpich#8048) |
 | `--features` | `comm_size,msg_size,pof2` | the conditions splits may use, any of `comm_size`, `msg_size`, `pof2`, `num_nodes`, `ppn` (e.g. a default file without node conditions) |
+| `--also MODEL` | | fit jointly with this model of another network, repeatable: every tree minimizes the regret over the points of both, each point's regret against the best algorithm of its own model. The units pair up by their tags. The positional model decides the guard's growth classes and the staleness report, and its layouts must include the other's for the swap choice, so give the one with the most layouts first |
+| `--leaf-cost` | none | prune by price instead of `--tol`: stop when the cheapest split left is worth more than this much of the subtree's mean log2 regret per leaf removed (0.016 is about 1.1%). One price across the subtrees keeps leaves only where they are worth it. With `--max-depth`, each subtree's depth is the one with the lowest log2 geomean regret + price x leaves. `--max-regret` still holds. The price is relative to the subtree's own points, not to a whole file's regret |
+| `--msg-grid B`, `--comm-grid B` | none | thresholds of `msg_size`, `comm_size` only at powers of B. The fit runs on this grid, so its regret already includes them |
 | `--max-depth` | none | at most this many nested condition levels per subtree, applied while the tree grows; the depth is the smallest up to this whose predicted p90 regret is at most `--depth-p90` (1.10) and within `--depth-slack` (0.02) of the deepest's, else `--max-depth`. The report lists each depth's geomean, p90, max and leaves |
 | `--guard-above P\|auto` | none | above comm size P (the largest sampled; `auto`: each unit's own largest measured comm size, since it differs by launch kind and by how far a unit got): each subtree gets a `comm_size(P)` branch with the measured tree, and above it a copy (branches only smaller communicators reach dropped) whose leaves of linear-growth algorithms are replaced by the candidate with the least regret at the leaf's largest sampled comm size, among those not linear whose exponent is below `--linear-above`; leaves of unclear class are kept and reported. The classes come from the models' growth anchors (`python3 -m csel_tuner.growth MODEL.json` prints them); an algorithm without anchors stays. A subtree it does not change stays as it is |
 | `--linear-above` | 0.7 | with `--guard-above`: the growth exponent that separates linear from logarithmic |
 | `--into FILE` | | write `--out` as FILE (MPICH's `src/mpi/coll/coll_selection.json`) with this run's subtrees in place of its own: the built collectives' intra subtrees replaced (old ones the run lacks removed), new ones after their collective's, every other entry byte for byte |
+| `--compact` | off | with `--into`: a branch that is only a leaf on one line, parameters inline, the brace on the key's line; the same JSON in fewer lines |
 | `--min-fallback-algs` | 3 | a set may call a subset's subtree that uses at least this many algorithms; a smaller one's algorithms are candidates directly |
 | `--stale-tol` | 1.05 | report a compositional algorithm's changed inner choice when the two are predicted more than this apart |
 | `--nested-dispatch` | off | dispatch on restrictions with nested conditions instead of `dispatch=` (MPICH without pmodels/mpich#8048) |
@@ -546,6 +550,15 @@ node conditions), spliced into the source tree:
 
 ```sh
 bin/colltree run.json --features comm_size,msg_size,pof2 --max-depth 4 \
+    --into $MPICH_SRC/src/mpi/coll/coll_selection.json --out $MPICH_SRC/src/mpi/coll/coll_selection.json
+```
+
+A smaller, more readable default from the runs of two networks (one tree serves both; leaves
+pruned at one price, round thresholds, one line per leaf):
+
+```sh
+bin/colltree a.json --also b.json --features comm_size,msg_size,pof2 --max-depth 3 \
+    --leaf-cost 0.016 --msg-grid 4 --min-fallback-algs 1 --guard-above 64 --compact \
     --into $MPICH_SRC/src/mpi/coll/coll_selection.json --out $MPICH_SRC/src/mpi/coll/coll_selection.json
 ```
 
