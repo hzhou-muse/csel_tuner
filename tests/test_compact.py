@@ -1,5 +1,5 @@
 """bin/colltree's options for a small default file: a joint fit of two models (--also), pruning
-by price (--leaf-cost), thresholds on a grid (--msg-grid, --comm-grid) and the compact layout."""
+by price (--leaf-cost), thresholds on a grid (--msg-grid, --comm-grid), and the layout --into writes."""
 import io
 import json
 import os
@@ -104,20 +104,14 @@ def test_also_fits_both():
     assert leaves(build([one, two])["name=bcast-intra-0"]) == ["MPIR_Bcast_intra_b"]
 
 
-def test_compact_layout():
+def test_layout():
     subtree = {"comm_size(8)": {"msg_size(4)": {"algorithm=X": {"k": 2, "t": "kary"}},
                                 "any": {"algorithm=Y": {}}},
                "any": "call=auto"}
-    ct.COMPACT = False
-    standard = ct.format_main(subtree, 4)
-    ct.COMPACT = True
-    try:
-        compact = ct.format_main(subtree, 4)
-    finally:
-        ct.COMPACT = False
-    assert json.loads(compact) == json.loads(standard) == subtree
-    assert len(compact.splitlines()) < len(standard.splitlines())
-    assert '"msg_size(4)": {"algorithm=X": {"k": 2, "t": "kary"}},' in compact
+    text = ct.format_main(subtree, 4)
+    assert json.loads(text) == subtree
+    assert '"msg_size(4)": {"algorithm=X": {"k": 2, "t": "kary"}},' in text
+    assert '"comm_size(8)": {\n' in text
 
 
 if __name__ == "__main__":
@@ -126,5 +120,5 @@ if __name__ == "__main__":
     test_on_grid()
     test_msg_grid()
     test_also_fits_both()
-    test_compact_layout()
+    test_layout()
     print("ok")

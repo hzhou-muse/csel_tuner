@@ -539,7 +539,6 @@ predicted regret and the algorithms used.
 | `--guard-above P\|auto` | none | above comm size P (the largest sampled; `auto`: each unit's own largest measured comm size, since it differs by launch kind and by how far a unit got): each subtree gets a `comm_size(P)` branch with the measured tree, and above it a copy (branches only smaller communicators reach dropped) whose leaves of linear-growth algorithms are replaced by the candidate with the least regret at the leaf's largest sampled comm size, among those not linear whose exponent is below `--linear-above`; leaves of unclear class are kept and reported. The classes come from the models' growth anchors (`python3 -m csel_tuner.growth MODEL.json` prints them); an algorithm without anchors stays. A subtree it does not change stays as it is |
 | `--linear-above` | 0.7 | with `--guard-above`: the growth exponent that separates linear from logarithmic |
 | `--into FILE` | | write `--out` as FILE (MPICH's `src/mpi/coll/coll_selection.json`) with this run's subtrees in place of its own: the built collectives' intra subtrees replaced (old ones the run lacks removed), new ones after their collective's, every other entry byte for byte |
-| `--compact` | off | with `--into`: a branch that is only a leaf on one line, parameters inline, the brace on the key's line; the same JSON in fewer lines |
 | `--min-fallback-algs` | 3 | a set may call a subset's subtree that uses at least this many algorithms; a smaller one's algorithms are candidates directly |
 | `--stale-tol` | 1.05 | report a compositional algorithm's changed inner choice when the two are predicted more than this apart |
 | `--nested-dispatch` | off | dispatch on restrictions with nested conditions instead of `dispatch=` (MPICH without pmodels/mpich#8048) |
@@ -558,7 +557,7 @@ pruned at one price, round thresholds, one line per leaf):
 
 ```sh
 bin/colltree a.json --also b.json --features comm_size,msg_size,pof2 --max-depth 3 \
-    --leaf-cost 0.016 --msg-grid 4 --min-fallback-algs 1 --guard-above 64 --compact \
+    --leaf-cost 0.016 --msg-grid 4 --min-fallback-algs 1 --guard-above 64 \
     --into $MPICH_SRC/src/mpi/coll/coll_selection.json --out $MPICH_SRC/src/mpi/coll/coll_selection.json
 ```
 
