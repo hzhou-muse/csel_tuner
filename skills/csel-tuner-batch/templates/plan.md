@@ -105,9 +105,9 @@ into the Log, per step:
 2. <add step>: the `set ...` lines, the `anchors:` line (a `warning:` is a
    stop condition), any `two-stage check` lines, the total line (`stop:
    done` expected).
-3. Each tree: its subtree lines, the dispatch line
-   (`python3 -c "import json; print(json.load(open('results/<t>.json'))['name=<op>-intra-auto'])"`,
-   expected `<dispatch>`), and any `stale:` lines.
+3. Each tree: its subtree lines, the set names
+   (`python3 -c "import json; print(sorted(json.load(open('results/<t>.json'))))"`,
+   expected `<sets>`), and any `stale:` lines.
 
 ## Step 4: job 2
 
