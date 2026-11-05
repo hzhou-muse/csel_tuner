@@ -301,7 +301,7 @@ predicted regret of choosing a at point i):
   second rule a geomean target lets a few expensive choices through, e.g.
   an algorithm that wins at power-of-two p chosen for the nearby
   non-power-of-two p, where it is much slower.
-- **Output:** a CSEL subtree `name=<op>-intra-auto`. A right-leaning chain
+- **Output:** a CSEL subtree, e.g. `name=<op>-intra-0`. A right-leaning chain
   of splits becomes one object of ordered sibling conditions ending in
   `any`; a numeric split on value v uses the canonical threshold form
   `cond(t)` (v ≤ t); a leaf is `{"algorithm=MPIR_<Coll>_intra_<alg>":
@@ -400,9 +400,9 @@ an anchor `"anchor": true`. An algorithm's model across layouts is a
 LayoutModel (§5) over all its curves, fitted on load. collmodel/2 and /3,
 written by earlier versions, convert with `bin/collmodel --import`.
 
-**Tuning JSON:** a CSEL subtree (`name=bcast-intra-auto`), loaded with
-`MPIR_CVAR_COLL_SELECTION_JSON_FILE`; it replaces MPICH's built-in subtree
-of that name.
+**Tuning JSON:** CSEL subtrees, the restriction sets (`name=bcast-intra-0`,
+...), loaded with `MPIR_CVAR_COLL_SELECTION_JSON_FILE`; each replaces MPICH's
+built-in subtree of that name.
 
 ## 9. Evaluation by replay
 
@@ -531,14 +531,22 @@ catalog `bcast-intra-200` for single-node communicators
   `"call=<op>-intra-0"`, whose time at a point is that of r0's choice
   there. With one restricted algorithm it is a short split on size.
 - A set with no layouts (mutually exclusive conditions) produces no subtree.
-- `<op>-intra-auto` is the dispatch, `"dispatch=<op>-intra(<bits>)"`
-  (pmodels/mpich#8048): MPICH evaluates the restrictions in `bits` with one
-  call and continues in the matching subtree; a set with no subtree uses
-  its largest present subset, at worst `r0` (with positive restrictions a
-  subset's algorithms are always allowed), resolved when the file is
-  loaded. It costs about 20 ns per call less than nested conditions for two
-  restrictions. `--nested-dispatch` writes the nested conditions instead,
-  each evaluated once on a path, for an MPICH without `dispatch=`.
+- The sets carry MPICH's reserved names, `<op>-intra-<mask>`, and MPICH's
+  built-in `call=auto` routes to them: it evaluates the restrictions its sets
+  use with one call and continues in the matching set; a combination with no
+  set uses its largest present subset, at worst `r0` (with positive
+  restrictions a subset's algorithms are always allowed), resolved when the
+  file is loaded. So the file holds only the sets. A set reaches a subset with
+  `call=auto(<mask>)`, which leaves out the restrictions the subset lacks;
+  MPICH allows `call=` only to free names, so a set cannot reach one whose
+  restrictions do not hold. MPICH refuses two sets of the same size that could
+  both match one call, since it cannot know which combinations happen;
+  colltree adds their union, a one-line `call=auto(<mask>)` to the one the
+  older dispatch picked. `--format legacy` writes the older form for an MPICH
+  without the reserved names: `<op>-intra-auto` as the dispatch,
+  `"dispatch=<op>-intra(<bits>)"` (pmodels/mpich#8048; about 20 ns per call
+  less than nested conditions for two restrictions), or with
+  `--nested-dispatch` the nested conditions, and `call=` between sets.
 
 **Stages for compositional algorithms.** A compositional algorithm runs
 collectives through the selection: its `inner` calls in the catalog, as
@@ -846,39 +854,39 @@ import from their journals.
   on their own. All ranks of a call must reach the same algorithm, which
   decides how each device condition can shape the file:
   - `gpu_coll` is the same on all ranks, so it selects the device model's own
-    subtrees, with the prefix `<op>-intra-gpu`. A `gpu_coll` call never falls
-    back to a host subtree. `gpu_local` and `gpu_coll` hold everywhere in the
-    model (`--launch gpu`), so they are dropped from the masks. An algorithm
-    restricted to them alone (`buffer_swap`) is unrestricted there, and
-    `<op>-intra-gpu-0` is that model's fallback.
-  - `<op>-intra-auto` tests `gpu_coll` first:
-    `{"gpu_coll": "dispatch=<op>-intra-gpu(<bits>)", "any": <host dispatch>}`.
-  - `gpu_local` can differ between ranks, and MPICH allows it only in the tree
-    `main` reaches, choosing between `call=auto` and an algorithm restricted on
-    it. So a device call without `gpu_coll` runs the host tree's algorithm A,
-    directly or after a swap, and ranks converge either way, because the swap
-    clears the condition and continues in `auto`, reaching A. colltree fits this
-    two-way choice per collective, on the device model's curves for A and
-    `buffer_swap`: `<op>-intra-main` is `{"gpu_coll": "call=auto", "gpu_local":
-    <the choice>, "any": "call=auto"}`, and `main` sends the collective there.
-    `gpu_coll` comes first because it implies `gpu_local` and has its own tree.
-    Keeping the choice out of the host tree costs host calls only a flag test.
+    sets, MPICH's `-gpu` variant, `<op>-intra-<mask>-gpu`. `call=auto` falls back
+    within the variant, and to a host set only where no `-gpu` set matches.
+    `gpu_local` and `gpu_coll` hold everywhere in the model (`--launch gpu`), so
+    they are dropped from the masks. An algorithm restricted to them alone
+    (`buffer_swap`) is unrestricted there, and `<op>-intra-0-gpu` is that model's
+    fallback.
+  - `gpu_local` can differ between ranks. MPICH takes it through a local set
+    first, `<op>-intra-<gpu_local bit>`, whose leaves are an algorithm restricted
+    on it or `call=auto(<that bit>)`, where the host ranks go; a `gpu_coll` call
+    never takes it. So a device call without `gpu_coll` runs the host sets'
+    algorithm A, directly or after a swap, and ranks converge either way, because
+    the swap clears the condition and selects again, reaching A. colltree fits
+    this two-way choice per collective, on the device model's curves for A and
+    `buffer_swap`, as the local set. Host calls skip it in the same table lookup.
     The device collection already holds both curves, so this needs no collection
     of its own. `--launch gpu` has `gpu_coll` set, so where A is compositional and
     keeps `gpu_coll` on its inner calls (allreduce `smp`), its curve used the device
-    trees for them, while a call without `gpu_coll` uses the host trees: there the
-    choice is an approximation.
+    sets for them, while a call without `gpu_coll` uses the host sets: there the
+    choice is an approximation. Inner calls select with `call=auto` and the flags
+    they inherit, so on device buffers they reach the local set too, unless their
+    algorithm cleared `gpu_local`. (`--format legacy` writes the choice into
+    `<op>-intra-main`, `{"gpu_coll": "call=auto", "gpu_local": <the choice>,
+    "any": "call=auto"}`, which `main` sends the collective to, and the device
+    subtrees under the prefix `<op>-intra-gpu`, with `<op>-intra-auto` testing
+    `gpu_coll` first; there inner calls select from `auto` and never swap.)
   - A more restricted tree is written only if it is unique. No algorithm requires
     `gpu_coll` today, so the `gpu_coll` subtrees differ only where their free choice
     among all algorithms beats the host tree's algorithm with the swap choice; if it
-    never chooses differently they and their keys are left out. Likewise a
-    restricted subtree that chooses like its dispatch fallback.
+    never chooses differently they are left out. Likewise a restricted subtree
+    that chooses like its fallback.
   - MPICH does not define `gpu_coll` for gatherv, scatterv and alltoallv (a rank
     may have no buffer to query), and refuses a file that splits on it there. They
     have no device subtrees: their device model only serves the swap choice.
-  - MPICH's `dispatch=` only looks up `<prefix>-<hex>` names, so the
-    prefixes keep the two kinds' subtrees apart, including their subset
-    fallbacks.
 
 ### 12.4 Batch strategies
 

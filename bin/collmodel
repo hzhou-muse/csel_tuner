@@ -671,9 +671,11 @@ def alg_info(x, bits, cvar_values=None, old=None):
 
 def missing_inner(x, text):
     """The sections of a compositional algorithm's inner calls that the tuning file (its text) has
-    no tree for (name=<section>-auto), e.g. ibcast-intra for nb."""
+    no tree for (name=<section>-0, its base set, or the legacy name=<section>-auto), e.g.
+    ibcast-intra for nb."""
     names = set(json.loads(text)) if text else set()
-    return sorted({i.section for i in x.inner if "name=%s-auto" % i.section not in names})
+    return sorted({i.section for i in x.inner
+                   if "name=%s-auto" % i.section not in names and "name=%s-0" % i.section not in names})
 
 
 def compositional_names(a, algs):

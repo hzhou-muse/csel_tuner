@@ -32,8 +32,7 @@ def test_v2_then_tree():
         subprocess.run([sys.executable, os.path.join(REPO, "bin", "colltree"), model, "--out", tuning],
                        check=True, stdout=subprocess.DEVNULL)
         t = json.load(open(tuning))
-        assert list(t) == ["name=bcast-intra-0", "name=bcast-intra-auto"]
-        assert t["name=bcast-intra-auto"] == "call=bcast-intra-0"
+        assert list(t) == ["name=bcast-intra-0"]           # MPICH's call=auto reaches it
 
 
 if __name__ == "__main__":

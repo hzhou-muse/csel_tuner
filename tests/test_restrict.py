@@ -257,11 +257,15 @@ def test_two_set_replay():
         subprocess.run([sys.executable, os.path.join(REPO, "bin", "colltree"), model, "--out", tuning],
                        check=True, capture_output=True)
         t = json.load(open(tuning))
-        assert set(t) == {"name=bcast-intra-0", "name=bcast-intra-10", "name=bcast-intra-auto"}
-        assert t["name=bcast-intra-auto"] == "dispatch=bcast-intra(0x10)"
+        assert set(t) == {"name=bcast-intra-0", "name=bcast-intra-10"}     # reached by MPICH's call=auto
         assert "MPIDI_POSIX_mpi_bcast_release_gather" in json.dumps(t["name=bcast-intra-10"])
         subprocess.run([sys.executable, os.path.join(REPO, "bin", "colltree"), model, "--out", tuning,
-                        "--nested-dispatch"], check=True, capture_output=True)
+                        "--format", "legacy"], check=True, capture_output=True)
+        t = json.load(open(tuning))
+        assert set(t) == {"name=bcast-intra-0", "name=bcast-intra-10", "name=bcast-intra-auto"}
+        assert t["name=bcast-intra-auto"] == "dispatch=bcast-intra(0x10)"
+        subprocess.run([sys.executable, os.path.join(REPO, "bin", "colltree"), model, "--out", tuning,
+                        "--format", "legacy", "--nested-dispatch"], check=True, capture_output=True)
         t = json.load(open(tuning))
         assert t["name=bcast-intra-auto"] == {"MPIDI_CH4_release_gather": "call=bcast-intra-10",
                                               "any": "call=bcast-intra-0"}
@@ -297,7 +301,7 @@ def test_compositional_add_replay():
         assert d.runs[-1]["algs"] == ["smp"] and d.runs[-1]["anchors"]["points"] > 0
         r = run(os.path.join(REPO, "bin", "colltree"), m2, "--out", t2)
         t = json.load(open(t2))
-        assert t["name=bcast-intra-auto"] == "dispatch=bcast-intra(0x18)"
+        assert "name=bcast-intra-auto" not in t and "name=bcast-intra-10" in t
         assert "MPIR_Bcast_intra_smp" in json.dumps(t["name=bcast-intra-8"])
         # a compositional algorithm needs the file of its inner calls when live; a second run with
         # another file replaces its curves

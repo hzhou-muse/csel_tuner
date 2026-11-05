@@ -93,6 +93,8 @@ def leaves(obj):
 def colltree(argv):
     from importlib.machinery import SourceFileLoader
     ct = SourceFileLoader("colltree", os.path.join(REPO, "bin", "colltree")).load_module()
+    if "--format" not in argv:          # these tests check the legacy layout; test_reserved the new one
+        argv = list(argv) + ["--format", "legacy"]
     with redirect_stdout(io.StringIO()) as buf:
         ct.main(argv)
     return buf.getvalue()
