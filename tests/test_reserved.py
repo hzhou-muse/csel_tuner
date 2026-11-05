@@ -1,5 +1,5 @@
 """bin/colltree's default output, MPICH's reserved set names (--format reserved): the sets only,
-reached by MPICH's built-in call=auto; fallbacks and tie aliases as call=auto(<mask>); the -gpu
+reached by MPICH's built-in dispatch; fallbacks and tie aliases as dispatch(<mask>); the -gpu
 variant and the local set. Each file selects what the legacy layout selects, at every point."""
 import io
 import itertools
@@ -44,21 +44,21 @@ def legacy_choice(trees, coll, x, bits):
 
 def calls(obj):
     if isinstance(obj, str):
-        return [obj] if obj.startswith("call=") else []
+        return [obj] if obj.startswith(("call=", "dispatch")) else []
     return [c for v in obj.values() for c in calls(v)]
 
 
 def check_mpich_rules(trees, coll, bits):
     """The load-time rules of MPICH's reserved names: no name=main, auto, -auto or dispatch; call=
-    names free subtrees only; in a set, every call=auto(r) leaves out one of its restrictions, and in
+    names free subtrees only; in a set, every dispatch(r) leaves out one of its restrictions, and in
     the local set only local ones, its own among them."""
     local = sum(1 << k for k, b in enumerate(bits) if b.endswith("_local"))
     sets = {name: mask for (mask, gpu), name in set_masks(trees, coll).items()}
     assert set(trees) == set(sets), sorted(set(trees) - set(sets))
     for name, mask in sets.items():
         for c in calls(trees[name]):
-            assert c.startswith("call=auto("), (name, c)
-            r = int(c[len("call=auto("):-1], 16)
+            assert c.startswith("dispatch("), (name, c)
+            r = int(c[len("dispatch("):-1], 16)
             assert r & mask, (name, c)
             if mask & local:
                 assert r & local and not r & ~local, (name, c)
@@ -82,7 +82,7 @@ def test_gpu_reserved():
     assert sorted(new) == ["bcast-intra-0", "bcast-intra-0-gpu", "bcast-intra-2"], sorted(new)
     check_mpich_rules(new, "bcast-intra", GPU_BITS)
     local = new["bcast-intra-2"]
-    assert set(calls(local)) == {"call=auto(2)"}, local
+    assert set(calls(local)) == {"dispatch(2)"}, local
     # a gpu_coll call never swaps, so the -gpu sets choose without buffer_swap
     assert "algorithm=MPIR_Coll_buffer_swap" not in json.dumps(new["bcast-intra-0-gpu"])
     for x in points(GPU_BITS, LAYOUTS, SIZES):
@@ -117,7 +117,7 @@ def test_tie_alias():
         old = run([path], "--node-aware", "--min-fallback-algs", "1", "--format", "legacy")
     assert {"bcast-intra-0", "bcast-intra-1", "bcast-intra-2", "bcast-intra-3"} <= set(new), sorted(new)
     # the union of the tied sets goes where the legacy dispatch went: the lower mask, 1
-    assert new["bcast-intra-3"] == "call=auto(2)", new["bcast-intra-3"]
+    assert new["bcast-intra-3"] == "dispatch(2)", new["bcast-intra-3"]
     check_mpich_rules(new, "bcast-intra", bits)
     for x in points(bits, LAYOUTS, SIZES):
         assert legacy_choice(old, "bcast-intra", x, bits) == file_choice(new, "bcast-intra", x, bits), x

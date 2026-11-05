@@ -251,7 +251,7 @@ def set_masks(trees, coll):
 
 
 def auto_lookup(trees, coll, m, gpu, bits):
-    """The set MPICH's call=auto continues in (pmodels/mpich, reserved set names): for a gpu_coll
+    """The set MPICH's dispatch continues in (pmodels/mpich, reserved set names): for a gpu_coll
     call the -gpu set with the most restrictions among those in m, local restrictions left out,
     else the host one; otherwise a local set (a mask with a <name>_local restriction) first, then
     the other host sets, local restrictions left out. Two of the same size are an error, as MPICH
@@ -282,10 +282,10 @@ def auto_lookup(trees, coll, m, gpu, bits):
 def file_choice(trees, coll, x, bits):
     """The algorithm a whole file (its subtrees by name, keys without "name=") selects for a call
     of `coll` (e.g. "bcast-intra"): from the legacy <coll>-auto dispatch if the file has one, else
-    from MPICH's built-in call=auto over the reserved set names."""
+    from MPICH's built-in dispatch over the reserved set names."""
     if coll + "-auto" in trees:
         return json_choice(trees[coll + "-auto"], x, trees, bits)
-    return json_choice("call=auto", x, trees, bits, coll=coll)
+    return json_choice("dispatch", x, trees, bits, coll=coll)
 
 
 def json_choice(obj, x, trees=None, bits=None, coll=None):
@@ -294,8 +294,9 @@ def json_choice(obj, x, trees=None, bits=None, coll=None):
     per node, "pof2": 0/1, "cond": {restrictive condition: bool}}: siblings
     are tried in order, the first true condition is followed, "any" always
     is; "call=NAME" continues in trees["NAME"] (a file's subtrees, keys
-    without "name="); "call=auto" and "call=auto(MASK)" continue in the
-    restriction set of `coll` (e.g. "bcast-intra") that auto_lookup finds,
+    without "name="); "dispatch(MASK)", and "dispatch" where a selection
+    starts, continue in the restriction set of `coll` (e.g. "bcast-intra")
+    that auto_lookup finds,
     the restrictions in MASK left out (cumulative within one search;
     gpu_coll from x["cond"]); "dispatch=PREFIX(BITS)" (the older format)
     continues in PREFIX-<the bits whose condition holds, in hex>, or its
@@ -312,12 +313,12 @@ def json_choice(obj, x, trees=None, bits=None, coll=None):
             subs = [s for s in range(m + 1) if s & ~m == 0 and "%s-%x" % (prefix, s) in trees]
             obj = trees["%s-%x" % (prefix, max(subs, key=lambda s: (bin(s).count("1"), -s)))]
             continue
-        if isinstance(obj, str) and coll is not None and (obj == "call=auto" or obj.startswith("call=auto(")):
+        if isinstance(obj, str) and coll is not None and (obj == "dispatch" or obj.startswith("dispatch(")):
             gpu_coll = [k for k, b in enumerate(bits) if b.endswith("_coll")]
             if m is None:
                 m = sum(1 << k for k, b in enumerate(bits) if x["cond"].get(b, False) and k not in gpu_coll)
-            if obj != "call=auto":
-                m &= ~int(obj[len("call=auto("):-1], 16)
+            if obj != "dispatch":
+                m &= ~int(obj[len("dispatch("):-1], 16)
             gpu = any(x["cond"].get(bits[k], False) for k in gpu_coll)
             obj = trees[auto_lookup(trees, coll, m, gpu, bits)]
             continue

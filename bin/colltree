@@ -35,10 +35,10 @@ supersets':
   --min-fallback-algs algorithms (a smaller one is not worth the call: its
   algorithms are candidates directly). A call is scored at S's own layouts:
   at each point, the predicted time of what that subtree chooses there;
-MPICH's built-in call=auto continues in the set of the restrictions that
+MPICH's built-in dispatch continues in the set of the restrictions that
 hold, or its largest present subset (restrictions are positive, so whatever a
 subset allows is allowed there too; at worst set 0). A set reaches a subset's
-subtree with "call=auto(<mask>)", leaving out the restrictions of the
+subtree with "dispatch(<mask>)", leaving out the restrictions of the
 collective's sets that the subset lacks, since MPICH allows call= only to free
 names; two sets of the same size that could both match a call are refused by
 MPICH, so colltree adds their union as an alias to the one the legacy dispatch
@@ -63,13 +63,13 @@ the same algorithm:
 
 - gpu_coll is the same on all ranks, so it selects subtrees of their own: the
   gpu model's, the -gpu variant "name=<op>-intra-<S in hex>-gpu", in which
-  call=auto falls back within the variant (to "<op>-intra-0-gpu"), and only if
+  the dispatch falls back within the variant (to "<op>-intra-0-gpu"), and only if
   none matches to the host sets. Both conditions hold in the whole model, so they
   are left out of S and of the algorithms' restrictions (an algorithm restricted
   to gpu alone, e.g. buffer_swap, is unrestricted there).
 - gpu_local can differ between ranks, so MPICH takes it through a local set
   first, "name=<op>-intra-<gpu_local bit>" (e.g. -400), whose leaves are
-  buffer_swap, which clears the flags and selects again, or "call=auto(<that
+  buffer_swap, which clears the flags and selects again, or "dispatch(<that
   bit>)", where the host ranks go. A device call without gpu_coll therefore runs
   the host sets' algorithm, directly or after a swap, and a gpu_coll call never
   takes the local set. Where the gpu model predicts buffer_swap faster than the
@@ -86,7 +86,7 @@ the same algorithm:
 A more restricted tree is written only if it is unique: a subtree that chooses like
 its fallback at every point it was fitted on, and the gpu subtrees if they choose
 like the host sets and the swap choice at every point of the gpu models. These are
-reported. The inner calls of a compositional algorithm select with call=auto and the
+reported. The inner calls of a compositional algorithm select from the dispatch with the
 flags they inherit, so on device buffers they can reach the local set (legacy: from
 auto, so only a user's call swaps, in main).
 
@@ -613,7 +613,7 @@ def stale(model, S, out, built, tol):
     has host buffers. Any other inner call of a device unit may select with or without gpu_coll,
     which the algorithm decides in its code (it may clear the condition for host temporaries, or
     keep it with device ones), so both choices are compared, each timed by the unit's model. Inner
-    calls select with call=auto and the flags they inherit, so on device buffers they can reach the
+    calls select from the dispatch with the flags they inherit, so on device buffers they can reach the
     local set (legacy: from auto, so only a user's call can swap, in main)."""
     m = model
     trees = {k[len("name="):]: v for k, v in out.items()}
@@ -1026,7 +1026,7 @@ def main(argv=None):
                     # legacy: main's choice before call=auto; reserved: the local set, whose other leaf
                     # leaves gpu_local out, where the host ranks go
                     L = local_bit(by_mem["host"][0][1])
-                    stay = "call=auto" if legacy else "call=auto(%x)" % L
+                    stay = "call=auto" if legacy else "dispatch(%x)" % L
                     branch = json_tree(swap_t, ["direct", "swap"], lambda o: stay if o == "direct"
                                        else ("algorithm=" + SWAP_LEAF, {}), names)
                     if a.guard_above is not None:
@@ -1061,7 +1061,7 @@ def main(argv=None):
                         return "call=" + set_name(op, kept(o[1]), mem)
                     # leave out every restriction of the family that the subset lacks: the lookup
                     # then lands on the subset whatever else holds
-                    return "call=auto(%x)" % (U & ~kept(o[1]))
+                    return "dispatch(%x)" % (U & ~kept(o[1]))
                 return ("algorithm=" + m.leaf(o), leaf_params(m, o))
             for mask, (t, opts) in sorted(trees.items()):
                 if mask in dropped:
@@ -1086,7 +1086,7 @@ def main(argv=None):
             if not legacy:
                 aliases, lines = tie_aliases(present)
                 for u, w in sorted(aliases.items()):
-                    out[f"name={set_name(op, u, mem)}"] = "call=auto(%x)" % (U & ~w)
+                    out[f"name={set_name(op, u, mem)}"] = "dispatch(%x)" % (U & ~w)
                 if aliases:
                     report.append(f"{op} {mem}: tied sets resolved by aliases: " + ", ".join(
                         f"{set_name(op, u, mem)} -> {set_name(op, w, mem)}" for u, w in sorted(aliases.items())))

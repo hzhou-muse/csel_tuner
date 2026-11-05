@@ -541,7 +541,7 @@ predicted regret and the algorithms used.
 | `--into FILE` | | write `--out` as FILE (MPICH's `src/mpi/coll/coll_selection.json`) with this run's subtrees in place of its own: the built collectives' intra subtrees replaced (old ones the run lacks removed), new ones after their collective's, every other entry byte for byte |
 | `--min-fallback-algs` | 3 | a set may call a subset's subtree that uses at least this many algorithms; a smaller one's algorithms are candidates directly |
 | `--stale-tol` | 1.05 | report a compositional algorithm's changed inner choice when the two are predicted more than this apart |
-| `--format` | `reserved` | `reserved`: MPICH's reserved set names, reached by its built-in `call=auto`; `legacy`: the `<op>-intra-auto` dispatches, `<op>-intra-main` swap choices and `name=main`, for an MPICH without the reserved names |
+| `--format` | `reserved` | `reserved`: MPICH's reserved set names, reached by its built-in dispatch; `legacy`: the `<op>-intra-auto` dispatches, `<op>-intra-main` swap choices and `name=main`, for an MPICH without the reserved names |
 | `--nested-dispatch` | off | with `--format legacy`: dispatch on restrictions with nested conditions instead of `dispatch=` (MPICH without pmodels/mpich#8048) |
 | `--param ALG.KEY=VALUE` | | override an algorithm leaf's parameter, e.g. `tree.k=4`; by default the leaves get the parameters the model recorded (the CVAR values of the measurements, design §8) |
 
@@ -577,17 +577,17 @@ file stops `MPI_Init` with the line and column of the error.
 The output has a subtree per restriction set, named by MPICH's reserved set
 names (the suffix is the mask of true conditions, bit k = the restriction with
 index k in `coll_algorithms.txt`): `name=bcast-intra-0`,
-`name=bcast-intra-200`, .... MPICH's built-in `call=auto` continues in the
+`name=bcast-intra-200`, .... MPICH's built-in dispatch continues in the
 set with the most restrictions that hold: `bcast-intra-200`
 (`MPIDI_CH4_release_gather`, bit 9) on a single-node communicator,
 `bcast-intra-10` (`hierarchical`, bit 4) on a hierarchical one, else
 `bcast-intra-0`. A restricted set's leaves are the algorithms allowed there
 or a subset's subtree that uses at least `--min-fallback-algs` algorithms,
 each scored at the set's own layouts; the file reaches the subset with
-`call=auto(<mask>)`, leaving out the restrictions the subset lacks (MPICH
+`dispatch(<mask>)`, leaving out the restrictions the subset lacks (MPICH
 allows `call=` only to free names). MPICH refuses two sets of the same size
 that could both match a call, so where two such sets exist colltree adds
-their union as a one-line `call=auto(<mask>)` to the one the legacy dispatch
+their union as a one-line `dispatch(<mask>)` to the one the legacy dispatch
 used (the more restrictions, then the lower mask) and reports it. To see
 which algorithms ran, set `MPIR_CVAR_DUMP_COLL_ALGO_COUNTERS=0` (rank 0
 prints its counts at finalize). An MPICH without the reserved names needs
@@ -598,13 +598,13 @@ pmodels/mpich#8048), and `call=` between the sets.
 With a model of device buffers (`--launch gpu`) too, the file also has that
 model's sets, the `-gpu` variant: `bcast-intra-<mask>-gpu`. In them `gpu_local`
 and `gpu_coll` are left out of the mask, because they hold everywhere in that
-model. `call=auto` takes them for a `gpu_coll` call, falling back within the
+model. The dispatch takes them for a `gpu_coll` call, falling back within the
 variant and, if none matches, to the host sets. The model's catalog must have
 both restrictions.
 
 `gpu_local` can differ between the ranks of a call, so MPICH takes it through a
 local set, `bcast-intra-<gpu_local bit>` (e.g. `bcast-intra-400`), first: its
-leaves are `buffer_swap` (pmodels/mpich#8089) or `call=auto(400)`, which leaves
+leaves are `buffer_swap` (pmodels/mpich#8089) or `dispatch(400)`, which leaves
 `gpu_local` out and goes where the host ranks go. A device-buffer call without
 `gpu_coll` therefore runs the host sets' algorithm, directly or after a swap,
 and a `gpu_coll` call never takes the local set. colltree makes that choice from
@@ -612,8 +612,8 @@ the same model: where `buffer_swap` is predicted faster than the host sets'
 choice, the file has the local set, by size and layout. No extra collection is
 needed. It reports how many points swap, and the algorithms with no curve on
 device buffers, whose points it leaves out. Above `--guard-above` there is no
-swap data, so the choice there is `call=auto(400)`. Inner calls select with
-`call=auto` and the flags they inherit, so on device buffers they reach the local
+swap data, so the choice there is `dispatch(400)`. Inner calls select from the
+dispatch with the flags they inherit, so on device buffers they reach the local
 set too, unless their algorithm cleared `gpu_local`. gatherv, scatterv and
 alltoallv have no `gpu_coll` in MPICH, so they get no device sets, only the local
 set. A more restricted tree is written only if it is unique: colltree reports a
@@ -627,10 +627,10 @@ Several variant units of one collective (in-place and not, §6.4 `--colls
 COLL:all`) go into the same file. Each unit's input conditions (`inplace`,
 and `builtin_op` and `commutative` for the reductions) are set in all its
 masks, so its subtrees have names of their own (alltoall: `-0` not in place,
-`-1` in place; allreduce: `-c` and `-d`), and `call=auto` tests those
+`-1` in place; allreduce: `-c` and `-d`), and the dispatch tests those
 bits too. A variant's base set is built from its own measurements even
 where no algorithm is restricted to it, and a set may `call=` another
-variant's subset subtree (`call=auto(<mask>)`), scored with this variant's curves of that
+variant's subset subtree (`dispatch(<mask>)`), scored with this variant's curves of that
 subtree's algorithms (only where it has them all). Where no variant is
 free of input conditions (the reductions measure builtin commutative ops
 only), the variant with the fewest builds subtree 0 from its unrestricted
@@ -764,7 +764,7 @@ python3 tests/test_growth_anchors.py  # growth anchors (point set, fit unchanged
 python3 tests/test_growth_guard.py    # growth anchors: points predicted too costly left out, timeouts recorded, not retried
 python3 tests/test_grow.py           # a model grown over job sizes (layouts beyond the model, stages, anchors beyond it, guard auto)
 python3 tests/test_gpu.py        # memory-kind restrictions; colltree merging host and gpu models, swap choices
-python3 tests/test_reserved.py   # colltree's reserved set names: call=auto(<mask>) fallbacks, tie aliases, local and -gpu sets, same choices as legacy
+python3 tests/test_reserved.py   # colltree's reserved set names: dispatch(<mask>) fallbacks, tie aliases, local and -gpu sets, same choices as legacy
 python3 tests/test_kinds.py      # restriction kinds, variants; inner trees in --inner-selection
 python3 tests/test_stages.py     # algorithm stages from inner calls; disabled algorithms, leaf names and parameters
 python3 tests/test_collection.py  # colltree over several collectives and variants, --colls, --with, staleness

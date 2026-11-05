@@ -90,7 +90,7 @@ def plan_sets(algs, bits, masks):
     return out
 
 
-# "reserved": MPICH's reserved set names, <op>-intra-<mask>[-gpu], reached by call=auto;
+# "reserved": MPICH's reserved set names, <op>-intra-<mask>[-gpu], reached by MPICH's dispatch;
 # "legacy": <op>-intra[-gpu]-<mask>, reached by the dispatch in <op>-intra-auto (an MPICH before them)
 NAMES = "reserved"
 
