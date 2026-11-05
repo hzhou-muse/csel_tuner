@@ -41,6 +41,8 @@ def build(models, *argv):
             m.save(paths[-1])
         out = os.path.join(d, "out.json")
         args = [paths[0]] + [x for p in paths[1:] for x in ("--also", p)] + ["--out", out] + list(argv)
+        if "--format" not in args:      # the legacy layout; test_reserved checks the new one
+            args += ["--format", "legacy"]
         with redirect_stdout(io.StringIO()):
             ct.main(args)
         with open(out) as f:

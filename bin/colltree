@@ -35,11 +35,18 @@ supersets':
   --min-fallback-algs algorithms (a smaller one is not worth the call: its
   algorithms are candidates directly). A call is scored at S's own layouts:
   at each point, the predicted time of what that subtree chooses there;
-- "name=<op>-intra-auto", the dispatch: "dispatch=<op>-intra(<bits>)", the
-  restriction-mask node of pmodels/mpich#8048 (MPICH continues in the subtree
-  of the restrictions that hold, or of its largest subset that has one, at
-  worst set 0); with --nested-dispatch, for an MPICH without it, nested
-  restrictive conditions ending in "call=" those subtrees.
+MPICH's built-in call=auto continues in the set of the restrictions that
+hold, or its largest present subset (restrictions are positive, so whatever a
+subset allows is allowed there too; at worst set 0). A set reaches a subset's
+subtree with "call=auto(<mask>)", leaving out the restrictions of the
+collective's sets that the subset lacks, since MPICH allows call= only to free
+names; two sets of the same size that could both match a call are refused by
+MPICH, so colltree adds their union as an alias to the one the legacy dispatch
+used. With --format legacy, for an MPICH without the reserved names:
+"name=<op>-intra-auto", the dispatch: "dispatch=<op>-intra(<bits>)" (the
+restriction-mask node of pmodels/mpich#8048), or with --nested-dispatch nested
+restrictive conditions ending in "call=" the subtrees; sets call each other by
+name.
 
 Several variant units of one collective and memory kind (in-place and
 not; the reductions' builtin commutative op) share its subtrees: each
@@ -55,31 +62,33 @@ conditions shape the file differently, because all ranks of a call must reach
 the same algorithm:
 
 - gpu_coll is the same on all ranks, so it selects subtrees of their own: the
-  gpu model's as "name=<op>-intra-gpu-<S in hex>" with its own dispatch,
-  "dispatch=<op>-intra-gpu(<bits>)", whose fallback is "<op>-intra-gpu-0", never
-  a host subtree. Both conditions hold in the whole model, so they are left out
-  of S and of the algorithms' restrictions (an algorithm restricted to gpu alone,
-  e.g. buffer_swap, is unrestricted there). "name=<op>-intra-auto" is
-  {"gpu_coll": <gpu dispatch>, "any": <host dispatch>}.
-- gpu_local can differ between ranks, so MPICH allows it only in the tree main
-  reaches, to choose between call=auto and buffer_swap, which clears the flags and
-  continues in auto. A device call without gpu_coll therefore runs the host tree's
-  algorithm, directly or after a swap. Where the gpu model predicts buffer_swap
-  faster than the host tree's choice at some point, the file has
-  "name=<op>-intra-main": {"gpu_coll": "call=auto", "gpu_local": <a tree whose
-  leaves are buffer_swap or call=auto>, "any": "call=auto"}, and "name=main" sends
-  the collective there. gpu_coll comes first, because it implies gpu_local and
-  has a tree of its own. Above --guard-above the choice is call=auto, and a point
-  whose algorithm has no curve in the gpu model is reported and not counted.
-  MPICH does not define gpu_coll for gatherv, scatterv and alltoallv, so they have
-  no gpu subtrees and no gpu_coll key: their gpu model only serves the swap choice.
+  gpu model's, the -gpu variant "name=<op>-intra-<S in hex>-gpu", in which
+  call=auto falls back within the variant (to "<op>-intra-0-gpu"), and only if
+  none matches to the host sets. Both conditions hold in the whole model, so they
+  are left out of S and of the algorithms' restrictions (an algorithm restricted
+  to gpu alone, e.g. buffer_swap, is unrestricted there).
+- gpu_local can differ between ranks, so MPICH takes it through a local set
+  first, "name=<op>-intra-<gpu_local bit>" (e.g. -400), whose leaves are
+  buffer_swap, which clears the flags and selects again, or "call=auto(<that
+  bit>)", where the host ranks go. A device call without gpu_coll therefore runs
+  the host sets' algorithm, directly or after a swap, and a gpu_coll call never
+  takes the local set. Where the gpu model predicts buffer_swap faster than the
+  host sets' choice at some point, the file has the local set. Above
+  --guard-above the choice is not to swap, and a point whose algorithm has no
+  curve in the gpu model is reported and not counted. MPICH does not define
+  gpu_coll for gatherv, scatterv and alltoallv, so they have no gpu sets: their
+  gpu model only serves the swap choice. (--format legacy: the choice is
+  "name=<op>-intra-main": {"gpu_coll": "call=auto", "gpu_local": <the choice>,
+  "any": "call=auto"}, which "name=main" sends the collective to, and the gpu
+  subtrees are "<op>-intra-gpu-<S>" with a dispatch of their own, under
+  {"gpu_coll": <gpu dispatch>, "any": <host dispatch>}.)
 
 A more restricted tree is written only if it is unique: a subtree that chooses like
-its dispatch fallback at every point it was fitted on, and the gpu subtrees with their
-gpu_coll keys if they choose like the host tree and the swap choice at every point
-of the gpu models. These are reported.
-  Only a user's call reaches main; the inner calls of a compositional algorithm
-  select from auto, so they don't swap.
+its fallback at every point it was fitted on, and the gpu subtrees if they choose
+like the host sets and the swap choice at every point of the gpu models. These are
+reported. The inner calls of a compositional algorithm select with call=auto and the
+flags they inherit, so on device buffers they can reach the local set (legacy: from
+auto, so only a user's call swaps, in main).
 
 A host model is required; each memory kind at most once.
 
@@ -106,10 +115,11 @@ import numpy as np  # noqa: E402
 
 from csel_tuner.kinds import canon_condition, has_gpu_coll, has_msg_size, is_device, is_rooted, measured, variants  # noqa: E402
 from csel_tuner.model import ModelFile, parse_sel, tag_key, tag_str  # noqa: E402
+import csel_tuner.restrict as restrict  # noqa: E402
 from csel_tuner.restrict import GPU_COLL, GPU_LOCAL, role_layout, set_name, set_prefix  # noqa: E402
 from csel_tuner.single import is_pof2  # noqa: E402
 from csel_tuner.growth import classes as growth_classes, table as growth_table  # noqa: E402
-from csel_tuner.tree import (CSEL_NAME, cond_depth, fit_tree, json_choice, json_tree,  # noqa: E402
+from csel_tuner.tree import (CSEL_NAME, cond_depth, file_choice, fit_tree, json_tree,  # noqa: E402
                              prune_to, regret_stats, select)
 
 SWAP, SWAP_LEAF = "buffer_swap", "MPIR_Coll_buffer_swap"
@@ -379,6 +389,9 @@ class Sets:
     def build(self, mask, lays):
         m = self.m
         algs = m.set_algs(mask)
+        if is_device(m.mem) and self.a.format != "legacy":
+            # a -gpu set serves gpu_coll calls, which never swap: _coll and _local sets are apart
+            algs = [x for x in algs if x != SWAP]
         if mask == 0:
             algs = [x for x in algs if m.mask_of(x) == 0]
         if not algs:
@@ -600,7 +613,8 @@ def stale(model, S, out, built, tol):
     has host buffers. Any other inner call of a device unit may select with or without gpu_coll,
     which the algorithm decides in its code (it may clear the condition for host temporaries, or
     keep it with device ones), so both choices are compared, each timed by the unit's model. Inner
-    calls select from auto: only a user's call can swap, in main."""
+    calls select with call=auto and the flags they inherit, so on device buffers they can reach the
+    local set (legacy: from auto, so only a user's call can swap, in main)."""
     m = model
     trees = {k[len("name="):]: v for k, v in out.items()}
     slot = "device" if is_device(m.mem) else "host"
@@ -636,7 +650,6 @@ def stale(model, S, out, built, tol):
                 mi, Si = target
                 by_leaf = {mi.leaf(x): x for x in mi.algorithms}
                 idx = {size: i for i, size in enumerate(mi.sizes)}
-                auto = f"{coll}-intra-auto"
                 at = {}             # inner layout -> sizes at which some outer call uses c
                 for lay, sizes in ((x, uses[x]) for x in lays):
                     r = role_layout(lay, comm)
@@ -650,9 +663,13 @@ def stale(model, S, out, built, tol):
                         for gpu_coll in ((True, False) if on_device else (None,)):
                             x = x_of(mi, r, size)
                             if gpu_coll is not None:
-                                x["cond"][GPU_COLL] = gpu_coll
-                            new = by_leaf.get(json_choice(trees[auto], x, trees, mi.conditions))
-                            was = by_leaf.get(json_choice(old[auto], x, old, mi.conditions)) if auto in old else None
+                                x["cond"][GPU_COLL] = gpu_coll and has_gpu_coll(coll)
+                                x["cond"][GPU_LOCAL] = True
+                            new = by_leaf.get(file_choice(trees, f"{coll}-intra", x, mi.conditions))
+                            try:
+                                was = by_leaf.get(file_choice(old, f"{coll}-intra", x, mi.conditions))
+                            except (KeyError, ValueError):
+                                was = None
                             if new == was or new is None or was is None or was not in mi.curves:
                                 continue
                             i = idx[size]
@@ -746,6 +763,54 @@ def swap_tree(op, host, gpu_units, feats, a):
     return (t if n else None), lines
 
 
+def local_bit(model):
+    """The mask bit of gpu_local, the local restriction, in a model's conditions."""
+    return 1 << model.conditions.index(GPU_LOCAL)
+
+
+def tie_aliases(present):
+    """MPICH refuses two restriction sets of the same size that could both match one call (it
+    cannot know which combinations of restrictions happen). {union: winner} of the sets to add,
+    each a call=auto to the set the legacy dispatch used there (the most restrictions, then the
+    lower mask), and [report lines] where the aliases change a combination's choice."""
+    sets, aliases, lines = set(present), {}, []
+    U = 0
+    for s in present:
+        U |= s
+    pos = [k for k in range(32) if U >> k & 1]
+    combos = [sum(1 << pos[j] for j in range(len(pos)) if c >> j & 1) for c in range(1 << len(pos))]
+
+    def legacy_choice(m):
+        return max((s for s in present if s & ~m == 0), key=lambda s: (bin(s).count("1"), -s))
+    while True:
+        tie = None
+        for m in combos:
+            cands = [s for s in sets if s & ~m == 0]
+            if not cands:
+                continue
+            top = max(bin(s).count("1") for s in cands)
+            win = [s for s in cands if bin(s).count("1") == top]
+            if len(win) > 1:
+                tie = win
+                break
+        if tie is None:
+            break
+        u = 0
+        for s in tie:
+            u |= s
+        aliases[u] = legacy_choice(u)
+        sets.add(u)
+    for m in combos:
+        cands = [s for s in sets if s & ~m == 0]
+        if not cands:
+            continue
+        best = max(cands, key=lambda s: bin(s).count("1"))
+        if aliases.get(best, best) != legacy_choice(m):
+            lines.append("alias %x changes the set of restrictions %x: %x, legacy %x"
+                         % (best, m, aliases.get(best, best), legacy_choice(m)))
+    return aliases, lines
+
+
 def main_tree(keys):
     """name=main from the <op>-intra-main subtrees among keys, or None if there are none."""
     ops = sorted(k[len("name="):-len("-intra-main")] for k in keys
@@ -795,11 +860,16 @@ def main(argv=None):
     ap.add_argument("--param", action="append", default=[], metavar="ALG.KEY=VALUE")
     ap.add_argument("--size-condition", default="msg_size", choices=["msg_size", "avg_msg_size"],
                     help="the CSEL condition of the size splits; avg_msg_size for an MPICH without msg_size")
-    ap.add_argument("--nested-dispatch", action="store_true", help="dispatch on restrictions with nested "
-                    "conditions (for an MPICH without dispatch=, pmodels/mpich#8048)")
+    ap.add_argument("--format", choices=["reserved", "legacy"], default="reserved",
+                    help="reserved: MPICH's reserved set names, reached by its built-in call=auto; legacy: "
+                    "<op>-intra-auto dispatches, <op>-intra-main swap choices and name=main, for an MPICH "
+                    "without the reserved names")
+    ap.add_argument("--nested-dispatch", action="store_true", help="with --format legacy: dispatch on "
+                    "restrictions with nested conditions (for an MPICH without dispatch=, pmodels/mpich#8048)")
     ap.add_argument("--buffer-swap", action="store_true", help="host model only: the file measures buffer_swap "
-                    "(device buffers swap to host, then the host tree): <op>-intra-auto is "
-                    "everywhere; <op>-intra-main is {gpu_local: buffer_swap, any: call=auto}")
+                    "(device buffers swap to host, then the host tree): every device call swaps "
+                    "(the local set <op>-intra-<gpu_local bit> is buffer_swap; legacy: <op>-intra-main is "
+                    "{gpu_local: buffer_swap, any: call=auto})")
     ap.add_argument("--guard-above", metavar="P|auto", help="above comm size P (the largest sampled; auto: each "
                     "unit's own largest measured comm size): "
                     "each subtree's linear- or unclear-growth leaves replaced by logarithmic-growth algorithms, "
@@ -814,6 +884,10 @@ def main(argv=None):
                     help="also write the subtrees of FILE's collectives that this run does not build into --out "
                     "(a tuning file for inner calls into another collective, or the final file)")
     a = ap.parse_args(argv)
+    restrict.NAMES = a.format
+    legacy = a.format == "legacy"
+    if a.nested_dispatch and not legacy:
+        sys.exit("--nested-dispatch: only with --format legacy")
     try:
         sel = parse_sel(a.unit)
     except ValueError as e:
@@ -949,13 +1023,20 @@ def main(argv=None):
                 report += lines
                 swap_fit[op] = swap_t
                 if swap_t is not None:
-                    branch = json_tree(swap_t, ["direct", "swap"], lambda o: "call=auto" if o == "direct"
+                    # legacy: main's choice before call=auto; reserved: the local set, whose other leaf
+                    # leaves gpu_local out, where the host ranks go
+                    L = local_bit(by_mem["host"][0][1])
+                    stay = "call=auto" if legacy else "call=auto(%x)" % L
+                    branch = json_tree(swap_t, ["direct", "swap"], lambda o: stay if o == "direct"
                                        else ("algorithm=" + SWAP_LEAF, {}), names)
                     if a.guard_above is not None:
                         branch = {"comm_size(%d)" % guard_comm_size(a, [m for path, m in by_mem["device"]]): branch,
-                                  "any": "call=auto"}
-                    first = {GPU_COLL: "call=auto"} if has_gpu_coll(op) else {}
-                    out[f"name={op}-intra-main"] = dict(first, **{GPU_LOCAL: branch, "any": "call=auto"})
+                                  "any": stay}
+                    if legacy:
+                        first = {GPU_COLL: "call=auto"} if has_gpu_coll(op) else {}
+                        out[f"name={op}-intra-main"] = dict(first, **{GPU_LOCAL: branch, "any": "call=auto"})
+                    else:
+                        out[f"name={set_name(op, L)}"] = branch
 
             owner = {mask: m for path, m, S in built[(op, mem)] for mask in S.mine}
             owner_sets = {mask: S for path, m, S in built[(op, mem)] for mask in S.mine}
@@ -969,9 +1050,18 @@ def main(argv=None):
                     s = dropped[s]
                 return s
 
+            present = sorted(s for s in trees if s not in dropped)
+            U = 0
+            for s_ in present:
+                U |= s_
+
             def sub(o, m):
                 if isinstance(o, tuple):
-                    return "call=" + set_name(op, kept(o[1]), mem)
+                    if legacy:
+                        return "call=" + set_name(op, kept(o[1]), mem)
+                    # leave out every restriction of the family that the subset lacks: the lookup
+                    # then lands on the subset whatever else holds
+                    return "call=auto(%x)" % (U & ~kept(o[1]))
                 return ("algorithm=" + m.leaf(o), leaf_params(m, o))
             for mask, (t, opts) in sorted(trees.items()):
                 if mask in dropped:
@@ -993,7 +1083,15 @@ def main(argv=None):
                     if g_json != tree_json:
                         tree_json = {"comm_size(%d)" % P: tree_json, "any": g_json}
                 out[key] = tree_json
-            present = sorted(s for s in trees if s not in dropped)
+            if not legacy:
+                aliases, lines = tie_aliases(present)
+                for u, w in sorted(aliases.items()):
+                    out[f"name={set_name(op, u, mem)}"] = "call=auto(%x)" % (U & ~w)
+                if aliases:
+                    report.append(f"{op} {mem}: tied sets resolved by aliases: " + ", ".join(
+                        f"{set_name(op, u, mem)} -> {set_name(op, w, mem)}" for u, w in sorted(aliases.items())))
+                report += lines
+                continue
             if a.nested_dispatch:
                 disp[mem] = dispatch(op, by_mem[mem][0][1].conditions, present, mem)
             else:
@@ -1002,15 +1100,23 @@ def main(argv=None):
                     bits |= s
                 disp[mem] = "dispatch=%s(0x%x)" % (set_prefix(op, mem), bits) if bits else \
                     "call=" + set_name(op, 0, mem)
-        if "device" in disp and not gpu_coll_is_unique([(m, S) for path, m, S in built[(op, "host")]],
-                                                       [(m, S) for path, m, S in built[(op, "device")]],
-                                                       swap_fit.get(op)):
+        has_dev = (op, "device") in built and (legacy and "device" in disp or not legacy)
+        # without its -gpu sets a gpu_coll call runs the host sets' choice; legacy: or the swap choice
+        if has_dev and not gpu_coll_is_unique([(m, S) for path, m, S in built[(op, "host")]],
+                                              [(m, S) for path, m, S in built[(op, "device")]],
+                                              swap_fit.get(op) if legacy else None):
             report.append(f"{op}: gpu_coll selects the same as without it: its subtrees are not written")
-            del disp["device"]
-            for key in [k for k in out if k.startswith(f"name={set_prefix(op, 'gpu')}-")]:
+            disp.pop("device", None)
+            gpu_keys = [k for k in out if k.startswith(f"name={set_prefix(op, 'gpu')}-")] if legacy else \
+                [k for k in out if k.startswith(f"name={op}-intra-") and k.endswith("-gpu")]
+            for key in gpu_keys:
                 del out[key]
             if f"name={op}-intra-main" in out:
                 out[f"name={op}-intra-main"].pop(GPU_COLL, None)
+        if not legacy:
+            if a.buffer_swap:
+                out[f"name={set_name(op, local_bit(colls[op]['host'][0][1]))}"] = {"algorithm=" + SWAP_LEAF: {}}
+            continue
         out[f"name={op}-intra-auto"] = {GPU_COLL: disp["device"], "any": disp["host"]} if "device" in disp else \
             disp["host"]
         if a.buffer_swap:
@@ -1023,7 +1129,7 @@ def main(argv=None):
         for k, v in other.items():
             if not k.startswith(mine) and k != "name=main":
                 written[k] = v
-    entry = main_tree(written)
+    entry = main_tree(written) if legacy else None
     if entry is not None:
         written["name=main"] = entry
     depth = json_depth(written)
@@ -1033,7 +1139,10 @@ def main(argv=None):
         with open(a.into) as f:
             text = f.read()
         keep = [k for k in json.loads(text) if not k.startswith(mine)]
-        entry = main_tree(list(out) + keep)
+        if not legacy and "name=auto" in keep:
+            sys.exit(f"--into {a.into}: the file routes through name=auto (the legacy format); "
+                     "use --format legacy, or a coll_selection.json with the reserved set names")
+        entry = main_tree(list(out) + keep) if legacy else None
         text = splice_into(text, dict(out, **{"name=main": entry}) if entry else out, colls)
         with open(a.out, "w") as f:
             f.write(text)

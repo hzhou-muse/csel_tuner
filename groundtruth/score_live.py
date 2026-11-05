@@ -214,8 +214,8 @@ def summary(r):
 
 
 def validate(a):
-    from csel_tuner.restrict import GPU
-    from csel_tuner.tree import json_choice
+    from csel_tuner.restrict import GPU_COLL, GPU_LOCAL
+    from csel_tuner.tree import file_choice
     model = load_model(a.model)
     measured = set(model.measured_layouts())
     masks = model.masks
@@ -240,7 +240,7 @@ def validate(a):
     trees = {"tree (offline)": json.load(open(a.tuning))}
     if a.tuning_node_aware:
         trees["tree, node-aware (offline)"] = json.load(open(a.tuning_node_aware))
-    # every subtree of a file by name; the selection starts at <op>-intra-auto
+    # every subtree of a file by name; the selection starts at <op>-intra-auto (legacy) or call=auto
     trees = {k: {n.split("=", 1)[1]: t for n, t in v.items()} for k, v in trees.items()}
     points = sorted({k[1:] for k in truth if k[0] is not None})
     pred = {}
@@ -258,12 +258,12 @@ def validate(a):
         best = min(list(t.values()) + ([default[(None, n, q, m)]] if (None, n, q, m) in default else []))
         x = {"p": n * q, "m": m, "N": n, "ppn": q, "pof2": float((n * q) & (n * q - 1) == 0),
              "cond": {b: bool(mask >> k & 1) for k, b in enumerate(bits)}}
-        x["cond"][GPU] = model.mem == "device"     # a file of host and device models starts with gpu
+        x["cond"][GPU_COLL] = x["cond"][GPU_LOCAL] = model.mem == "device"   # gpu_coll: the device sets
         i = int(np.argmin(np.abs(np.log2(sizes) - np.log2(max(m, 1)))))
         alg = model_choice(mask, n, q, i)
         r = {"model, per point": t[alg] / best if alg in t else float("nan")}
         for name, tree in trees.items():
-            key = json_choice(tree[f"{op}-intra-auto"], x, tree, bits)
+            key = file_choice(tree, f"{op}-intra", x, bits)
             alg = leaf_alg.get(key, key.split("_intra_", 1)[-1])
             r[name] = t[alg] / best if alg in t else float("nan")
             if name == "tree (offline)" and (None, n, q, m) in tuned and alg in t:

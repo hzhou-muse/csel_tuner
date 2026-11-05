@@ -234,16 +234,75 @@ def json_tree(root, alg_names, leaf, names=CSEL_NAME):
     return obj(root)
 
 
-def json_choice(obj, x, trees=None, bits=None):
+def set_masks(trees, coll):
+    """{(mask, gpu): name} of the restriction sets of `coll` (e.g. "bcast-intra") among a file's
+    subtree names (keys without "name="): <coll>-<mask in hex>, or <coll>-<mask>-gpu."""
+    out = {}
+    pre = coll + "-"
+    for name in trees:
+        if not name.startswith(pre):
+            continue
+        rest = name[len(pre):]
+        gpu = rest.endswith("-gpu")
+        h = rest[:-len("-gpu")] if gpu else rest
+        if h and all(c in "0123456789abcdef" for c in h) and (h == "0" or h[0] != "0"):
+            out[(int(h, 16), gpu)] = name
+    return out
+
+
+def auto_lookup(trees, coll, m, gpu, bits):
+    """The set MPICH's call=auto continues in (pmodels/mpich, reserved set names): for a gpu_coll
+    call the -gpu set with the most restrictions among those in m, local restrictions left out,
+    else the host one; otherwise a local set (a mask with a <name>_local restriction) first, then
+    the other host sets, local restrictions left out. Two of the same size are an error, as MPICH
+    refuses the file."""
+    local = sum(1 << k for k, b in enumerate(bits) if b.endswith("_local"))
+    sets = set_masks(trees, coll)
+
+    def best(cands):
+        if not cands:
+            return None
+        top = max(bin(s).count("1") for s, g in cands)
+        win = [c for c in cands if bin(c[0]).count("1") == top]
+        if len(win) > 1:
+            raise ValueError("%s: tie between %s" % (coll, ", ".join(sets[c] for c in win)))
+        return sets[win[0]]
+    nl = m & ~local
+    stages = [] if not gpu else [[c for c in sets if c[1] and c[0] & ~nl == 0]]
+    if not gpu:
+        stages.append([c for c in sets if not c[1] and c[0] & local and c[0] & ~m == 0])
+    stages.append([c for c in sets if not c[1] and not c[0] & local and c[0] & ~nl == 0])
+    for cands in stages:
+        name = best(cands)
+        if name is not None:
+            return name
+    raise ValueError("%s: no set matches" % coll)
+
+
+def file_choice(trees, coll, x, bits):
+    """The algorithm a whole file (its subtrees by name, keys without "name=") selects for a call
+    of `coll` (e.g. "bcast-intra"): from the legacy <coll>-auto dispatch if the file has one, else
+    from MPICH's built-in call=auto over the reserved set names."""
+    if coll + "-auto" in trees:
+        return json_choice(trees[coll + "-auto"], x, trees, bits)
+    return json_choice("call=auto", x, trees, bits, coll=coll)
+
+
+def json_choice(obj, x, trees=None, bits=None, coll=None):
     """The algorithm a CSEL subtree (as json_tree writes it) chooses at one
     point, x = {"p": comm_size, "m": message size, "N": nodes, "ppn": ranks
     per node, "pof2": 0/1, "cond": {restrictive condition: bool}}: siblings
     are tried in order, the first true condition is followed, "any" always
     is; "call=NAME" continues in trees["NAME"] (a file's subtrees, keys
-    without "name="); "dispatch=PREFIX(BITS)" continues in PREFIX-<the bits
-    whose condition holds, in hex>, or its largest subset that exists
-    (bits: the restriction names, bit k = bits[k]). Returns the leaf's key
-    after "algorithm=", e.g. "MPIR_Bcast_intra_binomial"."""
+    without "name="); "call=auto" and "call=auto(MASK)" continue in the
+    restriction set of `coll` (e.g. "bcast-intra") that auto_lookup finds,
+    the restrictions in MASK left out (cumulative within one search;
+    gpu_coll from x["cond"]); "dispatch=PREFIX(BITS)" (the older format)
+    continues in PREFIX-<the bits whose condition holds, in hex>, or its
+    largest subset that exists (bits: the restriction names, bit k =
+    bits[k]). Returns the leaf's key after "algorithm=", e.g.
+    "MPIR_Bcast_intra_binomial"."""
+    m = None
     feature = {"comm_size": "p", "msg_size": "m", "avg_msg_size": "m", "num_nodes": "N", "ppn": "ppn"}
     while True:
         if isinstance(obj, str) and obj.startswith("dispatch="):
@@ -252,6 +311,15 @@ def json_choice(obj, x, trees=None, bits=None):
             m = sum(1 << k for k, b in enumerate(bits) if mask >> k & 1 and x["cond"].get(b, False))
             subs = [s for s in range(m + 1) if s & ~m == 0 and "%s-%x" % (prefix, s) in trees]
             obj = trees["%s-%x" % (prefix, max(subs, key=lambda s: (bin(s).count("1"), -s)))]
+            continue
+        if isinstance(obj, str) and coll is not None and (obj == "call=auto" or obj.startswith("call=auto(")):
+            gpu_coll = [k for k, b in enumerate(bits) if b.endswith("_coll")]
+            if m is None:
+                m = sum(1 << k for k, b in enumerate(bits) if x["cond"].get(b, False) and k not in gpu_coll)
+            if obj != "call=auto":
+                m &= ~int(obj[len("call=auto("):-1], 16)
+            gpu = any(x["cond"].get(bits[k], False) for k in gpu_coll)
+            obj = trees[auto_lookup(trees, coll, m, gpu, bits)]
             continue
         if isinstance(obj, str):
             if not obj.startswith("call="):

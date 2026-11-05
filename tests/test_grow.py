@@ -135,7 +135,7 @@ def test_stages_at_new_layouts():
         assert c.inner_files[c.inner_at("smp", lay)] == open(p("t2.json")).read()
         # colltree reads the model, the stale check per inner selection included
         tree(p("b2.json"), "--out", p("t3.json"))
-        assert "name=bcast-intra-auto" in json.load(open(p("t3.json")))
+        assert "name=bcast-intra-0" in json.load(open(p("t3.json")))
         # without an inner selection the compositional one is left out, and says so
         r = run("--model", p("b2.json"), *common, "--layouts", "12x8", "--replay-nodes", "16", "--out", p("b3.json"))
         assert (12, 8) in Model.load(p("b3.json")).curves["binomial"] and (12, 8) not in Model.load(p("b3.json")).curves["smp"]

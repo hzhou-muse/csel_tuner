@@ -90,15 +90,24 @@ def plan_sets(algs, bits, masks):
     return out
 
 
+# "reserved": MPICH's reserved set names, <op>-intra-<mask>[-gpu], reached by call=auto;
+# "legacy": <op>-intra[-gpu]-<mask>, reached by the dispatch in <op>-intra-auto (an MPICH before them)
+NAMES = "reserved"
+
+
 def set_prefix(op, mem="host"):
-    """The prefix of a model's subtree names: <op>-intra, <op>-intra-gpu for device buffers."""
-    return "%s-intra%s" % (op, "-gpu" if mem in ("device", "gpu") else "")
+    """The prefix of a model's subtree names: <op>-intra (legacy: <op>-intra-gpu for device
+    buffers)."""
+    return "%s-intra%s" % (op, "-gpu" if NAMES == "legacy" and mem in ("device", "gpu") else "")
 
 
 def set_name(op, mask, mem="host"):
-    """The set's CSEL subtree name: the mask of true conditions in hex, e.g. bcast-intra-800
-    (bcast-intra-gpu-800 in a model of device buffers)."""
-    return "%s-%x" % (set_prefix(op, mem), mask)
+    """The set's CSEL subtree name: the mask of true conditions in hex, e.g. bcast-intra-200, and
+    bcast-intra-200-gpu in a model of device buffers (legacy: bcast-intra-gpu-200)."""
+    gpu = mem in ("device", "gpu")
+    if NAMES == "legacy":
+        return "%s-%x" % (set_prefix(op, mem), mask)
+    return "%s-%x%s" % (set_prefix(op, mem), mask, "-gpu" if gpu else "")
 
 
 def role_layout(lay, comm):
