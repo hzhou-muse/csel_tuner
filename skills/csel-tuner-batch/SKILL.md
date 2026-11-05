@@ -60,8 +60,9 @@ Rules the tools enforce or assume:
 - **MPICH requirements.** The build under test needs the per-request
   algorithm switch (`MPISRV_CVAR_SWITCH=1`; MPICH main ≥ de0b8e6921), the
   `restrictions:` section and side-effect-free release_gather condition
-  (pmodels/mpich#8048, merged) for `--catalog`, and `dispatch=` for
-  the default tree output (else `--nested-dispatch`). The tree's size
+  (pmodels/mpich#8048, merged) for `--catalog`, and the reserved set
+  names with the built-in `call=auto` for the default tree output (else
+  `--format legacy`, which needs `dispatch=` or `--nested-dispatch`). The tree's size
   splits use `msg_size` (pmodels/mpich#8083; else `colltree
   --size-condition avg_msg_size`), and leaf parameters write booleans as
   0/1 (pmodels/mpich#8080). `mpisrv` must be rebuilt against the MPICH
