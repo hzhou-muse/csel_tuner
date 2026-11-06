@@ -571,10 +571,10 @@ set with the most restrictions that hold: `bcast-intra-200`
 or a subset's subtree that uses at least `--min-fallback-algs` algorithms,
 each scored at the set's own layouts; the file reaches the subset with
 `dispatch(<mask>)`, leaving out the restrictions the subset lacks (MPICH
-allows `call=` only to free names). MPICH refuses two sets of the same size
-that could both match a call, so where two such sets exist colltree adds
-their union as a one-line `dispatch(<mask>)` to the one the legacy dispatch
-used (the more restrictions, then the lower mask) and reports it. To see
+allows `call=` only to free names). Of two sets of the same size that could
+both match a call, MPICH takes the larger mask, so where two such sets exist
+colltree adds their union as a one-line `dispatch(<mask>)` to the one the
+legacy dispatch used (the more restrictions, then the lower mask) and reports it. To see
 which algorithms ran, set `MPIR_CVAR_DUMP_COLL_ALGO_COUNTERS=0` (rank 0
 prints its counts at finalize). An MPICH without the reserved names needs
 `--format legacy`: an `<op>-intra-auto` dispatch, `"dispatch=bcast-intra(0x210)"`
@@ -584,9 +584,11 @@ pmodels/mpich#8048), and `call=` between the sets.
 With a model of device buffers (`--launch gpu`) too, the file also has that
 model's sets, the `-gpu` variant: `bcast-intra-<mask>-gpu`. In them `gpu_local`
 and `gpu_coll` are left out of the mask, because they hold everywhere in that
-model. The dispatch takes them for a `gpu_coll` call, falling back within the
-variant and, if none matches, to the host sets. The model's catalog must have
-both restrictions.
+model. MPICH takes a variant only after a `dispatch(<mask>)` that leaves its
+`_coll` restriction out, so the file also has the set of `gpu_coll` alone,
+`"name=bcast-intra-800": "dispatch(800)"`: a `gpu_coll` call goes there and on
+to the `-gpu` sets, falling back within the variant and, if none matches, to the
+host sets. The model's catalog must have both restrictions.
 
 `gpu_local` can differ between the ranks of a call, so MPICH takes it through a
 local set, `bcast-intra-<gpu_local bit>` (e.g. `bcast-intra-400`), first: its

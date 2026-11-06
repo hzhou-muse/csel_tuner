@@ -250,32 +250,26 @@ def set_masks(trees, coll):
     return out
 
 
-def auto_lookup(trees, coll, m, gpu, bits):
-    """The set MPICH's dispatch continues in (pmodels/mpich, reserved set names): for a gpu_coll
-    call the -gpu set with the most restrictions among those in m, local restrictions left out,
-    else the host one; otherwise a local set (a mask with a <name>_local restriction) first, then
-    the other host sets, local restrictions left out. Two of the same size are an error, as MPICH
-    refuses the file."""
+def auto_lookup(trees, coll, m, v, bits):
+    """The set MPICH's dispatch continues in (pmodels/mpich#8115, MPII_Csel_dispatch): m is the
+    restrictions that hold, local ones already left out where a _coll one holds, and v the _coll
+    restrictions the search's dispatch(<mask>)es left out, which select the variants (-gpu for
+    gpu_coll). A local set (a mask with a <name>_local restriction) whose mask is within m comes
+    first, then a set whose mask is within m and whose variants are within v. Within each, the most
+    variants, then the most restrictions, then the larger variant mask, then the larger mask wins."""
     local = sum(1 << k for k, b in enumerate(bits) if b.endswith("_local"))
+    gpu_bit = 1 << bits.index("gpu_coll") if "gpu_coll" in bits else 0
     sets = set_masks(trees, coll)
 
-    def best(cands):
-        if not cands:
-            return None
-        top = max(bin(s).count("1") for s, g in cands)
-        win = [c for c in cands if bin(c[0]).count("1") == top]
-        if len(win) > 1:
-            raise ValueError("%s: tie between %s" % (coll, ", ".join(sets[c] for c in win)))
-        return sets[win[0]]
-    nl = m & ~local
-    stages = [] if not gpu else [[c for c in sets if c[1] and c[0] & ~nl == 0]]
-    if not gpu:
-        stages.append([c for c in sets if not c[1] and c[0] & local and c[0] & ~m == 0])
-    stages.append([c for c in sets if not c[1] and not c[0] & local and c[0] & ~nl == 0])
+    def order(c):
+        mask, gpu = c
+        vm = gpu_bit if gpu else 0
+        return (-bin(vm).count("1"), -bin(mask).count("1"), -vm, -mask)
+    stages = [[c for c in sets if not c[1] and c[0] & local and c[0] & ~m == 0],
+              [c for c in sets if not c[0] & local and c[0] & ~m == 0 and (gpu_bit if c[1] else 0) & ~v == 0]]
     for cands in stages:
-        name = best(cands)
-        if name is not None:
-            return name
+        if cands:
+            return sets[min(cands, key=order)]
     raise ValueError("%s: no set matches" % coll)
 
 
@@ -297,8 +291,8 @@ def json_choice(obj, x, trees=None, bits=None, coll=None):
     without "name="); "dispatch(MASK)", and "dispatch" where a selection
     starts, continue in the restriction set of `coll` (e.g. "bcast-intra")
     that auto_lookup finds,
-    the restrictions in MASK left out (cumulative within one search;
-    gpu_coll from x["cond"]); "dispatch=PREFIX(BITS)" (the older format)
+    the restrictions in MASK left out (cumulative within one search; a
+    _coll one left out selects its variant, e.g. -gpu); "dispatch=PREFIX(BITS)" (the older format)
     continues in PREFIX-<the bits whose condition holds, in hex>, or its
     largest subset that exists (bits: the restriction names, bit k =
     bits[k]). Returns the leaf's key after "algorithm=", e.g.
@@ -314,13 +308,21 @@ def json_choice(obj, x, trees=None, bits=None, coll=None):
             obj = trees["%s-%x" % (prefix, max(subs, key=lambda s: (bin(s).count("1"), -s)))]
             continue
         if isinstance(obj, str) and coll is not None and (obj == "dispatch" or obj.startswith("dispatch(")):
-            gpu_coll = [k for k, b in enumerate(bits) if b.endswith("_coll")]
+            coll_bits = sum(1 << k for k, b in enumerate(bits) if b.endswith("_coll"))
             if m is None:
-                m = sum(1 << k for k, b in enumerate(bits) if x["cond"].get(b, False) and k not in gpu_coll)
+                # MPICH tests only the restrictions in the masks of the collective's sets
+                aggregate = 0
+                for mask, gpu in set_masks(trees, coll):
+                    aggregate |= mask
+                m = sum(1 << k for k, b in enumerate(bits) if x["cond"].get(b, False)) & aggregate
+                if m & coll_bits:       # a _coll and a _local restriction exclude each other
+                    m &= ~sum(1 << k for k, b in enumerate(bits) if b.endswith("_local"))
+                v = 0
             if obj != "dispatch":
-                m &= ~int(obj[len("dispatch("):-1], 16)
-            gpu = any(x["cond"].get(bits[k], False) for k in gpu_coll)
-            obj = trees[auto_lookup(trees, coll, m, gpu, bits)]
+                drop = int(obj[len("dispatch("):-1], 16)
+                v |= m & drop & coll_bits
+                m &= ~drop
+            obj = trees[auto_lookup(trees, coll, m, v, bits)]
             continue
         if isinstance(obj, str):
             if not obj.startswith("call="):
