@@ -66,7 +66,9 @@ the same algorithm:
   the dispatch falls back within the variant (to "<op>-intra-0-gpu"), and only if
   none matches to the host sets. MPICH takes the variant only after a dispatch
   that leaves gpu_coll out, so the file has "name=<op>-intra-<gpu_coll bit>":
-  "dispatch(<that bit>)" (e.g. -800) too. Both conditions hold in the whole model, so they
+  "dispatch(<that bit>)" (e.g. -800) too, and the same for <S | that bit> where a
+  host set S has more restrictions than it and a gpu_coll call would otherwise
+  stay in S at some point of the gpu models (e.g. -a0c for -20c). Both conditions hold in the whole model, so they
   are left out of S and of the algorithms' restrictions (an algorithm restricted
   to gpu alone, e.g. buffer_swap, is unrestricted there).
 - gpu_local can differ between ranks, so MPICH takes it through a local set
@@ -108,6 +110,7 @@ import argparse
 import copy
 import json
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -775,6 +778,40 @@ def coll_bit(model):
     return 1 << model.conditions.index(GPU_COLL)
 
 
+def gpu_coll_sets(op, out, points, bits, G, L):
+    """MPICH takes the -gpu variant only after a dispatch that leaves gpu_coll (bit G) out, and a
+    gpu_coll call reaches such a set only if no host set with more restrictions that hold comes
+    first. So each host set s (other than the local sets, bit L) gets a set s|G, "dispatch(G)", and
+    G itself the base one. ([masks kept], [masks dropped]): a set is dropped, the smaller ones
+    first, if without it the file selects the same at every point (gpu_coll calls of the gpu
+    models). G itself is always kept: it is where a gpu_coll call goes that no larger set matches,
+    also at the combinations of restrictions that the models did not measure."""
+    pre = f"name={op}-intra-"
+    host = sorted({int(k[len(pre):], 16) for k in out
+                   if k.startswith(pre) and re.fullmatch(r"[0-9a-f]+", k[len(pre):])})
+    cands = sorted({s | G for s in host if not s & (L | G)}, key=lambda c: (bin(c).count("1"), c))
+    trees = {k[len("name="):]: v for k, v in out.items()}
+
+    def choices(t):
+        return [file_choice(t, f"{op}-intra", x, bits) for x in points]
+    for c in cands:
+        trees[set_name(op, c)] = "dispatch(%x)" % G
+    want = choices(trees)
+    kept, dropped = [], []
+    for c in cands:
+        if c == G:
+            kept.append(c)
+            continue
+        t = dict(trees)
+        del t[set_name(op, c)]
+        if choices(t) == want:
+            trees = t
+            dropped.append(c)
+        else:
+            kept.append(c)
+    return sorted(kept), sorted(dropped)
+
+
 def tie_aliases(present):
     """Of two restriction sets of the same size that could both match one call, MPICH takes the
     larger mask (it cannot know which combinations of restrictions happen), the legacy dispatch
@@ -1125,8 +1162,19 @@ def main(argv=None):
             # MPICH selects a variant only through a dispatch(<mask>) that leaves its _coll restriction
             # out: <op>-intra-<gpu_coll bit> sends the gpu_coll calls to the -gpu sets
             if any(k.startswith(f"name={op}-intra-") and k.endswith("-gpu") for k in out):
-                G = coll_bit(colls[op]["host"][0][1])
-                out[f"name={set_name(op, G)}"] = "dispatch(%x)" % G
+                host = colls[op]["host"][0][1]
+                dev = [m for path, m, S in built[(op, "device")]]
+                points = [x_of(m, lay, size) for O in dev for m in [O] + list(getattr(O, "also", ()))
+                          for lay in m.layouts for size in m.sizes]
+                for x in points:
+                    x["cond"][GPU_COLL] = True
+                gc_sets, gc_dropped = gpu_coll_sets(op, out, points, host.conditions, coll_bit(host),
+                                                    local_bit(host))
+                for c in gc_sets:
+                    out[f"name={set_name(op, c)}"] = "dispatch(%x)" % coll_bit(host)
+                if gc_dropped:
+                    report.append(f"{op}: gpu_coll sets not written, same choices without them: "
+                                  + ", ".join(set_name(op, c) for c in gc_dropped))
             if a.buffer_swap:
                 out[f"name={set_name(op, local_bit(colls[op]['host'][0][1]))}"] = {"algorithm=" + SWAP_LEAF: {}}
             continue

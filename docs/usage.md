@@ -602,7 +602,11 @@ model. MPICH takes a variant only after a `dispatch(<mask>)` that leaves its
 `_coll` restriction out, so the file also has the set of `gpu_coll` alone,
 `"name=bcast-intra-800": "dispatch(800)"`: a `gpu_coll` call goes there and on
 to the `-gpu` sets, falling back within the variant and, if none matches, to the
-host sets. The model's catalog must have both restrictions.
+host sets. A host set with more restrictions that hold comes first, though, so
+for a host set `S` where that changes the choice at some point of the gpu
+models, colltree also writes `<S | 800>` the same way (e.g.
+`"name=allreduce-intra-a0c": "dispatch(800)"` for `allreduce-intra-20c`), and
+reports the ones it leaves out. The model's catalog must have both restrictions.
 
 `gpu_local` can differ between the ranks of a call, so MPICH takes it through a
 local set, `bcast-intra-<gpu_local bit>` (e.g. `bcast-intra-400`), first: its

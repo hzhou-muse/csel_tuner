@@ -158,6 +158,24 @@ def test_variant():
     assert pick(trees, gpu_local=True, gpu_coll=True) == "swap"
 
 
+
+def test_gpu_coll_sets():
+    """colltree adds s|gpu_coll for a host set s when a gpu_coll call would otherwise stay in s,
+    keeps the base set of gpu_coll alone, and drops the others that change nothing."""
+    ct = SourceFileLoader("colltree", os.path.join(REPO, "bin", "colltree")).load_module()
+    bits = ["a", "b", "gpu_local", "gpu_coll"]
+    leaf = {k: {"algorithm=" + k: {}} for k in ("h0", "h1", "h3", "g0", "swap")}
+    out = {"name=c-intra-0": leaf["h0"], "name=c-intra-1": leaf["h1"], "name=c-intra-3": leaf["h3"],
+           "name=c-intra-0-gpu": leaf["g0"], "name=c-intra-4": leaf["swap"]}
+    points = [{"cond": {"a": a, "b": b, "gpu_local": True, "gpu_coll": True}}
+              for a, b in ((False, False), (True, False), (True, True))]
+    # c-intra-3 has more restrictions than c-intra-8, so a gpu_coll call with a and b needs c-intra-b;
+    # c-intra-1 ties with c-intra-8, which wins as the larger mask, so c-intra-9 changes nothing
+    assert ct.gpu_coll_sets("c", out, points, bits, 8, 4) == ([8, 0xb], [9])
+    # where c-intra-3 chooses like the -gpu set, c-intra-b changes nothing either; c-intra-8 stays
+    out["name=c-intra-3"] = leaf["g0"]
+    assert ct.gpu_coll_sets("c", out, points, bits, 8, 4) == ([8], [9, 0xb])
+
 if __name__ == "__main__":
     np.seterr(all="ignore")
     for name, fn in list(globals().items()):
