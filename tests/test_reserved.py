@@ -79,17 +79,21 @@ def test_gpu_reserved():
         gpu_model().save(g)
         new = run([h, g], "--node-aware")
         old = run([h, g], "--node-aware", "--format", "legacy")
-    assert sorted(new) == ["bcast-intra-0", "bcast-intra-0-gpu", "bcast-intra-2"], sorted(new)
+    assert sorted(new) == ["bcast-intra-0", "bcast-intra-0-gpu", "bcast-intra-2", "bcast-intra-4"], sorted(new)
     check_mpich_rules(new, "bcast-intra", GPU_BITS)
     local = new["bcast-intra-2"]
     assert set(calls(local)) == {"dispatch(2)"}, local
+    # the set of gpu_coll (bit 2) leaves it out, which selects the -gpu variant
+    assert new["bcast-intra-4"] == "dispatch(4)", new["bcast-intra-4"]
     # a gpu_coll call never swaps, so the -gpu sets choose without buffer_swap
     assert "algorithm=MPIR_Coll_buffer_swap" not in json.dumps(new["bcast-intra-0-gpu"])
     for x in points(GPU_BITS, LAYOUTS, SIZES):
-        if x["cond"]["gpu_coll"]:
-            continue                    # legacy lets gpu_coll calls swap
-        a = legacy_choice(old, "bcast-intra", x, GPU_BITS)
         b = file_choice(new, "bcast-intra", x, GPU_BITS)
+        if x["cond"]["gpu_coll"]:
+            # legacy lets gpu_coll calls swap; here they take the -gpu set
+            assert b == json_choice(new["bcast-intra-0-gpu"], x, new, GPU_BITS), (x, b)
+            continue
+        a = legacy_choice(old, "bcast-intra", x, GPU_BITS)
         assert a == b, (x, a, b)
 
 
@@ -130,13 +134,28 @@ def test_fallback_mask():
     trees = {"c-intra-0": {}, "c-intra-1": {}, "c-intra-2": {}, "c-intra-3": {}}
     bits = ["a", "b"]
     for m in range(4):
-        assert auto_lookup(trees, "c-intra", m & ~2, False, bits) == "c-intra-%x" % (m & 1)
-    try:
-        auto_lookup({"c-intra-0": {}, "c-intra-1": {}, "c-intra-2": {}}, "c-intra", 3, False, bits)
-    except ValueError as e:
-        assert "tie" in str(e)
-    else:
-        raise AssertionError("a tie must be refused")
+        assert auto_lookup(trees, "c-intra", m & ~2, 0, bits) == "c-intra-%x" % (m & 1)
+    # of two sets of the same size, the larger mask
+    assert auto_lookup({"c-intra-0": {}, "c-intra-1": {}, "c-intra-2": {}}, "c-intra", 3, 0, bits) == "c-intra-2"
+
+
+def test_variant():
+    """MPICH takes a -gpu set only after a dispatch that leaves gpu_coll out (here the set
+    c-intra-4), and falls back to the host sets; a gpu_coll call never takes the local set."""
+    bits = ["a", "gpu_local", "gpu_coll"]
+    leaf = {k: {"algorithm=" + k: {}} for k in ("h0", "h1", "g0", "swap")}
+    trees = {"c-intra-0": leaf["h0"], "c-intra-1": leaf["h1"], "c-intra-0-gpu": leaf["g0"],
+             "c-intra-2": leaf["swap"], "c-intra-4": "dispatch(4)"}
+
+    def pick(t, **cond):
+        return file_choice(t, "c-intra", {"cond": dict({b: False for b in bits}, **cond)}, bits)
+    assert pick(trees) == "h0"
+    assert pick(trees, a=True) == "h1"
+    assert pick(trees, gpu_local=True) == "swap"
+    assert pick(trees, gpu_local=True, gpu_coll=True) == "g0"
+    # without the set of gpu_coll the variant is never selected, and the local set is taken
+    del trees["c-intra-4"]
+    assert pick(trees, gpu_local=True, gpu_coll=True) == "swap"
 
 
 if __name__ == "__main__":

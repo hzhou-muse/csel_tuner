@@ -40,9 +40,9 @@ hold, or its largest present subset (restrictions are positive, so whatever a
 subset allows is allowed there too; at worst set 0). A set reaches a subset's
 subtree with "dispatch(<mask>)", leaving out the restrictions of the
 collective's sets that the subset lacks, since MPICH allows call= only to free
-names; two sets of the same size that could both match a call are refused by
-MPICH, so colltree adds their union as an alias to the one the legacy dispatch
-used. With --format legacy, for an MPICH without the reserved names:
+names; of two sets of the same size that could both match a call, MPICH takes
+the larger mask, so colltree adds their union as an alias to the one the legacy
+dispatch used. With --format legacy, for an MPICH without the reserved names:
 "name=<op>-intra-auto", the dispatch: "dispatch=<op>-intra(<bits>)" (the
 restriction-mask node of pmodels/mpich#8048), or with --nested-dispatch nested
 restrictive conditions ending in "call=" the subtrees; sets call each other by
@@ -64,7 +64,9 @@ the same algorithm:
 - gpu_coll is the same on all ranks, so it selects subtrees of their own: the
   gpu model's, the -gpu variant "name=<op>-intra-<S in hex>-gpu", in which
   the dispatch falls back within the variant (to "<op>-intra-0-gpu"), and only if
-  none matches to the host sets. Both conditions hold in the whole model, so they
+  none matches to the host sets. MPICH takes the variant only after a dispatch
+  that leaves gpu_coll out, so the file has "name=<op>-intra-<gpu_coll bit>":
+  "dispatch(<that bit>)" (e.g. -800) too. Both conditions hold in the whole model, so they
   are left out of S and of the algorithms' restrictions (an algorithm restricted
   to gpu alone, e.g. buffer_swap, is unrestricted there).
 - gpu_local can differ between ranks, so MPICH takes it through a local set
@@ -768,11 +770,17 @@ def local_bit(model):
     return 1 << model.conditions.index(GPU_LOCAL)
 
 
+def coll_bit(model):
+    """The mask bit of gpu_coll, the restriction whose variant is -gpu, in a model's conditions."""
+    return 1 << model.conditions.index(GPU_COLL)
+
+
 def tie_aliases(present):
-    """MPICH refuses two restriction sets of the same size that could both match one call (it
-    cannot know which combinations of restrictions happen). {union: winner} of the sets to add,
-    each a call=auto to the set the legacy dispatch used there (the most restrictions, then the
-    lower mask), and [report lines] where the aliases change a combination's choice."""
+    """Of two restriction sets of the same size that could both match one call, MPICH takes the
+    larger mask (it cannot know which combinations of restrictions happen), the legacy dispatch
+    the lower one. {union: winner} of the sets to add, each a dispatch(<mask>) to the set the
+    legacy dispatch used there (the most restrictions, then the lower mask), and [report lines]
+    where the aliases change a combination's choice."""
     sets, aliases, lines = set(present), {}, []
     U = 0
     for s in present:
@@ -1114,6 +1122,11 @@ def main(argv=None):
             if f"name={op}-intra-main" in out:
                 out[f"name={op}-intra-main"].pop(GPU_COLL, None)
         if not legacy:
+            # MPICH selects a variant only through a dispatch(<mask>) that leaves its _coll restriction
+            # out: <op>-intra-<gpu_coll bit> sends the gpu_coll calls to the -gpu sets
+            if any(k.startswith(f"name={op}-intra-") and k.endswith("-gpu") for k in out):
+                G = coll_bit(colls[op]["host"][0][1])
+                out[f"name={set_name(op, G)}"] = "dispatch(%x)" % G
             if a.buffer_swap:
                 out[f"name={set_name(op, local_bit(colls[op]['host'][0][1]))}"] = {"algorithm=" + SWAP_LEAF: {}}
             continue
