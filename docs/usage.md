@@ -289,6 +289,19 @@ bin/collmodel --model bcast.json --growth-anchors --site aurora --nodes 32 --ppn
   run's inner selection is the one its curves ran under. The run record
   (`runs[-1].growth_anchors`) lists the points, what was measured and the
   (algorithm, layout) pairs left out with the reason.
+- A guard keeps an anchor from costing more than it is worth: each point is
+  one request, smallest size first, and a point is left out (`guarded`, with
+  the reason) when its request is predicted to take longer than
+  `--growth-max-s` (default: half of `--timeout`), or when it is at least as
+  large (N, ppn and m) as a point left out or timed out before. The request
+  time is taken as (3 + `--batches`) calls (the server's first call,
+  calibration and warmup besides the batches) of the call time: measured at
+  the point if the model has it, else a power law in N through the two
+  largest smaller N of the same algorithm, ppn and size, else the model's
+  curve. A request without a reply in `--timeout` is not retried: it goes
+  into `timeouts` and the journal, so a `--resume` does not send it again,
+  and later runs on the model skip it unless their `--timeout` is longer.
+  (The sampler still sends a batch that timed out again, up to 3 tries.)
 - N beyond the model's layouts (up to the job's allocation) are allowed, for
   scaling data without new curves: such a layout gets its precheck and stays
   out of the model's layouts. Points beyond the server's buffers (m x p above
@@ -365,6 +378,7 @@ Also `--log`, `--resume`, `--deadline`, `--checkpoint-every` (§6.5) and
 | `--grid-nodes N` | the allocation | the size grid of a collective with p blocks per buffer as on N nodes; the same in every job of a model grown over job sizes (§6.2) |
 | `--growth-anchors` | off | after the sampling, measure every modeled algorithm at a fixed point set for scaling fits (§6.2); with `--model` alone, top up a model's anchors |
 | `--growth-n`, `--growth-ppn`, `--growth-sizes` | powers of two; 1, 2^⌊log2 √ppn_max⌋, ppn_max; 1k,4k,16k, max/16, max/4 | the anchors' node counts, ranks per node and sizes |
+| `--growth-max-s` | `--timeout` / 2 | leave out an anchor whose request is predicted to take longer, and the larger points after one left out or timed out (§6.2) |
 | `--budget-h` | none | per unit: stop after this many wall-clock hours, all jobs |
 | `--budget-node-h` | none | per unit, in node-hours (deprecated: `--budget-h`; replay experiments use it) |
 | `--prune` | 2.0 | v2: skip sizes predicted this much slower than the best; 0 = off |
@@ -725,6 +739,7 @@ python3 tests/test_resume.py     # a cut journal resumes to the same model; same
 python3 tests/test_restrict.py   # catalog, precheck, sets, dispatch; the builds with sets need replay data
 python3 tests/test_extend.py     # adding an algorithm and layouts to a model, resume; needs replay data
 python3 tests/test_growth_anchors.py  # growth anchors (point set, fit unchanged, top-up, resume), growth classes, guard
+python3 tests/test_growth_guard.py    # growth anchors: points predicted too costly left out, timeouts recorded, not retried
 python3 tests/test_grow.py           # a model grown over job sizes (layouts beyond the model, stages, anchors beyond it, guard auto)
 python3 tests/test_gpu.py        # memory-kind restrictions; colltree merging host and gpu models, swap choices
 python3 tests/test_kinds.py      # restriction kinds, variants; inner trees in --inner-selection

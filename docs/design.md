@@ -712,6 +712,17 @@ for every algorithm. The records carry `growth: true` and the fit skips
 them, as it skips drift anchors: the curves and the tree do not depend on
 them. Fixed ppn keeps pof2 constant along each ladder.
 
+Because the anchors measure losing algorithms too, they reach points no
+sampler would: a ring alltoall at the largest N and size moves p times the
+data of a linear one in p - 1 dependent rounds, and one such call can take
+minutes. The anchors therefore carry their own guard: a point whose request
+is predicted (from the smaller N of the same ladder, which come first) to
+take longer than a limit is left out, so is every point that dominates
+(more N, ppn and m) one left out or timed out, and a timeout is a result —
+journaled and recorded in the run, not retried — rather than a fault. The
+sampler keeps retrying a timed-out batch: there a point is needed for the
+curve, and a hang is more likely a fault than a cost.
+
 *Alternative, not adopted for now:* store only `data` and fit on load. The
 fit is a function of the data and the fitter version (per-layout PCHIP and
 the penalty a(m): seconds, less than building

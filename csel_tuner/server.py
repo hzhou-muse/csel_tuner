@@ -7,8 +7,8 @@
 
 Every request and reply is appended to a JSONL log (`log=`), so a session
 can be replayed in the simulator. A request that gets no reply within
-`timeout` seconds kills the server and raises ServerError; `restart()`
-starts a fresh one.
+`timeout` seconds kills the server and raises Timeout (a ServerError that
+keeps the batch's earlier replies); `restart()` starts a fresh one.
 """
 import json
 import os
@@ -24,6 +24,14 @@ SERVER = os.path.join(ROOT, "server", "mpisrv")
 
 class ServerError(RuntimeError):
     pass
+
+
+class Timeout(ServerError):
+    """No reply within the timeout (the server is killed). replies: those of the
+    batch that came before, in order; the request after them got none."""
+    def __init__(self, msg, replies=()):
+        super().__init__(msg)
+        self.replies = list(replies)
 
 
 def warmup_sizes(max_m, step=4):
@@ -90,7 +98,7 @@ class Server:
             left = deadline - time.time()
             if left <= 0 or not self.sel.select(left):
                 self.kill()
-                raise ServerError(f"no reply in {timeout}s to: {what}")
+                raise Timeout(f"no reply in {timeout}s to: {what}")
             chunk = os.read(fd, 1 << 16)
             if not chunk:
                 raise ServerError(f"server closed its output; exit code {self.p.wait()}")
@@ -107,7 +115,13 @@ class Server:
         t0 = time.time()
         reps = []
         for line, req in zip(lines, reqs):
-            rep = json.loads(self.readline(self.timeout, line))
+            try:
+                rep = json.loads(self.readline(self.timeout, line))
+            except Timeout as e:
+                if self.log:
+                    self.log.flush()
+                e.replies = reps
+                raise
             if self.log:
                 self.log.write(json.dumps({"time": t0, "req": req, "rep": rep}) + "\n")
             reps.append(rep)

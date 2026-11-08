@@ -88,7 +88,16 @@ a bandwidth band (a quarter and a sixteenth of the largest size), every modeled
 algorithm whose restrictions hold and whose precheck passed, contender or not.
 --growth-n, --growth-ppn and --growth-sizes replace the defaults. The records
 carry "growth": true, and the fit skips them: the sampling, the curves and
-the tree are the same with or without them. With --model alone it tops up a
+the tree are the same with or without them. Each point is one request,
+smallest size first, and a guard (GrowthGuard) leaves out a point whose
+request is predicted to take longer than --growth-max-s (default: half of
+--timeout), from the model's records at the point, else the growth of the
+same algorithm, ppn and size at fewer nodes, else its curves; and every point
+at least as large (N, ppn, m) as one left out or timed out. A request
+without a reply in --timeout is recorded as a timeout, not retried, journaled
+(a --resume does not send it again), and kept in the run record, so that
+later runs on the model skip it unless their --timeout is longer. The run
+record lists both ("guarded", "timeouts"). With --model alone it tops up a
 model's anchors (points it has are not remeasured):
 
     bin/collmodel --model bcast.json --growth-anchors --out bcast2.json --site aurora --nodes 32 --ppn 96
@@ -151,6 +160,7 @@ from csel_tuner.model import FORMAT, FORMAT_V4, Model, ModelFile, default_tags, 
 from csel_tuner.multi import Builder2, MultiSampler, known_sampler  # noqa: E402
 from csel_tuner.restrict import fixed_point, mem_known, plan_sets, precheck, set_name  # noqa: E402
 from csel_tuner.single import Builder, initial_layouts  # noqa: E402
+from csel_tuner.server import ServerError  # noqa: E402
 
 VERSION = "collmodel 0.4"
 
@@ -308,7 +318,7 @@ def resume_check(jobs, job):
 def live(a, shared=None):
     """(send, make_req, probe, layouts, sizes, nodes, ppn_max, max_m, meta, server). shared: {"srv": the
     server of this launch kind, started by the launch kind's first unit, reused by the others}."""
-    from csel_tuner.server import Server, ServerError
+    from csel_tuner.server import Server, Timeout
     # a forced algorithm whose restriction fails must fail, not run the default
     env = {"MPIR_CVAR_COLLECTIVE_FALLBACK": "error"}
     if a.inner_selection:
@@ -398,13 +408,43 @@ def live(a, shared=None):
                 print(f"warning: {e}\n  restarting the server (attempt {attempt + 2} of 3)", file=sys.stderr)
                 srv.restart()
 
-    def send(reqs, occurrences):
+    def rewarm(reqs, m):
         # After a driver pause, mid-size messages measure slow for a while
         # (a pause of a few hundred ms is enough): re-warm first.
         if time.time() - srv.last > a.rewarm_gap:
-            srv.measure(**dict(reqs[0], m=rewarm_m, batches=1, target_us=20000, tag="rewarm"))
-        return [{"status": "ok", "t_us": rep["t_us"], "wall_us": rep["wall_us"]}
-                for rep in retrying(lambda: srv.measure_many(reqs))]
+            srv.measure(**dict(reqs[0], m=m, batches=1, target_us=20000, tag="rewarm"))
+
+    def ok(rep):
+        return {"status": "ok", "t_us": rep["t_us"], "wall_us": rep["wall_us"]}
+
+    def send(reqs, occurrences, timeout_ok=False):
+        """The replies to reqs, in order. A batch that gets no reply in --timeout is sent again on a
+        fresh server, up to 3 tries. timeout_ok (growth anchors): a request without a reply gets
+        {"status": "timeout"} as its reply and is not sent again; the server is restarted for the
+        requests after it. The re-warm then uses at most the first request's size, so that a
+        timed-out re-warm stands for that request, and a cheap point is not preceded by a costly one."""
+        if not timeout_ok:
+            rewarm(reqs, rewarm_m)
+            return [ok(rep) for rep in retrying(lambda: srv.measure_many(reqs))]
+        out, todo = [], list(reqs)
+        while todo:
+            try:
+                rewarm(todo, min(rewarm_m, todo[0]["m"]))
+                reps = srv.measure_many(todo)
+            except Timeout as e:
+                for rep in e.replies:
+                    if rep["status"] != "ok":
+                        raise ServerError(rep.get("msg", "error"))
+                out += [ok(rep) for rep in e.replies]
+                out.append({"status": "timeout", "msg": str(e), "wall_us": a.timeout * 1e6})
+                todo = todo[len(e.replies) + 1:]
+                print(f"warning: {e}\n  recorded as a timeout, not sent again; restarting the server",
+                      file=sys.stderr)
+                srv.restart()
+                continue
+            out += [ok(rep) for rep in reps]
+            break
+        return out
 
     def probe(req):
         rep = retrying(lambda: srv.request(**req))
@@ -444,7 +484,7 @@ def replay(a):
     def make_req(n, ppn, alg, m):
         return dict(op=a.op, alg=alg, m=m, p=n * ppn, ppn=ppn)
 
-    def send(reqs, occurrences):
+    def send(reqs, occurrences, timeout_ok=False):
         out = []
         for r, k in zip(reqs, occurrences):
             t, wall = rep.one(alias.get(r["alg"], (r["alg"],))[0], r["p"] // r["ppn"], r["ppn"], r["m"], k)
@@ -464,14 +504,16 @@ def replay(a):
 
 
 def make_measure(journal, send, make_req, on_reply=None):
-    """measure(n, ppn, alg, [m, ...], tag=None) -> [(t_us, wall_us), ...]:
+    """measure(n, ppn, alg, [m, ...], tag=None, timeout_ok=False) -> [(t_us, wall_us), ...]:
     answers from the journal where it has them, the rest measured as one batch
     and journaled. send() also gets each request's occurrence count (how often
     it was asked before), for an order-independent replay. on_reply(req, rep,
-    journal job index or None for this job) sees every answer, in order."""
+    journal job index or None for this job) sees every answer, in order.
+    timeout_ok: a request without a reply in --timeout is answered (and journaled)
+    as a timeout, t_us None, instead of being retried (send())."""
     counts = {}
 
-    def measure(n, ppn, alg, ms, tag=None):
+    def measure(n, ppn, alg, ms, tag=None, timeout_ok=False):
         reqs = [dict(make_req(n, ppn, alg, m), **({"tag": tag} if tag else {})) for m in ms]
         out, todo, job = [None] * len(reqs), [], [None] * len(reqs)
         for i, r in enumerate(reqs):
@@ -484,17 +526,21 @@ def make_measure(journal, send, make_req, on_reply=None):
             else:
                 out[i], job[i] = rep, journal.last_job
         if todo:
-            reps = send([reqs[i] for i, _ in todo], [o for _, o in todo])
+            kw = {"timeout_ok": True} if timeout_ok else {}
+            reps = send([reqs[i] for i, _ in todo], [o for _, o in todo], **kw)
             for (i, _), rep in zip(todo, reps):
                 out[i] = rep
                 journal.write({"req": reqs[i], "rep": rep})
             journal.flush()
         for r, rep, j in zip(reqs, out, job):
+            if rep.get("status") == "timeout" and not timeout_ok:
+                raise ServerError(rep.get("msg", "timeout"))
             measure.answered[req_key(r)] = rep
             measure.wall_us += float(rep["wall_us"])
             if on_reply:
                 on_reply(r, rep, j)
-        return [(float(np.median(r["t_us"])), float(r["wall_us"])) for r in out]
+        return [(None if r.get("status") == "timeout" else float(np.median(r["t_us"])), float(r["wall_us"]))
+                for r in out]
     measure.answered = {}
     measure.wall_us = 0.0       # recorded wall time of every answer (replay bills this)
     return measure
@@ -1003,7 +1049,10 @@ def growth_spec(a):
     """The anchors' settings as the job record keeps them (None without --growth-anchors)."""
     if not a.growth_anchors:
         return None
-    return {"n": a.growth_n, "ppn": a.growth_ppn, "sizes": a.growth_sizes}
+    spec = {"n": a.growth_n, "ppn": a.growth_ppn, "sizes": a.growth_sizes}
+    if getattr(a, "growth_max_s", None) is not None:     # only when given: journals of earlier versions resume
+        spec["max_s"] = a.growth_max_s
+    return spec
 
 
 def growth_anchors(a, model, measure, inner_hash, stop_check, on_layout, cost, allocation=None, probe=None):
@@ -1053,6 +1102,9 @@ def growth_anchors(a, model, measure, inner_hash, stop_check, on_layout, cost, a
           f"sizes {','.join(map(str, sizes))}: {rec['points']} points to measure, "
           f"{len(skipped)} (algorithm, layout) pairs left out, "
           f"{n_over} points beyond the server's buffers left out", file=sys.stderr)
+    max_s = getattr(a, "growth_max_s", None)
+    guard = GrowthGuard(m, max_s if max_s is not None else a.timeout / 2, a.timeout, a.batches)
+    rec.update(max_s=guard.max_s, guarded=[], timeouts=[])
     c0 = cost()
     try:
         last = None
@@ -1065,8 +1117,19 @@ def growth_anchors(a, model, measure, inner_hash, stop_check, on_layout, cost, a
                     rec["stop"] = why
                     break
                 last = lay
-            measure(lay[0], lay[1], x, ms, tag="growth")
-            rec["measured"] += len(ms)
+            for s in ms:            # one request per size, smallest first: a timeout stops the larger ones
+                pt = {"alg": x, "N": lay[0], "ppn": lay[1], "m": s}
+                why = guard.check(x, lay[0], lay[1], s)
+                if why:
+                    guard.block(x, lay[0], lay[1], s)
+                    rec["guarded"].append(dict(pt, **why))
+                    continue
+                t, _ = measure(lay[0], lay[1], x, [s], tag="growth", timeout_ok=True)[0]
+                if t is None:
+                    guard.block(x, lay[0], lay[1], s)
+                    rec["timeouts"].append(dict(pt, after_s=a.timeout))
+                else:
+                    rec["measured"] += 1
         else:
             if last is not None:
                 on_layout()
@@ -1074,9 +1137,81 @@ def growth_anchors(a, model, measure, inner_hash, stop_check, on_layout, cost, a
         rec["stop"] = "terminated"
         print("SIGTERM: writing the model with the growth anchors measured so far", file=sys.stderr)
     rec["node_h"] = round(cost() - c0, 4)
-    print(f"growth anchors: {rec['measured']} of {rec['points']} points, {rec['node_h']:.3f} node-h, "
-          f"stop: {rec['stop']}", file=sys.stderr)
+    print(f"growth anchors: {rec['measured']} of {rec['points']} points, {len(rec['guarded'])} left out by the "
+          f"guard (request predicted above {guard.max_s:g} s, or beyond a point left out or timed out), "
+          f"{len(rec['timeouts'])} timed out, {rec['node_h']:.3f} node-h, stop: {rec['stop']}", file=sys.stderr)
+    for g in rec["guarded"] + rec["timeouts"]:
+        why = g.get("why", "timeout after %g s" % g.get("after_s", 0)) + \
+            (f" ({g['predicted_s']} s from the {g['source']})" if "predicted_s" in g else "")
+        print(f"  {g['alg']} {g['N']}x{g['ppn']} m={g['m']}: {why}", file=sys.stderr)
     return rec
+
+
+GROWTH_CALLS = 3    # calls of a request besides its batches: the untimed first call, calibration (k = 1 for
+                    # a call above target_us/2) and the warmup batch (server/macros/measure.def)
+
+
+class GrowthGuard:
+    """Which growth anchors not to measure. A point is left out when
+    - an earlier run of the model timed out on it after at least this run's --timeout;
+    - it is at least as large as a point timed out or left out before: the same algorithm, at
+      least the nodes, ranks per node and size (the anchors come by ppn class, then N, then size,
+      so the smaller points come first);
+    - its predicted request time, GROWTH_CALLS + batches calls of the predicted call time, is above
+      max_s. The call time is, in this order: measured at the point (any record of the model); a
+      power law in N through the two largest smaller N (N > 1) at the same algorithm, ppn and size
+      (from one: linear in N); the model's curve of the algorithm at the layout."""
+
+    def __init__(self, model, max_s, timeout, batches):
+        self.m, self.max_s, self.calls = model, max_s, GROWTH_CALLS + batches
+        self.by, self.pos = {}, 0       # (alg, ppn, m) -> {N: [median t_us of each record]}
+        self.blocked = []               # (alg, N, ppn, m)
+        self.earlier = {}
+        for run in model.runs:
+            for x in (run.get("growth_anchors") or {}).get("timeouts", []):
+                if x["after_s"] >= timeout:
+                    self.earlier[(x["alg"], x["N"], x["ppn"], x["m"])] = x["after_s"]
+
+    def refresh(self):
+        ms = self.m.measurements
+        for r in ms[self.pos:]:
+            self.by.setdefault((r["alg"], r["ppn"], r["m"]), {}).setdefault(r["N"], []).append(
+                float(np.median(r["t_us"])))
+        self.pos = len(ms)
+
+    def predict_us(self, alg, n, q, s):
+        """(the call time in µs, its source), or (None, None)."""
+        self.refresh()
+        at = {k: float(np.median(v)) for k, v in self.by.get((alg, q, s), {}).items()}
+        if n in at:
+            return at[n], "measurement"
+        pts = sorted((k, t) for k, t in at.items() if 1 < k < n)
+        if pts:
+            n2, t2 = pts[-1]
+            e = 1.0
+            if len(pts) > 1:
+                n1, t1 = pts[-2]
+                e = min(max(math.log(t2 / t1) / math.log(n2 / n1), 0.0), 3.0)
+            return t2 * (n / n2) ** e, f"growth from N={n2} (exponent {e:.2f})"
+        try:
+            return float(2 ** self.m.predict(alg, n, q)[self.m.sizes.index(s)]), "model"
+        except Exception:       # no curves of the algorithm to predict from
+            return None, None
+
+    def check(self, alg, n, q, s):
+        """None to measure the point, else why it is left out (a dict for the run record)."""
+        if (alg, n, q, s) in self.earlier:
+            return {"why": "timeout after %g s in an earlier run" % self.earlier[(alg, n, q, s)]}
+        for b in self.blocked:
+            if b[0] == alg and b[1] <= n and b[2] <= q and b[3] <= s:
+                return {"why": "beyond %dx%d m=%d" % b[1:]}
+        t, src = self.predict_us(alg, n, q, s)
+        if t is not None and self.calls * t * 1e-6 > self.max_s:
+            return {"why": "predicted over the limit", "predicted_s": round(self.calls * t * 1e-6, 1), "source": src}
+        return None
+
+    def block(self, alg, n, q, s):
+        self.blocked.append((alg, n, q, s))
 
 
 # ---- the output file -----------------------------------------------------------
@@ -1268,6 +1403,9 @@ def parse_args(argv):
                    "power of two <= sqrt(ppn_max), ppn_max)")
     g.add_argument("--growth-sizes", metavar="M,...", help="the anchors' sizes, snapped to the grid, k/M "
                    "suffixes allowed (default: 1k,4k,16k and the largest size /16 and /4)")
+    g.add_argument("--growth-max-s", type=float, metavar="SEC", help="leave out an anchor whose request is predicted "
+                   "to take longer than this, and the larger points of the algorithm after one left out or timed "
+                   "out (default: half of --timeout)")
     ap.add_argument("--plan", action="store_true", help="print the units (--colls/--op, --launch) with their "
                     "algorithms by stage (from the inner calls in --catalog) and the trees each needs; no run")
     ap.add_argument("--max-stage", type=int, help="with --model: add only algorithms up to this stage (--plan); "
@@ -1342,8 +1480,8 @@ def parse_args(argv):
         if not a.catalog:
             ap.error("--plan needs --catalog")
         a.algs = a.algs or "all"
-    if (a.growth_n or a.growth_ppn or a.growth_sizes) and not a.growth_anchors:
-        ap.error("--growth-n, --growth-ppn and --growth-sizes go with --growth-anchors")
+    if (a.growth_n or a.growth_ppn or a.growth_sizes or a.growth_max_s is not None) and not a.growth_anchors:
+        ap.error("--growth-n, --growth-ppn, --growth-sizes and --growth-max-s go with --growth-anchors")
     if not (a.alg or a.algs or (a.model and (a.layouts or a.growth_anchors))):
         ap.error("one of --alg or --algs is required (or --model with --layouts or --growth-anchors)")
     a.algs = a.algs.split(",") if a.algs else [a.alg] if a.alg else []

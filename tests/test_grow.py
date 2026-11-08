@@ -179,13 +179,17 @@ def test_over_limit_points_left_out():
 
     class A:
         growth_n, growth_ppn, growth_sizes, catalog, replay = "2,4", "1", "1k,4k", None, False
+        growth_max_s, timeout, batches = None, 300, 5
         over_limit = staticmethod(lambda p, m: m * p > 8192)
     m = Model("allgather", [1024, 4096], [(1, 2), (2, 1), (4, 1)], {"N": [1, 4], "ppn": [1, 1], "m": [1024, 4096]})
     m.algorithms = {"x": {"leaf": None, "restrictions": [], "mask": 0, "inner": []}}
     sent = []
-    rec = cm.growth_anchors(A, m, lambda n, q, alg, ms, tag=None: sent.append((n, ms)), None, lambda: None,
-                            lambda: None, lambda: 0.0)
-    assert sent == [(2, [1024, 4096]), (4, [1024])] and rec["over_limit"] == 1
+
+    def measure(n, q, alg, ms, tag=None, timeout_ok=False):
+        sent.append((n, ms))
+        return [(1.0, 8.0)] * len(ms)
+    rec = cm.growth_anchors(A, m, measure, None, lambda: None, lambda: None, lambda: 0.0)
+    assert sent == [(2, [1024]), (2, [4096]), (4, [1024])] and rec["over_limit"] == 1
 
 
 if __name__ == "__main__":
