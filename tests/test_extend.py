@@ -63,8 +63,8 @@ def test_add_algorithm_matches_one_shot():
         new = [r for r in b.measurements if r["job"] in added["jobs"]]
         assert sum(r["alg"] == "circ_graph" for r in new) > 0.6 * len(new)
         assert sum(1 for r in new if r.get("anchor")) == added["anchors"]["points"]
-        # the earlier data is kept as it was
-        assert b.measurements[:len(a.measurements)] == a.measurements
+        # the earlier data is kept as it was (the file lists records grouped by algorithm)
+        assert [r for r in b.measurements if r["job"] not in added["jobs"]] == a.measurements
         r4, r5, r_once = true_regret(m4), true_regret(m5), true_regret(once)
         assert r5 < r4 and r5 < r_once * 1.02, (r4, r5, r_once)
         assert added["node_h"] < Model.load(once).runs[-1]["node_h"]

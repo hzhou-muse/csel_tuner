@@ -184,8 +184,8 @@ class Model:
             "conditions": self.conditions, "algorithms": self.algorithms,
             "layout_masks": [[l[0], l[1], self.masks.get(l, 0)] for l in self.layouts],
             "left_out": self.left_out, "notes": self.notes,
-            "data": {"jobs": self.jobs, "measurements": self.measurements, "prechecks": self.prechecks,
-                     "inner_files": self.inner_files},
+            "data": {"jobs": self.jobs, "measurements": self.grouped(self.measurements),
+                     "prechecks": self.grouped(self.prechecks), "inner_files": self.inner_files},
             "fit": {"version": FIT_VERSION, "inner": self.fit_inner,
                     "curves": {a: [{"N": l[0], "ppn": l[1], "log2_t": r(c)} for l, c in sorted(cs.items())]
                                for a, cs in self.curves.items()},
@@ -195,6 +195,14 @@ class Model:
         }
 
     # ---- data ----------------------------------------------------------
+
+    def grouped(self, records):
+        """Records grouped by algorithm (the catalog's order, then by first appearance), each
+        algorithm's in their order: how a .model file lists them (modelfile.py)."""
+        order = {a: i for i, a in enumerate(self.algorithms)}
+        for r in records:
+            order.setdefault(r["alg"], len(order))
+        return sorted(records, key=lambda r: order[r["alg"]])
 
     def add_job(self, job):
         self.jobs.append(job)
@@ -215,6 +223,7 @@ class Model:
         self.measurements.append(rec)
 
     def add_precheck(self, job, alg, n, ppn, ok, msg=""):
+        msg = " ".join(str(msg).split())        # one line, for the .model file
         self.prechecks.append({"alg": alg, "N": n, "ppn": ppn, "ok": bool(ok), "msg": msg, "job": job})
 
     def add_inner_file(self, text):
