@@ -211,13 +211,17 @@ class GridSampler:
 
 
 class LayoutModel:
-    def __init__(self, curves, penalty=True, smooth=3):
-        """curves: {(n, ppn): log2 T at every grid size}."""
+    def __init__(self, curves, penalty=True, smooth=3, a=None):
+        """curves: {(n, ppn): log2 T at every grid size}; a: {intra: a(m) or None}, the penalty
+        of an earlier fit of the same curves (a model file's fit cache), so fit_a is skipped."""
         self.curves = curves
         self.penalty = penalty
         self.a = {}
         for intra in (True, False):
-            self.a[intra] = self.fit_a(intra, smooth) if penalty else None
+            if a is not None and penalty:
+                self.a[intra] = None if a[intra] is None else np.asarray(a[intra], float)
+            else:
+                self.a[intra] = self.fit_a(intra, smooth) if penalty else None
         nsz = len(next(iter(curves.values())))
         self.S = {}
         for lay, y in curves.items():

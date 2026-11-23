@@ -20,8 +20,9 @@ flag), the precheck results, the jobs and the inner selection files. `fit`
 holds each algorithm's curve at each layout where it was sampled (log2 T
 on the size grid, as the sampler left it: measured sizes exactly, the rest
 interpolated or, where pruned, the cross-layout prediction corrected by the
-measured residuals). An algorithm's model across layouts is a
-single.LayoutModel over all its curves, fitted on load. See
+measured residuals) and the penalty a(m) of its LayoutModel. An algorithm's
+model across layouts is a single.LayoutModel over all its curves, built on
+load from the stored a (a file of fit version 1 refits it). See
 docs/design.md, section 12.
 """
 import datetime
@@ -37,7 +38,7 @@ from .single import LayoutModel
 
 FORMAT = "collmodel/5"
 FORMAT_V4 = "collmodel/4"
-FIT_VERSION = 1
+FIT_VERSION = 2          # 2: the penalty a(m) of each algorithm stored; 1 refits it on load
 
 
 def default_tags(coll, launch="host", inplace=False, counts="uniform"):
@@ -119,6 +120,7 @@ class Model:
         self.prechecks = []             # [{"alg", "N", "ppn", "ok", "msg", "job"}]
         self.inner_files = {}           # hash -> content of a tuning file loaded for inner calls
         self.curves = {}                # alg -> {layout: log2 T on the grid}
+        self.penalty = {}               # alg -> {intra: a(m) or None}, its LayoutModel's (fit cache)
         self._inner_at = None           # (alg, N, ppn) -> inner selection, built by inner_at
         self.fit_inner = {}             # compositional alg -> hash of the inner selection its curves ran under
         self.runs = []                  # per collmodel run: settings, stop, estimate (results, not model)
@@ -160,9 +162,11 @@ class Model:
         self.jobs, self.measurements = data["jobs"], data["measurements"]
         self.prechecks, self.inner_files = data["prechecks"], data["inner_files"]
         fit = d["fit"]
-        if fit.get("version") != FIT_VERSION:
+        if fit.get("version") not in (1, FIT_VERSION):
             raise ValueError("%s: fit version %s, this tool has %d" % (path, fit.get("version"), FIT_VERSION))
         self.curves = {a: {(c["N"], c["ppn"]): np.array(c["log2_t"]) for c in cs} for a, cs in fit["curves"].items()}
+        for a, p in fit.get("penalty", {}).items():     # version 1 has none: refitted when needed
+            self.penalty[a] = {True: p["intra"], False: p["inter"]}
         self.fit_inner = fit.get("inner", {})
         self.runs = d.get("runs", [])
         return self
@@ -170,6 +174,10 @@ class Model:
     def to_dict(self):
         """The unit's entry in a collmodel/5 file."""
         r = lambda v: [round(float(x), 6) for x in v]
+        rn = lambda v: None if v is None else r(v)
+        for a, cs in self.curves.items():
+            if cs and a not in self.penalty:
+                self.layout_model(a)
         return {
             "tags": self.tags, "what": "%s-latency" % self.op,
             "sizes": self.sizes, "domain": self.domain, "layouts": [list(l) for l in self.layouts],
@@ -180,7 +188,9 @@ class Model:
                      "inner_files": self.inner_files},
             "fit": {"version": FIT_VERSION, "inner": self.fit_inner,
                     "curves": {a: [{"N": l[0], "ppn": l[1], "log2_t": r(c)} for l, c in sorted(cs.items())]
-                               for a, cs in self.curves.items()}},
+                               for a, cs in self.curves.items()},
+                    "penalty": {a: {"intra": rn(p[True]), "inter": rn(p[False])}
+                                for a, p in sorted(self.penalty.items()) if self.curves.get(a)}},
             "runs": self.runs,
         }
 
@@ -327,14 +337,20 @@ class Model:
     def set_curve(self, alg, lay, curve):
         self.curves.setdefault(alg, {})[tuple(lay)] = np.asarray(curve, float)
         self._lm.pop(alg, None)
+        self.penalty.pop(alg, None)
 
     def drop_curves(self, alg):
         self.curves.pop(alg, None)
         self._lm.pop(alg, None)
+        self.penalty.pop(alg, None)
 
     def layout_model(self, alg):
+        """The algorithm's LayoutModel, from the stored penalty if there is one (else fitted, and
+        its penalty stored)."""
         if alg not in self._lm:
-            self._lm[alg] = LayoutModel(self.curves[alg])
+            lm = LayoutModel(self.curves[alg], a=self.penalty.get(alg))
+            self.penalty[alg] = dict(lm.a)
+            self._lm[alg] = lm
         return self._lm[alg]
 
     def predict(self, alg, n, ppn):

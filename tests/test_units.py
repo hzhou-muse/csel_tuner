@@ -1,5 +1,5 @@
 """Model files of several units (collmodel/5): tags, selection, the round trip, collmodel/4 files
-read as one unit, put() replacing by tags, and collmodel --merge."""
+read as one unit, put() replacing by tags, collmodel --merge, and the fit cache (the stored penalty)."""
 import json
 import os
 import subprocess
@@ -74,6 +74,36 @@ def test_v4():
         assert Model.load(path).tags == default_tags("alltoallv")
 
 
+def test_fit_cache():
+    """The penalty a(m) is stored: a loaded model predicts as the fresh fit did, without fit_a; a
+    changed curve drops it; a file of fit version 1 (no penalty) refits on load."""
+    from csel_tuner import single
+    sizes = [1, 2, 4, 8]
+    lays = [(1, p) for p in (2, 3, 4, 6, 8, 12, 16)]
+    m = Model("bcast", sizes, lays, {"N": [1, 1], "ppn": [2, 16], "m": [1, 8]})
+    for n, p in lays:   # a non-pof2 penalty, so a(m) is fitted (not None)
+        m.set_curve("ring", (n, p), np.log2(np.array(sizes) * p * (1 + 0.5 * single.sigma(p))))
+    fresh = m.predict("ring", 1, 10)
+    assert m.penalty["ring"][True] is not None
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "m.json")
+        m.save(path)
+        d = json.load(open(path))
+        assert d["units"][0]["fit"]["version"] == 2 and d["units"][0]["fit"]["penalty"]["ring"]["inter"] is None
+        fit_a, single.LayoutModel.fit_a = single.LayoutModel.fit_a, None     # fails if called
+        try:
+            assert np.allclose(Model.load(path).predict("ring", 1, 10), fresh)
+        finally:
+            single.LayoutModel.fit_a = fit_a
+        g = Model.load(path)
+        g.set_curve("ring", (1, 16), g.curves["ring"][(1, 16)] + 1)
+        assert "ring" not in g.penalty
+        d["units"][0]["fit"]["version"] = 1
+        del d["units"][0]["fit"]["penalty"]
+        json.dump(d, open(path, "w"))
+        assert np.allclose(Model.load(path).predict("ring", 1, 10), fresh)
+
+
 def test_merge():
     with tempfile.TemporaryDirectory() as tmp:
         a, b, c, out = (os.path.join(tmp, x) for x in ("a.json", "b.json", "c.json", "out.json"))
@@ -111,5 +141,6 @@ if __name__ == "__main__":
     test_tags()
     test_file()
     test_v4()
+    test_fit_cache()
     test_merge()
     print("ok")

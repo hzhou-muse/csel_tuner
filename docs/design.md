@@ -376,8 +376,9 @@ before a tag existed has its default value).
                                              "t_us": [...], "wall_us": ..., "job": 0}, ...],
           "prechecks": [{"alg": ..., "N": ..., "ppn": ..., "ok": true, "msg": "", "job": 0}, ...],
           "inner_files": {"<hash>": "<tuning file text>"}},
- "fit": {"version": 1, "inner": {"smp": "<hash>"},
-         "curves": {"binomial": [{"N": 2, "ppn": 4, "log2_t": [...]}, ...], ...}},
+ "fit": {"version": 2, "inner": {"smp": "<hash>"},
+         "curves": {"binomial": [{"N": 2, "ppn": 4, "log2_t": [...]}, ...], ...},
+         "penalty": {"binomial": {"intra": [...], "inter": null}, ...}},
  "runs": [{"mode": "create" | "add" | "import", "jobs": [...], "stop": ..., "node_h": ..., ...}]}
 ```
 
@@ -397,7 +398,11 @@ frozen table of the 2026-10 defaults.
 
 A measurement of a compositional algorithm also has `"inner": "<hash>"`,
 an anchor `"anchor": true`. An algorithm's model across layouts is a
-LayoutModel (§5) over all its curves, fitted on load. collmodel/2 and /3,
+LayoutModel (§5) over all its curves. Its penalty a(m), per class (intra:
+N = 1, inter: N > 1; `null` where there is nothing to fit), is the only
+costly part of that fit (a leave-one-out search over a grid of a), so the fit
+stores it and a load builds the LayoutModel from it; a file of fit version 1
+(before the penalty was stored) refits it on load. collmodel/2 and /3,
 written by earlier versions, convert with `bin/collmodel --import`.
 
 **Tuning JSON:** CSEL subtrees, the restriction sets (`name=bcast-intra-0`,
@@ -706,9 +711,9 @@ One unit of a file (collmodel/5, §12) has two sections:
   hash, with its content (tens of kB).
 - **`fit`**, derived: the per-algorithm layout models (§5) per restriction
   set, the selection and the regret estimate, with the fitting code's
-  version. `collmodel --refit` recomputes it from `data`; any tool that
-  finds an older fit version refits (not implemented yet: tools refuse a
-  fit of another version).
+  version. `collmodel --refit` recomputes it from `data` (not implemented
+  yet). A fit of version 1 lacks the stored penalty, which is refitted from
+  its curves on load; tools refuse a fit of any other version.
 
 **Growth anchors** (`collmodel --growth-anchors`) are records of a fixed
 point set: every modeled algorithm at an N ladder (powers of two) × a few
