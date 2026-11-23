@@ -10,9 +10,9 @@ decision tree in MPICH's collective-selection JSON format (CSEL).
 
 ```
 bin/collmodel --plan --colls ... --catalog CAT      the units and their stages
-bin/collmodel --colls bcast,allreduce:all --algs all --max-stage 1 ...   measure  ->  model.json
-bin/collmodel --model model.json --max-stage 2 --inner-selection t1.json ...  add  ->  model2.json
-bin/colltree model2.json                            decision trees, one file  ->  tuning.json
+bin/collmodel --colls bcast,allreduce:all --algs all --max-stage 1 ...   measure  ->  m1.model
+bin/collmodel --model m1.model --max-stage 2 --inner-selection t1.json ...  add  ->  m2.model
+bin/colltree m2.model                               decision trees, one file  ->  tuning.json
 MPIR_CVAR_COLL_SELECTION_JSON_FILE=tuning.json mpiexec ... ./app
 ```
 
@@ -37,10 +37,10 @@ make -C server MPICC=/path/to/mpich/bin/mpicc
 
 # 3. measure and model (inside an allocation): every plain bcast algorithm
 bin/collmodel --colls bcast --algs all --max-stage 1 --catalog $MPICH_SRC/src/mpi/coll/coll_algorithms.txt \
-    --site aurora --nodes 8 --ppn 96 --out bcast.json --log bcast.log
+    --site aurora --nodes 8 --ppn 96 --out bcast.model --log bcast.log
 
 # 4. make the tuning file and use it
-bin/colltree bcast.json --out bcast_tuning.json
+bin/colltree bcast.model --out bcast_tuning.json
 export MPIR_CVAR_COLL_SELECTION_JSON_FILE=$PWD/bcast_tuning.json
 ```
 

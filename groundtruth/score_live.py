@@ -2,7 +2,7 @@
 """Score the live checks (numpy only).
 
     python3 score_live.py switch RESULT_DIR
-    python3 score_live.py validate --truth DIR --default DIR --tuned DIR --model MODEL.json \\
+    python3 score_live.py validate --truth DIR --default DIR --tuned DIR --model MODEL.model \\
         --tuning TUNING.json [--tuning-node-aware T.json] [--json SUMMARY.json]
     python3 score_live.py compare --base DIR --new DIR [--noise DIR] [--json SUMMARY.json]
 
@@ -130,7 +130,7 @@ def switch(a):
 
 
 def load_model(path):
-    """The model file's one unit (collmodel/5 or /4; older ones convert with bin/collmodel --import)."""
+    """The model file's one unit (collmodel/6, or the JSON /5 or /4; older ones convert with bin/collmodel --import)."""
     from csel_tuner.model import Model
     try:
         return Model.load(path)
@@ -336,7 +336,7 @@ def main():
     v = sub.add_parser("validate")
     for k in ("truth", "default", "tuned", "tuning"):
         v.add_argument("--" + k, required=True)
-    v.add_argument("--model", required=True, help="model file of one unit (collmodel/5 or /4)")
+    v.add_argument("--model", required=True, help="model file of one unit (collmodel/6, or the JSON /5 or /4)")
     v.add_argument("--tuning-node-aware")
     v.add_argument("--json")
     c = sub.add_parser("compare")

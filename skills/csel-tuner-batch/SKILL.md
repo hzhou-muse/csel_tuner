@@ -17,11 +17,11 @@ repo for the tools themselves; this file assumes them.
 | Block | Command | In → out | Cost |
 |---|---|---|---|
 | **plan** | `bin/collmodel --plan --colls ... --launch ... --catalog CAT` | → the units, their algorithms by stage, the trees each needs | none |
-| **create** | `bin/collmodel --colls C1,C2:all,... --launch host,gpu --algs all --max-stage 1 --catalog CAT ...` | → model `M0.json` (one unit per collective, variant and launch kind) | per unit its budget (`--budget-h`) or less; precheck: one probe per algorithm × layout |
-| **add** | `bin/collmodel --model Mi.json --colls C --algs X[,Y] ...` or `--layouts NxP,...` | `Mi` → `Mi+1` (keeps `Mi`'s other units) | only the new measurements, plus a few anchors |
-| **next stage** | `... --model Mi.json --colls ... --algs all --max-stage k --inner-selection Ti.json` | `Mi` → `Mi+1` | as add; the launch loads `Ti`, the trees of the stages below k |
-| **merge** | `bin/collmodel --merge A.json --merge B.json --out C.json` | split jobs' files → one | none |
-| **tree** | `bin/colltree Mi.json --out Ti.json [--colls ...] [--node-aware]` | `Mi` → tuning file `Ti` for every collective and variant in it | seconds to a minute on the login or compute node; no measurement |
+| **create** | `bin/collmodel --colls C1,C2:all,... --launch host,gpu --algs all --max-stage 1 --catalog CAT ...` | → model `M0.model` (one unit per collective, variant and launch kind) | per unit its budget (`--budget-h`) or less; precheck: one probe per algorithm × layout |
+| **add** | `bin/collmodel --model Mi.model --colls C --algs X[,Y] ...` or `--layouts NxP,...` | `Mi` → `Mi+1` (keeps `Mi`'s other units) | only the new measurements, plus a few anchors |
+| **next stage** | `... --model Mi.model --colls ... --algs all --max-stage k --inner-selection Ti.json` | `Mi` → `Mi+1` | as add; the launch loads `Ti`, the trees of the stages below k |
+| **merge** | `bin/collmodel --merge A.model --merge B.model --out C.model` | split jobs' files → one | none |
+| **tree** | `bin/colltree Mi.model --out Ti.json [--colls ...] [--node-aware]` | `Mi` → tuning file `Ti` for every collective and variant in it | seconds to a minute on the login or compute node; no measurement |
 | **validate** | `groundtruth/gen_plans.py --set validate`, `run_set.sh` ×3, `score_live.py validate` | `Mi`, `Ti` → report | truth = every algorithm at the plan's random points; default and tuned one request per point (gen_plans prints the counts) |
 | **import** | `bin/collmodel --import old.json:old.log ...` | collmodel/3 → /4 | none |
 

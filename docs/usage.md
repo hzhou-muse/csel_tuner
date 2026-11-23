@@ -124,7 +124,7 @@ stages, see §6.7.
 bin/collmodel --op bcast \
     --algs binomial,scatter_recursive_doubling_allgather,scatter_ring_allgather,circ_graph,tree,pipelined_tree \
     --site aurora --nodes 8 --ppn 96 \
-    --budget-h 0.25 --out bcast.json --log bcast.jsonl
+    --budget-h 0.25 --out bcast.model --log bcast.jsonl
 ```
 
 - `--site/--nodes/--ppn` launch the server through `launch/config.sh`;
@@ -149,7 +149,7 @@ bin/collmodel --op bcast \
 ```sh
 bin/collmodel --op bcast --algs all \
     --catalog $MPICH_SRC/src/mpi/coll/coll_algorithms.txt \
-    --site aurora --nodes 8 --ppn 96 --budget-h 0.25 --out bcast.json --log bcast.jsonl
+    --site aurora --nodes 8 --ppn 96 --budget-h 0.25 --out bcast.model --log bcast.jsonl
 ```
 
 - `--catalog` is the `coll_algorithms.txt` of the MPICH build under
@@ -175,15 +175,17 @@ bin/collmodel --op bcast --algs all \
 - Needs an MPICH whose `release_gather` condition has no side effects
   (pmodels/mpich#8048); with an older one the precheck of `release_gather`
   depends on how often it was evaluated.
-- The model file is `collmodel/5` (design.md §12): units, each one
+- The model file is collmodel/6 text, `*.model` (design.md §8 and §12): units, each one
   collective measured one way and named by its tags (`coll`, `variant` such
   as `inplace`, `datatype`, `counts`, `launch`), with every measurement and
   its job, the precheck results, the catalog's conditions and each layout's
   mask (`data`), and each algorithm's curve at each layout it was sampled
   at (`fit`). A run puts its unit into `--out` and keeps the file's other
-  units, adding those of `--model` it lacks; `collmodel --merge A.json --merge B.json --out C.json` combines
+  units, adding those of `--model` it lacks; `collmodel --merge A.model --merge B.model --out C.model` combines
   files; `colltree --unit coll=allreduce,inplace=0` picks units from a file
-  with several. collmodel/4 files are read as one unit.
+  with several. The JSON model files of earlier versions (collmodel/5, and
+  collmodel/4 as one unit) are read everywhere;
+  `collmodel --convert old.json --out new.model` rewrites one as text.
 
 A PBS job on Aurora that stops cleanly before its walltime and continues a
 run an earlier job did not finish:
@@ -199,7 +201,7 @@ cd "$PBS_O_WORKDIR"
 resume=""; [ -s bcast.log ] && resume=--resume
 bin/collmodel --algs binomial,scatter_recursive_doubling_allgather,scatter_ring_allgather,circ_graph,tree,pipelined_tree \
     --site aurora --nodes 8 --ppn 96 --budget-h 0.75 \
-    --log bcast.log $resume --deadline 3300 --out bcast.json
+    --log bcast.log $resume --deadline 3300 --out bcast.model
 ```
 
 The budget counts every job of the run; the deadline is this job's
@@ -215,10 +217,10 @@ file, so that `--resume` finds the model the run started from).
 ```sh
 CAT=$MPICH_SRC/src/mpi/coll/coll_algorithms.txt
 # an algorithm the model lacks (all: every one of the catalog's it lacks)
-bin/collmodel --model bcast.json --algs pipelined_tree --catalog $CAT \
-    --site aurora --nodes 8 --ppn 96 --budget-h 0.125 --out bcast2.json --log add.jsonl
+bin/collmodel --model bcast.model --algs pipelined_tree --catalog $CAT \
+    --site aurora --nodes 8 --ppn 96 --budget-h 0.125 --out bcast2.model --log add.jsonl
 # more layouts for the algorithms it has
-bin/collmodel --model bcast.json --layouts 4x24,16x8 --catalog $CAT ... --out bcast2.json
+bin/collmodel --model bcast.model --layouts 4x24,16x8 --catalog $CAT ... --out bcast2.model
 ```
 
 - A new algorithm is prechecked at every layout; a new restriction moves
@@ -245,11 +247,11 @@ on 8 nodes, then add only the larger N on larger allocations:
 
 ```sh
 G="--grid-nodes 32 --catalog $CAT --site aurora --ppn 96"
-bin/collmodel --colls bcast --algs all --max-stage 1 $G --nodes 8 --out a.json ...
+bin/collmodel --colls bcast --algs all --max-stage 1 $G --nodes 8 --out a.model ...
 L16=12x1,12x2,...,16x96
-bin/collmodel --model a.json --layouts $L16 --max-stage 1 $G --nodes 16 --out b.json ...
-bin/colltree b.json --out tb.json
-bin/collmodel --model b.json --layouts $L16 --algs all --max-stage 2 --inner-selection tb.json $G --nodes 16 --out c.json ...
+bin/collmodel --model a.model --layouts $L16 --max-stage 1 $G --nodes 16 --out b.model ...
+bin/colltree b.model --out tb.json
+bin/collmodel --model b.model --layouts $L16 --algs all --max-stage 2 --inner-selection tb.json $G --nodes 16 --out c.model ...
 ```
 
 - Give every job of the model the same `--grid-nodes`, the largest allocation
@@ -273,8 +275,8 @@ points for fits of how each algorithm's time grows with N and ppn, measured
 after the sampling of a create or add run, or alone to top up a model:
 
 ```sh
-bin/collmodel --algs all --catalog $CAT --growth-anchors --site aurora --nodes 32 --ppn 96 --out bcast.json ...
-bin/collmodel --model bcast.json --growth-anchors --site aurora --nodes 32 --ppn 96 --out bcast2.json
+bin/collmodel --algs all --catalog $CAT --growth-anchors --site aurora --nodes 32 --ppn 96 --out bcast.model ...
+bin/collmodel --model bcast.model --growth-anchors --site aurora --nodes 32 --ppn 96 --out bcast2.model
 ```
 
 - The points are known before the run and do not depend on any
@@ -322,10 +324,10 @@ bin/collmodel --model bcast.json --growth-anchors --site aurora --nodes 32 --ppn
 tuning file of their inner calls loaded in the launch:
 
 ```sh
-bin/colltree bcast.json --out bcast_tuning.json
-bin/collmodel --model bcast.json --algs smp --inner-selection bcast_tuning.json --catalog $CAT \
-    --site aurora --nodes 8 --ppn 96 --budget-h 0.125 --out bcast2.json --log add.jsonl
-bin/colltree bcast2.json --out bcast_tuning2.json
+bin/colltree bcast.model --out bcast_tuning.json
+bin/collmodel --model bcast.model --algs smp --inner-selection bcast_tuning.json --catalog $CAT \
+    --site aurora --nodes 8 --ppn 96 --budget-h 0.125 --out bcast2.model --log add.jsonl
+bin/colltree bcast2.model --out bcast_tuning2.json
 ```
 
 - The file must have a tree (`name=<section>-0`, the base set, or the legacy
@@ -345,7 +347,7 @@ a stage-2 file needs the stage-1 tuning file it ran with):
 
 ```sh
 bin/collmodel --import bcast.json:bcast.jsonl --import bcast2.json:bcast2.jsonl \
-    --inner-selection bcast_tuning.json --out bcast4.json
+    --inner-selection bcast_tuning.json --out bcast4.model
 ```
 
 ### 6.3 One algorithm (v1)
@@ -418,9 +420,9 @@ A run can span several jobs and survive a kill:
   part billed. Put an algorithm back by starting a new journal.
 
   ```sh
-  bin/collmodel ... --exclude-algs A --log a.log --out a.json
+  bin/collmodel ... --exclude-algs A --log a.log --out a.model
   # algorithm B turns out to be broken: resume without it, keeping the rest
-  bin/collmodel ... --exclude-algs A,B --log a.log --resume --out a.json
+  bin/collmodel ... --exclude-algs A,B --log a.log --resume --out a.model
   ```
 - **Checkpoints.** The model file is rewritten after a layout at most every
   `--checkpoint-every` seconds (60) and at the end; the run's record in
@@ -443,7 +445,7 @@ measured on a launch with one GPU per rank:
 ```sh
 make -B -C server MPICC=$MPICH_PREFIX/bin/mpicc GPU=ze        # §3
 bin/collmodel --mem device --algs all --catalog $MPICH_SRC/src/mpi/coll/coll_algorithms.txt \
-    --out bcast_gpu.json --site aurora --nodes 8 --ppn 12 --log bcast_gpu.log
+    --out bcast_gpu.model --site aurora --nodes 8 --ppn 12 --log bcast_gpu.log
 ```
 
 - mpisrv runs with `--mem device`. It allocates its buffers on the rank's
@@ -479,13 +481,13 @@ CAT=$MPICH_SRC/src/mpi/coll/coll_algorithms.txt
 bin/collmodel --plan --colls bcast,ibcast,reduce:all,ireduce:all,allreduce:all,iallreduce:all --launch host,gpu --catalog $CAT
 # 2. stage 1: every plain algorithm of every unit (one file; split into jobs as the queue allows)
 bin/collmodel --colls bcast,ibcast,reduce:all,ireduce:all,allreduce:all,iallreduce:all --launch host,gpu --algs all --max-stage 1 \
-    --catalog $CAT --site aurora --nodes 8 --ppn 96 --out s1.json --log s1.log
+    --catalog $CAT --site aurora --nodes 8 --ppn 96 --out s1.model --log s1.log
 # 3. the trees so far, as the inner selection of stage 2
-bin/colltree s1.json --out inner1.json
-# 4. stage 2 (e.g. bcast nb, on ibcast's tree); the --out file keeps s1.json's other units
-bin/collmodel --model s1.json --colls bcast --launch host --algs all --max-stage 2 \
-    --inner-selection inner1.json --catalog $CAT --site aurora --nodes 8 --ppn 96 --out s2.json --log s2.log
-# ... colltree s2.json, stage 3 (bcast smp, on the bcast tree with nb), and so on to the last stage
+bin/colltree s1.model --out inner1.json
+# 4. stage 2 (e.g. bcast nb, on ibcast's tree); the --out file keeps s1.model's other units
+bin/collmodel --model s1.model --colls bcast --launch host --algs all --max-stage 2 \
+    --inner-selection inner1.json --catalog $CAT --site aurora --nodes 8 --ppn 96 --out s2.model --log s2.log
+# ... colltree s2.model, stage 3 (bcast smp, on the bcast tree with nb), and so on to the last stage
 # 5. the tuning file of the whole collection
 bin/colltree s3.json --out tuning.json
 ```
@@ -503,8 +505,8 @@ bin/colltree s3.json --out tuning.json
   `--algs all`; an explicit `--algs` above k is refused), and collmodel
   refuses one whose inner trees are not in `--inner-selection`.
 - Split jobs any way: by collective, variant, launch kind or stage. Files
-  from parallel jobs combine with `collmodel --merge A.json --merge B.json
-  --out C.json`. Only the stage order is fixed.
+  from parallel jobs combine with `collmodel --merge A.model --merge B.model
+  --out C.model`. Only the stage order is fixed.
 - colltree writes every collective's and variant's subtrees into one file,
   reports the variants without a unit (user ops are not measured by design;
   their calls reach subtree 0, correct for any op), and reports stale
@@ -513,9 +515,9 @@ bin/colltree s3.json --out tuning.json
 ## 7. Make and load the tuning file (`bin/colltree`)
 
 ```sh
-bin/colltree bcast.json --out bcast_tuning.json
-bin/colltree bcast.json bcast_gpu.json --out bcast_tuning.json   # host and device buffers (§6.6)
-bin/colltree run.json --colls bcast,ibcast --out tuning.json      # several collectives, one file
+bin/colltree bcast.model --out bcast_tuning.json
+bin/colltree bcast.model bcast_gpu.model --out bcast_tuning.json   # host and device buffers (§6.6)
+bin/colltree run.model --colls bcast,ibcast --out tuning.json      # several collectives, one file
 ```
 
 Every collective among the selected units (`--colls`, `--unit`) gets its
@@ -549,7 +551,7 @@ A compact file for MPICH's built-in default (subtrees of a few levels, no
 node conditions), spliced into the source tree:
 
 ```sh
-bin/colltree run.json --features comm_size,msg_size,pof2 --max-depth 4 \
+bin/colltree run.model --features comm_size,msg_size,pof2 --max-depth 4 \
     --into $MPICH_SRC/src/mpi/coll/coll_selection.json --out $MPICH_SRC/src/mpi/coll/coll_selection.json
 ```
 
@@ -557,7 +559,7 @@ A smaller, more readable default from the runs of two networks (one tree serves 
 pruned at one price, round thresholds, one line per leaf):
 
 ```sh
-bin/colltree a.json --also b.json --features comm_size,msg_size,pof2 --max-depth 3 \
+bin/colltree a.model --also b.model --features comm_size,msg_size,pof2 --max-depth 3 \
     --leaf-cost 0.016 --msg-grid 4 --min-fallback-algs 1 --guard-above 64 \
     --into $MPICH_SRC/src/mpi/coll/coll_selection.json --out $MPICH_SRC/src/mpi/coll/coll_selection.json
 ```
@@ -664,7 +666,7 @@ tools (§9) and convert it with `replay/make_data.py`; `replay/README.md`
 has the steps. Then:
 
 ```sh
-bin/collmodel --replay --algs binomial,scatter_ring_allgather,circ_graph --out m.json
+bin/collmodel --replay --algs binomial,scatter_ring_allgather,circ_graph --out m.model
 python3 replay/replay_v1.py --algs binomial --seeds 3 --tag t && python3 replay/replay_v1.py --report t
 python3 replay/replay_v2.py --seeds 3 --v1 --tag t && python3 replay/replay_v2.py --report t
 python3 replay/replay_v3.py --seeds 3
@@ -707,7 +709,7 @@ groundtruth/run_set.sh plans/validate/default results/validate/default 600   # M
 MPIR_CVAR_COLL_SELECTION_JSON_FILE=$PWD/bcast_tuning.json \
     groundtruth/run_set.sh plans/validate/tuned results/validate/tuned 600   # with the tuning file
 python3 groundtruth/score_live.py validate --truth results/validate/truth --default results/validate/default \
-    --tuned results/validate/tuned --model bcast.json --tuning bcast_tuning.json
+    --tuned results/validate/tuned --model bcast.model --tuning bcast_tuning.json
 ```
 
 `validate` takes any collective with `--op` (and `--inplace`, `--counts`;
@@ -737,9 +739,8 @@ tuning file, of the tree's and the model's own choices, whether MPICH
 applied the file, and whether the default beats every candidate algorithm
 somewhere (then the candidates miss one, e.g. `release_gather`). Regret is
 against the fastest of every algorithm measured and MPICH's default, split
-into single-node and multi-node layouts. `--model` takes a collmodel/4 (or a
-one-unit collmodel/5)
-file and `--tuning` a file with one or several subtrees. With a
+into single-node and multi-node layouts. `--model` takes a model file of one unit
+and `--tuning` a file with one or several subtrees. With a
 compositional algorithm in the model, run `truth/` with
 `MPIR_CVAR_COLL_SELECTION_JSON_FILE` set to the tuning file too, so that
 smp's inner calls follow it.
