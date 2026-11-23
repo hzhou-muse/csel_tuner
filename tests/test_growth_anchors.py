@@ -13,6 +13,7 @@ sys.path.insert(0, REPO)
 COLLMODEL = os.path.join(REPO, "bin", "collmodel")
 
 from test_restrict import CATALOG  # noqa: E402
+from csel_tuner.model import Model  # noqa: E402
 
 ALGS = "binomial,scatter_ring_allgather,tree"
 
@@ -28,7 +29,7 @@ def run(*args, check=True):
 
 
 def unit(path):
-    return json.load(open(path))["units"][0]
+    return Model.load(path).to_dict()
 
 
 def growth(u):
@@ -153,7 +154,6 @@ def test_guard_on_replay():
         print("skipped: no replay data")
         return
     from csel_tuner.growth import classes
-    from csel_tuner.model import Model
     from csel_tuner.tree import json_choice
     with tempfile.TemporaryDirectory() as d:
         m = os.path.join(d, "m.json")

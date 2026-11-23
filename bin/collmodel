@@ -3,7 +3,7 @@
 
 One algorithm (--alg, builder v1, csel_tuner/single.py; model file
 collmodel/1) or several, sampled for selection into a unit of a model file
-(collmodel/5, csel_tuner/model.py: the measurements and the fit derived
+(collmodel/6 text, csel_tuner/model.py and modelfile.py: the measurements and the fit derived
 from them; needs the per-request algorithm switch, MPISRV_CVAR_SWITCH=1).
 The unit is named by its tags (--op, --inplace, --counts, --launch); --out
 keeps its other units (and gets those of --model it lacks), and --merge combines model files. --colls and
@@ -13,18 +13,18 @@ launch per launch kind, a journal per unit in the --log directory.
 Create a model, live through the benchmark server, one launch of the whole
 allocation (launch/config.sh with the site file launch/sites/<site>.sh):
 
-    bin/collmodel --algs binomial,scatter_ring_allgather,circ_graph --out bcast.json \\
+    bin/collmodel --algs binomial,scatter_ring_allgather,circ_graph --out bcast.model \\
         --site aurora --nodes 32 --ppn 96 --log bcast.log [--deadline 3300]
 
 or with any launcher (mpisrv and its max-m argument are appended):
 
-    bin/collmodel --algs binomial,tree --out bcast.json --launcher "mpiexec -n 64 -ppn 32"
+    bin/collmodel --algs binomial,tree --out bcast.model --launcher "mpiexec -n 64 -ppn 32"
 
 All of the op's algorithms, restricted ones included (docs/design.md,
 section 11), from the build's coll_algorithms.txt:
 
     bin/collmodel --algs all --catalog $MPICH_SRC/src/mpi/coll/coll_algorithms.txt \\
-        --out bcast.json --site aurora --nodes 8 --ppn 96 --log bcast.log
+        --out bcast.model --site aurora --nodes 8 --ppn 96 --log bcast.log
 
 With --catalog the run starts with a precheck: one probe call of
 every algorithm at every allowed layout (the server runs with
@@ -39,8 +39,8 @@ calls go through the selection being built, so they are added afterwards.
 Add to a model (docs/design.md, section 12): algorithms, or layouts for the
 algorithms it has, at the cost of the new measurements only:
 
-    bin/collmodel --model bcast.json --algs pipelined_tree --catalog ... --out bcast2.json ...
-    bin/collmodel --model bcast.json --layouts 4x24,16x8 --catalog ... --out bcast2.json ...
+    bin/collmodel --model bcast.model --algs pipelined_tree --catalog ... --out bcast2.model ...
+    bin/collmodel --model bcast.model --layouts 4x24,16x8 --catalog ... --out bcast2.model ...
 
 A new algorithm is prechecked at every layout (a new restriction may move
 layouts to a new set) and sampled at the layouts the model has measured
@@ -56,9 +56,9 @@ A compositional algorithm is added with the tuning file of its inner calls
 loaded in the launch (MPIR_CVAR_COLL_SELECTION_JSON_FILE), after a check
 that those inner calls cannot run a compositional algorithm themselves:
 
-    bin/colltree bcast.json --out bcast_tuning.json
-    bin/collmodel --model bcast.json --algs smp --inner-selection bcast_tuning.json --catalog ... \\
-        --out bcast2.json ...
+    bin/colltree bcast.model --out bcast_tuning.json
+    bin/collmodel --model bcast.model --algs smp --inner-selection bcast_tuning.json --catalog ... \\
+        --out bcast2.model ...
 
 Its measurements record the file (by hash, the content kept in the model);
 adding it again with another file replaces its curves.
@@ -67,7 +67,7 @@ Convert collmodel/3 files of earlier versions, each with the journal of
 its run (a stage-2 file needs the stage-1 tuning file it ran with):
 
     bin/collmodel --import bcast_s1.json:s1.log --import bcast_s2.json:s2.log --inner-selection F1.json \\
-        --out bcast.json
+        --out bcast.model
 
 Device buffers (--mem device; mpisrv built with make GPU=..., one GPU per
 rank, launched with MEM=device through launch/config.sh) make a model of
@@ -76,7 +76,7 @@ the host model into one tuning file. The memory kind decides the gpu and
 gpu_coll restrictions (on device buffers gpu holds, on host buffers neither
 does) instead of the precheck:
 
-    bin/collmodel --mem device --algs all --catalog ... --out bcast_gpu.json \\
+    bin/collmodel --mem device --algs all --catalog ... --out bcast_gpu.model \\
         --site aurora --nodes 8 --ppn 12 --log bcast_gpu.log
 
 Growth anchors (--growth-anchors): after the sampling, a fixed set of points
@@ -100,11 +100,11 @@ later runs on the model skip it unless their --timeout is longer. The run
 record lists both ("guarded", "timeouts"). With --model alone it tops up a
 model's anchors (points it has are not remeasured):
 
-    bin/collmodel --model bcast.json --growth-anchors --out bcast2.json --site aurora --nodes 32 --ppn 96
+    bin/collmodel --model bcast.model --growth-anchors --out bcast2.model --site aurora --nodes 32 --ppn 96
 
 Replay on recorded data in replay/data (replay/README.md), for development:
 
-    bin/collmodel --algs binomial,tree --out m.json --replay [--seed 0]
+    bin/collmodel --algs binomial,tree --out m.model --replay [--seed 0]
 
 The starting state is blank: the allocation (nodes, ranks per node) and the
 largest size come from the server's info reply. Allowed layouts are N and
@@ -156,7 +156,9 @@ from csel_tuner.algos import GENERAL, Catalog  # noqa: E402
 from csel_tuner.kinds import RECIPES, classify, is_device, is_rooted, is_v  # noqa: E402
 from csel_tuner.layouts import axis_values, size_grid  # noqa: E402
 from csel_tuner.stages import Stages  # noqa: E402
-from csel_tuner.model import FORMAT, FORMAT_V4, Model, ModelFile, default_tags, file_hash, tag_key, tag_str  # noqa: E402,E501
+from csel_tuner.model import (FORMAT, FORMAT_V4, FORMAT_V5, Model, ModelFile, default_tags, file_hash,  # noqa: E402
+                              tag_key, tag_str)
+from csel_tuner.model import inner_text as inner_text_of  # noqa: E402
 from csel_tuner.multi import Builder2, MultiSampler, known_sampler  # noqa: E402
 from csel_tuner.restrict import fixed_point, mem_known, plan_sets, precheck, set_name  # noqa: E402
 from csel_tuner.single import Builder, initial_layouts  # noqa: E402
@@ -1223,16 +1225,18 @@ _out_files = {}
 
 def save_unit(path, unit, base=None):
     """Put the unit into the model file at path, keeping the file's other units (an existing
-    collmodel/4 or /5 file; any other file there is replaced) and adding those of the --model
+    collmodel/4, /5 or /6 file; any other file there is replaced) and adding those of the --model
     file base that it lacks, so a run that adds to a model keeps its other units."""
     f = _out_files.get(path)
     if f is None:
         f = ModelFile()
         try:
-            if json.load(open(path)).get("format") in (FORMAT, FORMAT_V4):
+            if ModelFile.format_of(path) in (FORMAT, FORMAT_V5, FORMAT_V4):
                 f = ModelFile.load(path)
-        except (OSError, ValueError):
+        except OSError:
             pass
+        except ValueError as e:
+            print(f"warning: {path}: {e}; replacing it", file=sys.stderr)
         old = f.get(unit.tags)
         if old is not None:
             print(f"{path}: replacing its unit {tag_str(unit.tags)}", file=sys.stderr)
@@ -1380,11 +1384,11 @@ def parse_args(argv):
                    "algorithm in --catalog")
     ap.add_argument("--exclude-algs", default="", metavar="A,B", help="leave these catalog algorithms out of "
                     "--algs all (e.g. one that hangs)")
-    ap.add_argument("--out", help="model file to write (collmodel/5): this run's unit goes "
-                    "into it, replacing a unit with the same tags; its other units stay, and those of --model "
-                    "it lacks are added")
+    ap.add_argument("--out", help="model file to write (collmodel/6 text, name it *.model; with --alg alone a "
+                    "collmodel/1 JSON file): this run's unit goes into it, replacing a unit with the same tags; "
+                    "its other units stay, and those of --model it lacks are added")
     ap.add_argument("--model", metavar="MODEL", help="add to this run's unit (the one with its tags: --op, "
-                    "--inplace, --counts, --mem) in this model file (collmodel/4 or /5): the algorithms of "
+                    "--inplace, --counts, --mem) in this model file (collmodel/4, /5 or /6): the algorithms of "
                     "--algs that it does not have, and the layouts of --layouts")
     ap.add_argument("--layouts", metavar="NxPPN,...", help="with --model: layouts of this allocation, also beyond "
                     "the model's, at which to measure its algorithms: those --algs names if it has them, else all, "
@@ -1415,6 +1419,9 @@ def parse_args(argv):
     ap.add_argument("--merge", action="append", default=[], metavar="MODEL",
                     help="combine the units of these model files into --out (a unit in two files must be the "
                     "same)")
+    ap.add_argument("--convert", dest="merge", action="append", metavar="MODEL",
+                    help="write a model file (e.g. a collmodel/4 or /5 JSON file) as collmodel/6 text to --out "
+                    "(--merge of one file)")
     ap.add_argument("--import", dest="import_", action="append", default=[], metavar="MODEL3[:JOURNAL]",
                     help="convert collmodel/3 files (stage 1, then stage 2) with their journals into --out")
     ap.add_argument("--catalog", metavar="PATH", help="the build's src/mpi/coll/coll_algorithms.txt: "
@@ -1476,6 +1483,8 @@ def parse_args(argv):
     a = ap.parse_args(argv)
     if not a.out and not a.plan:
         ap.error("--out is required (except with --plan)")
+    if a.out and not a.out.endswith(".model") and not (a.alg and not a.algs):
+        print(f"warning: --out {a.out}: a model file is collmodel/6 text; name it *.model", file=sys.stderr)
     if a.import_ or a.merge:
         return a
     if a.plan:
@@ -1497,7 +1506,7 @@ def parse_args(argv):
     if a.algs == ["all"] and not a.catalog:
         ap.error("--algs all needs --catalog")
     if a.growth_anchors and not a.model and len(a.algs) == 1 and not a.catalog:
-        ap.error("--growth-anchors needs a collmodel/5 model: several --algs, --catalog, or --model")
+        ap.error("--growth-anchors needs a model of several algorithms: several --algs, --catalog, or --model")
     # the units: (launch kind, coll, inplace, counts), launch kinds outermost
     kinds = a.launch.split(",") if a.launch else [a.mem]
     for k in kinds:
@@ -1689,7 +1698,7 @@ def run_unit(a, tags, t_job, shared):
                      + "; ".join(tag_str(u.tags) for u in ModelFile.load(a.model).units) + ")")
     base_hash = hashlib.sha256(open(a.model, "rb").read()).hexdigest()[:16] if a.model else None
     inner_text = open(a.inner_selection).read() if a.inner_selection else None
-    inner_hash = file_hash(inner_text) if inner_text else None
+    inner_hash = file_hash(inner_text_of(inner_text)) if inner_text else None
     journal = Journal(a.log, a.resume)
     srv = None
     v1 = not a.model and len(a.algs) == 1 and not a.catalog

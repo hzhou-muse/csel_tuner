@@ -10,7 +10,7 @@ import numpy as np
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
-from csel_tuner.model import (FORMAT, Model, ModelFile, default_tags, parse_sel, tag_str,  # noqa: E402
+from csel_tuner.model import (FORMAT, FORMAT_V5, Model, ModelFile, default_tags, parse_sel, tag_str,  # noqa: E402
                               tags_match)
 
 
@@ -38,12 +38,15 @@ def test_tags():
 
 def test_file():
     with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "m.json")
+        path = os.path.join(tmp, "m.model")
         f = ModelFile([unit("allreduce"), unit("allreduce", True), unit("bcast", mem="device")])
         f.save(path)
-        assert json.load(open(path))["format"] == FORMAT
+        assert ModelFile.format_of(path) == FORMAT
         g = ModelFile.load(path)
         assert [u.tags for u in g.units] == [u.tags for u in f.units]
+        v5 = os.path.join(tmp, "m.json")      # a collmodel/5 JSON file is read as before
+        json.dump({"format": FORMAT_V5, "units": [u.to_dict() for u in f.units]}, open(v5, "w"))
+        assert [u.to_dict() for u in ModelFile.load(v5).units] == [u.to_dict() for u in g.units]
         u = g.unit({"inplace": 1})
         assert u.op == "allreduce" and u.mem == "host" and np.allclose(u.curves["ring"][(1, 2)], [1, 2])
         assert Model.load(path, {"coll": "bcast"}).mem == "device"
@@ -87,8 +90,8 @@ def test_fit_cache():
     assert m.penalty["ring"][True] is not None
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "m.json")
-        m.save(path)
-        d = json.load(open(path))
+        d = {"format": FORMAT_V5, "units": [m.to_dict()]}
+        json.dump(d, open(path, "w"))
         assert d["units"][0]["fit"]["version"] == 2 and d["units"][0]["fit"]["penalty"]["ring"]["inter"] is None
         fit_a, single.LayoutModel.fit_a = single.LayoutModel.fit_a, None     # fails if called
         try:
@@ -106,7 +109,7 @@ def test_fit_cache():
 
 def test_merge():
     with tempfile.TemporaryDirectory() as tmp:
-        a, b, c, out = (os.path.join(tmp, x) for x in ("a.json", "b.json", "c.json", "out.json"))
+        a, b, c, out = (os.path.join(tmp, x) for x in ("a.model", "b.model", "c.model", "out.model"))
         ModelFile([unit("allreduce"), unit("bcast")]).save(a)
         ModelFile([unit("bcast"), unit("allreduce", True)]).save(b)
         ModelFile([unit("bcast", t=3.0)]).save(c)
@@ -126,7 +129,7 @@ def test_carry_model_units():
     from importlib.machinery import SourceFileLoader
     collmodel = SourceFileLoader("collmodel", os.path.join(REPO, "bin", "collmodel")).load_module()
     with tempfile.TemporaryDirectory() as tmp:
-        a, b = os.path.join(tmp, "a.json"), os.path.join(tmp, "b.json")
+        a, b = os.path.join(tmp, "a.model"), os.path.join(tmp, "b.model")
         ModelFile([unit("bcast"), unit("ibcast"), unit("scan")]).save(a)
         ModelFile([unit("scan", t=7.0)]).save(b)
         collmodel.save_unit(b, unit("bcast", t=3.0), a)

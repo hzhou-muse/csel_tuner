@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Turn model files (collmodel/5 or /4, from bin/collmodel; --colls and --unit select units) into
-an MPICH collective-selection JSON (builder v3, csel_tuner/tree.py).
+"""Turn model files (collmodel/6 .model, or the JSON /5 or /4, from bin/collmodel; --colls and --unit
+select units) into an MPICH collective-selection JSON (builder v3, csel_tuner/tree.py).
 
-    bin/colltree bcast.json [bcast_gpu.json] --out bcast_tuning.json [--tol 0.005] [--node-aware]
-    bin/colltree run.json [--colls bcast,ibcast] --out tuning.json
+    bin/colltree bcast.model [bcast_gpu.model] --out bcast_tuning.json [--tol 0.005] [--node-aware]
+    bin/colltree run.model [--colls bcast,ibcast] --out tuning.json
 
 Every collective among the selected units gets its subtrees in the one
 output file, each built as below from its unit of host buffers and,
@@ -872,8 +872,8 @@ def main(argv=None):
                     "coll=allgather,inplace=0; default: every unit of each file")
     ap.add_argument("--colls", help="the collectives to build, e.g. bcast,ibcast; default: every collective "
                     "among the selected units")
-    ap.add_argument("model", nargs="+", help="model files (collmodel/5 or /4): per collective one unit of host "
-                    "buffers, optionally one of device buffers")
+    ap.add_argument("model", nargs="+", help="model files (collmodel/6, or the JSON /5 or /4): per collective "
+                    "one unit of host buffers, optionally one of device buffers")
     ap.add_argument("--out", required=True, help="selection JSON to write")
     ap.add_argument("--tol", type=float, default=0.005, help="allowed predicted geomean regret over the full tree")
     ap.add_argument("--node-aware", action="store_true", help="also split on num_nodes and ppn (MPICH with "

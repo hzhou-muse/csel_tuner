@@ -7,6 +7,8 @@ import sys
 import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+from csel_tuner.model import ModelFile  # noqa: E402
 
 
 def have_data():
@@ -19,15 +21,15 @@ def test_v2_then_tree():
         print("skipped: no replay data (replay/README.md)")
         return
     with tempfile.TemporaryDirectory() as d:
-        model, tuning = os.path.join(d, "m.json"), os.path.join(d, "t.json")
+        model, tuning = os.path.join(d, "m.model"), os.path.join(d, "t.json")
         sys.path.insert(0, os.path.join(REPO, "replay"))
         from common import FIXED
         subprocess.run([sys.executable, os.path.join(REPO, "bin", "collmodel"), "--replay", "--out", model,
                         "--algs", ",".join(FIXED[:3]), "--budget-node-h", "0.3"],
                        check=True, stdout=subprocess.DEVNULL)
-        f = json.load(open(model))
-        m = f["units"][0]
-        assert f["format"] == "collmodel/5" and len(f["units"]) == 1 and len(m["fit"]["curves"]) == 3 \
+        f = ModelFile.load(model)
+        m = f.units[0].to_dict()
+        assert ModelFile.format_of(model) == "collmodel/6" and len(f.units) == 1 and len(m["fit"]["curves"]) == 3 \
             and m["data"]["measurements"]
         subprocess.run([sys.executable, os.path.join(REPO, "bin", "colltree"), model, "--out", tuning],
                        check=True, stdout=subprocess.DEVNULL)

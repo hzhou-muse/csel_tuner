@@ -112,7 +112,7 @@ def test_model_mem_roundtrip():
         device_model().save(path)
         assert Model.load(path).mem == "device"
         # a collmodel/4 file: its mem field, and host from before the field existed
-        d = dict(json.load(open(path))["units"][0], format="collmodel/4", op="bcast", mem="device")
+        d = dict(Model.load(path).to_dict(), format="collmodel/4", op="bcast", mem="device")
         del d["tags"]
         json.dump(d, open(path, "w"))
         assert Model.load(path).mem == "device"
@@ -273,8 +273,7 @@ def test_old_names():
     with tempfile.TemporaryDirectory() as tmp:
         h, g, t = (os.path.join(tmp, x) for x in ("h.json", "g.json", "t.json"))
         host_model().save(h)
-        gpu_model().save(g)
-        d = json.load(open(g))
+        d = {"format": "collmodel/5", "units": [gpu_model().to_dict()]}      # a JSON model of that time
         for u in d["units"]:
             u["conditions"] = ["hierarchical", "gpu", "gpu_coll"]
             u["algorithms"]["buffer_swap"]["restrictions"] = ["gpu"]

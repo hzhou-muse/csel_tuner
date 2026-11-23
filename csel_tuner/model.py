@@ -1,12 +1,13 @@
-"""The model file (collmodel/5): units of measurements with their provenance, and the fits derived
-from them.
+"""The model file: units of measurements with their provenance, and the fits derived from them.
+Written as collmodel/6 text (.model, modelfile.py); the JSON files of collmodel/5 (and /4, one unit
+each) are read.
 
-    f = ModelFile.load("models.json")     # every unit (a collmodel/4 file is one unit)
+    f = ModelFile.load("models.model")    # every unit (a collmodel/4 file is one unit)
     m = f.unit({"coll": "bcast"})         # the one unit these tags select
-    m = Model.load("bcast.json")          # the same, for a file of one unit (or Model.load(path, sel))
+    m = Model.load("bcast.model")         # the same, for a file of one unit (or Model.load(path, sel))
     m.predict("binomial", 8, 96)          # log2 T at every grid size
     m.sets()                              # {restriction mask: [layouts]}
-    f.put(m); f.save("models.json")       # add or replace the unit with m's tags
+    f.put(m); f.save("models.model")      # add or replace the unit with m's tags
 
 A unit is one model: one collective measured one way, named by its tags
 (tag_str): coll, variant (the input-condition assignment, kinds.py),
@@ -36,8 +37,9 @@ from .kinds import canon_condition, datatype, is_v, run_variant
 from .restrict import infer_mask, mem_known
 from .single import LayoutModel
 
-FORMAT = "collmodel/5"
-FORMAT_V4 = "collmodel/4"
+FORMAT = "collmodel/6"          # the text .model file (modelfile.py); the only format written
+FORMAT_V5 = "collmodel/5"       # JSON, read only
+FORMAT_V4 = "collmodel/4"       # JSON of one unit, read only
 FIT_VERSION = 2          # 2: the penalty a(m) of each algorithm stored; 1 refits it on load
 
 
@@ -89,6 +91,12 @@ def parse_sel(text):
 
 def file_hash(text):
     return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def inner_text(text):
+    """A tuning file loaded for inner calls as a model keeps it: with a final newline (a .model file
+    holds it in a verbatim block); its hash names it."""
+    return text if text.endswith("\n") else text + "\n"
 
 
 def lay_key(lay):
@@ -227,6 +235,8 @@ class Model:
         self.prechecks.append({"alg": alg, "N": n, "ppn": ppn, "ok": bool(ok), "msg": msg, "job": job})
 
     def add_inner_file(self, text):
+        """The hash of a tuning file loaded for inner calls (inner_text)."""
+        text = inner_text(text)
         h = file_hash(text)
         self.inner_files[h] = text
         return h
@@ -373,25 +383,44 @@ class ModelFile:
     def __init__(self, units=()):
         self.units = list(units)
 
+    @staticmethod
+    def format_of(path):
+        """The format of the file at path: "collmodel/6" (also gzipped), the "format" of a JSON
+        file, or None for another file; OSError if it cannot be read."""
+        from . import modelfile
+        with open(path, "rb") as f:
+            head = f.read(64)
+        if head[:2] == b"\x1f\x8b" or modelfile.is_text_model(head):
+            return FORMAT
+        try:
+            d = json.load(open(path))
+        except ValueError:
+            return None
+        return d.get("format") if isinstance(d, dict) else None
+
     @classmethod
     def load(cls, path):
+        from . import modelfile
+        fmt = cls.format_of(path)
+        if fmt == FORMAT:
+            units, _ = modelfile.read(path)
+            return cls([Model.from_dict(u, path) for u in units])
         d = json.load(open(path))
-        fmt = d.get("format")
         if fmt == FORMAT_V4:
             return cls([Model.from_dict(d, path, v4_tags(d))])
-        if fmt != FORMAT:
-            raise ValueError("%s: not a %s file (format %s; convert collmodel/3 with bin/collmodel --import)"
-                             % (path, FORMAT, fmt))
+        if fmt != FORMAT_V5:
+            raise ValueError("%s: not a model file (format %s; convert collmodel/3 with bin/collmodel --import)"
+                             % (path, fmt))
         return cls([Model.from_dict(u, path) for u in d["units"]])
 
     def save(self, path):
-        d = {"format": FORMAT,
-             "created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-             "units": [u.to_dict() for u in self.units]}
+        """Always as collmodel/6 text, whatever the path's extension."""
+        from . import modelfile
+        created = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        text = modelfile.dumps([u.to_dict() for u in self.units], created)
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
-            json.dump(d, f, indent=None, separators=(",", ":"))
-            f.write("\n")
+            f.write(text)
         os.replace(tmp, path)
 
     def select(self, sel=None):
