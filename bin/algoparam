@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""Calibrate a parameterized algorithm: measure a few points of its parameters, fit the constants
+of its param rule, write its param map (csel_tuner/params.py, the rule's csel_tuner/param_<rule>.py;
+docs/design.md, section 14).
+
+    bin/algoparam --op bcast --also ibcast,allgather --catalog $M/src/mpi/coll/coll_algorithms.txt \\
+        --site aurora --nodes 32 --ppn 96 --out cg_host.model --log cg_bcast.log
+    bin/algoparam --op allreduce --also reduce --catalog ... --site aurora --nodes 32 --ppn 96 \\
+        --out cg_host.model --log cg_allreduce.log
+    bin/collmodel --colls bcast,ibcast,allgather,reduce,allreduce --algs all --catalog ... \\
+        --param-map cg_host.model --out m.model ...
+
+One launch measures every point, on sub-communicators of the allocation (mpisrv), the algorithm
+forced and its parameters set per request (cvar.*). The rule (--rule, default the algorithm's
+name) decides which points (its calibrate) and fits its constants to them (its fit); --set fixes a
+constant (e.g. --set A=16K): it is kept, the others are fitted.
+
+The circ_graph rule (param_circ_graph.py) measures rows of chunk_size (every power of two from
+max(1K, m/16), or 4K above 64K, up to m) at q_len 8, by default at m = 16K, 64K, 4M, 64M on one
+full node (1 x ppn) and on two nodes with one rank each (2x1), and at m = 256K, 512K, 1M on the full
+allocation (N x ppn, where dense multi-node layouts need larger chunks; calibrate at the largest
+scale the tuning file serves). Its fit takes the constants F, A, Fb, C over a power-of-two grid
+that minimize the p98 regret of the rows, then their mean log regret. A q_len sweep (--qlen) at
+the fitted chunk on the full allocation at m >= 16M sets the large-message q_len.
+
+The output holds one unit per collective (--op and each --also of its family, the same map; a
+model unit's tags plus kind=param_map): the algorithm's entry with its param_map, and the lead's
+measurements with the parameters of each. An existing --out keeps its other units. --refit FILE
+refits from the measurements in FILE without measuring: the constants its fit had fixed with --set
+(recorded in the fit report, "set") are fixed again; a --set replaces one, --unset drops one.
+"""
+import argparse
+import datetime
+import json
+import os
+import shlex
+import sys
+import time
+
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+sys.path.insert(0, REPO)
+
+from csel_tuner.algos import Catalog  # noqa: E402
+from csel_tuner.kinds import is_device  # noqa: E402
+from csel_tuner.model import Model, ModelFile, tag_str  # noqa: E402
+from csel_tuner.params import ParamMap, is_map_unit, map_tags, parse_size, rule, size_str  # noqa: E402
+
+VERSION = "algoparam 0.2"
+
+
+def fit_map(a, op, alg, measurements, fixed):
+    """(ParamMap, report lines) from the measurements, by the rule's fit."""
+    try:
+        consts, report, lines = a.mod.fit(op, measurements, fixed, a)
+    except ValueError as e:
+        sys.exit(f"{op} {alg}: {e}")
+    fit = dict(report, op=op, tool=VERSION, set=dict(sorted(fixed.items())),
+               time=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    pm = ParamMap(alg, a.rule, consts, fit)
+    return pm, [f"{op} {alg}: {pm.describe()}"] + lines
+
+
+def write(a, ops, alg, launch, pm, meas, job, run, sizes, lays, nodes, ppn, leaf):
+    """The units of ops into --out (other units of an existing file kept)."""
+    f = ModelFile.load(a.out) if os.path.exists(a.out) else ModelFile()
+    for i, op in enumerate(ops):
+        tags = map_tags(op, launch)
+        m_op = ParamMap(alg, pm.rule, pm.consts, pm.fit if i == 0 else {"from": ops[0], "op": op})
+        u = Model(op, sizes or [1], lays, {"N": [1, nodes], "ppn": [1, ppn],
+                                          "m": [int(min(sizes or [1])), int(max(sizes or [1]))]},
+                  mem=launch, tags=tags,
+                  algorithms={alg: {"leaf": leaf, "restrictions": [], "mask": 0, "inner": [],
+                                    "param_map": m_op.to_dict()}})
+        if i == 0:
+            u.jobs = [job] if job else []
+            for r in meas:
+                u.measurements.append(dict(r, alg=alg))
+            u.runs = [run]
+        else:
+            u.notes.append(f"param map from {ops[0]}'s calibration")
+        replaced = f.put(u)
+        print(f"{a.out}: {'replaced' if replaced else 'added'} unit {tag_str(tags)}")
+    f.save(a.out)
+
+
+class Context:
+    """What a rule's calibrate measures through: the allocation, the buffers, the server's CVAR
+    values, run(), and the measurements so far."""
+
+    def __init__(self, a, op, alg, srv, info, coll, device):
+        self.a, self.op, self.alg, self.srv, self.info = a, op, alg, srv, info
+        self.nodes, self.ppn, self.device = info["nodes"], info["min_ppn"], device
+        self.cvar_values = info.get("cvar_values") or {}
+        self.blocks = coll.get("sbuf_p") or coll.get("rbuf_p")
+        self.cv = ParamMap.default(op, alg, a.rule).cvars(op)
+        self.alg_cvar = "MPIR_CVAR_%s_INTRA_ALGORITHM" % op.upper()
+        self.measurements, self.notes = [], []
+
+    def fits(self, lay, m):
+        if lay[0] > self.nodes or lay[1] > self.ppn or lay[0] * lay[1] < 2:
+            return f"layout {lay[0]}x{lay[1]} not in the allocation {self.nodes}x{self.ppn}"
+        if (m * lay[0] * lay[1] if self.blocks else m) > self.info["max_m"]:
+            return f"m = {size_str(m)} at {lay[0]}x{lay[1]}: beyond the server's buffers (--max-m)"
+        return None
+
+    def run(self, lay, m, thetas):
+        """Measure the algorithm at (layout, m) with each theta, one batch; False (and a note) if the
+        point does not fit the allocation."""
+        from csel_tuner.server import ServerError
+        why = self.fits(lay, m)
+        if why:
+            self.notes.append(why)
+            print("skip: " + why, file=sys.stderr)
+            return False
+        reqs = [dict(op=self.op, m=m, p=lay[0] * lay[1], ppn=lay[1], batches=self.a.batches, sync="call",
+                     **{"cvar." + self.alg_cvar: self.alg}, **{"cvar." + self.cv[k]: v for k, v in th.items()})
+                for th in thetas]
+        self.srv.measure(**dict(reqs[0], batches=1, target_us=20000, tag="rewarm"))
+        try:
+            reps = self.srv.measure_many(reqs)
+        except ServerError as e:
+            self.srv.close()
+            sys.exit(f"{self.op} {self.alg} at {lay[0]}x{lay[1]} m={m}: {e}")
+        for th, rep in zip(thetas, reps):
+            self.measurements.append({"N": lay[0], "ppn": lay[1], "m": m,
+                                      "t_us": [round(float(t), 4) for t in rep["t_us"]],
+                                      "wall_us": round(float(rep["wall_us"]), 1), "job": 0, "params": dict(th)})
+        best = min(range(len(reps)), key=lambda i: float(np.median(reps[i]["t_us"])))
+        print(f"  {lay[0]}x{lay[1]} m={size_str(m)}: {len(reqs)} points, best "
+              + ", ".join(f"{k}={size_str(v)}" for k, v in thetas[best].items()), file=sys.stderr, flush=True)
+        return True
+
+
+def measure(a, ops, alg, launch, fixed):
+    from csel_tuner.server import Server
+    op = ops[0]
+    env = {"MPIR_CVAR_COLLECTIVE_FALLBACK": "error", "MPISRV_CVAR_SWITCH": "1"}
+    env.update(kv.split("=", 1) for kv in a.env)
+    os.environ["LAUNCH"] = launch
+    os.environ["MEM"] = "device" if is_device(launch) else "host"
+    srv = Server(launcher=shlex.split(a.launcher), env=env, max_m=a.max_m, timeout=a.timeout, warmup=(),
+                 server=a.server, log=a.log, args=["--mem", "device"] if is_device(launch) else [])
+    info = srv.world
+    if info.get("cvar_switch") != 1:
+        srv.close()
+        sys.exit("the server reports no runtime CVAR switch (MPISRV_CVAR_SWITCH): parameters cannot be set "
+                 "per request")
+    coll = (info.get("colls") or {}).get(op)
+    if coll is None:
+        srv.close()
+        sys.exit(f"--op {op}: not a collective of this server")
+    ctx = Context(a, op, alg, srv, info, coll, is_device(launch))
+    print(f"{op} {alg} on {launch} buffers, allocation {ctx.nodes}x{ctx.ppn}", file=sys.stderr)
+    srv.warmup(op)
+    t0 = time.time()
+    settings = a.mod.calibrate(ctx, op, fixed, a)
+    pm, lines = fit_map(a, op, alg, ctx.measurements, fixed)
+    srv.close()
+    end = time.time()
+    job = dict({"start": round(t0, 3), "end": round(end, 3), "tool": VERSION, "op": op, "alg": alg,
+                "rule": a.rule, "nodes": ctx.nodes, "ppn_max": ctx.ppn, "max_m": info["max_m"],
+                "hosts": info.get("hosts"), "library": info.get("library"), "mem": launch, "batches": a.batches,
+                "launch": {"cmd": srv.cmd, "env": env}}, **(settings or {}))
+    run_rec = {"mode": "algoparam", "fit": pm.fit, "n_measurements": len(ctx.measurements),
+               "node_h": round((end - t0) * ctx.nodes / 3600, 4), "notes": ctx.notes}
+    meas = ctx.measurements
+    lays = sorted({(r["N"], r["ppn"]) for r in meas})
+    sizes = sorted({r["m"] for r in meas})
+    return pm, lines, meas, job, run_rec, sizes, lays, ctx.nodes, ctx.ppn
+
+
+def refit(a, ops, alg, fixed):
+    f = ModelFile.load(a.refit)
+    found = [u for u in f.units if u.op == ops[0] and is_map_unit(u) and alg in u.algorithms and u.measurements]
+    if len(found) != 1:
+        sys.exit(f"--refit {a.refit}: {len(found)} units of {ops[0]} {alg} with measurements (need one)")
+    u = found[0]
+    meas = [{k: v for k, v in r.items() if k != "alg"} for r in u.measurements if r["alg"] == alg]
+    # the constants the earlier fit had fixed (read from the raw entry: a map of another rule version,
+    # which a refit replaces, would not load), then --unset and --set over them
+    stored = ((u.algorithms[alg].get("param_map") or {}).get("fit") or {}).get("set") or {}
+    unknown = sorted(k for k in stored if k not in a.mod.DEFAULTS)
+    if unknown:
+        print(f"--refit: {', '.join(unknown)} fixed in {a.refit} are no constants of the {a.rule} rule; dropped",
+              file=sys.stderr)
+    kept = {k: v for k, v in stored.items() if k in a.mod.DEFAULTS and k not in a.unset}
+    merged = dict(kept, **fixed)
+    if stored:
+        print(f"--refit: fixed in {a.refit}: " + ", ".join(f"{k}={size_str(v)}" for k, v in sorted(stored.items()))
+              + "".join(f"; --unset {k}" for k in sorted(a.unset) if k in stored)
+              + "".join(f"; --set {k}={size_str(v)}" for k, v in sorted(fixed.items()) if k in stored),
+              file=sys.stderr)
+    pm, lines = fit_map(a, ops[0], alg, meas, merged)
+    run = {"mode": "refit", "fit": pm.fit, "from": a.refit, "n_measurements": 0}
+    job = u.jobs[0] if u.jobs else None
+    return pm, lines, meas, job, run, u.sizes, u.layouts, u.domain["N"][1], u.domain["ppn"][1], \
+        u.algorithms.get(alg, {}).get("leaf"), u.mem
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--op", required=True, help="the collective to calibrate (bcast-like: bcast; reduce-like: "
+                    "allreduce)")
+    ap.add_argument("--also", default="", help="collectives of the same family that take its map, e.g. "
+                    "ibcast,allgather for bcast, reduce for allreduce")
+    ap.add_argument("--alg", default="circ_graph", help="the algorithm (default circ_graph)")
+    ap.add_argument("--rule", help="its param rule, csel_tuner/param_<rule>.py (default: the algorithm's name)")
+    ap.add_argument("--catalog", help="coll_algorithms.txt: checks the algorithm's parameters and CVARs, and "
+                    "gives its leaf name")
+    ap.add_argument("--set", action="append", default=[], metavar="CONST=VALUE",
+                    help="fix a constant of the rule (circ_graph: F, A, Fb, C, M0, D, Q, Qb, Mq; sizes as 16K, 4M)")
+    ap.add_argument("--out", required=True, help="the param-map file (.model); its other units are kept")
+    ap.add_argument("--refit", metavar="FILE", help="refit from FILE's measurements, no measuring; the constants "
+                    "its fit had fixed with --set are fixed again")
+    ap.add_argument("--unset", action="append", default=[], metavar="CONST",
+                    help="with --refit: no longer fix a constant the earlier fit had fixed")
+    g = ap.add_argument_group("live")
+    g.add_argument("--launcher", help="command prefix that starts the server; mpisrv and max-m are appended")
+    g.add_argument("--site", help="launch through launch/config.sh with launch/sites/SITE.sh")
+    g.add_argument("--nodes", type=int)
+    g.add_argument("--ppn", type=int)
+    g.add_argument("--launch", default="host", choices=["host", "gpu", "device"], help="the launch kind "
+                   "(collmodel --launch): host buffers, or device buffers with (gpu) or without GPU_COLL")
+    g.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
+    g.add_argument("--server", default=os.path.join(REPO, "server", "mpisrv"))
+    g.add_argument("--max-m", type=int, default=1 << 26)
+    g.add_argument("--batches", type=int, default=5)
+    g.add_argument("--timeout", type=float, default=300)
+    g.add_argument("--log", help="JSONL log of every request and reply")
+    # the rule's own options: the rule is known from --alg/--rule, so those are parsed first (by a
+    # parser without --help, so that --help lists the rule's options too)
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--alg", default="circ_graph")
+    pre.add_argument("--rule")
+    first, _ = pre.parse_known_args(argv)
+    name = first.rule or first.alg
+    try:
+        mod = rule(name)
+    except ValueError as e:
+        ap.error(f"--alg {first.alg}: {e}")
+    mod.add_args(ap.add_argument_group(f"the {name} rule"))
+    a = ap.parse_args(argv)
+    a.rule, a.mod = name, mod
+
+    ops = [a.op] + [x for x in a.also.split(",") if x]
+    for op in ops:
+        if op not in mod.FAMILY:
+            ap.error(f"{op}: no {name} rule for it ({', '.join(mod.FAMILY)})")
+        if mod.FAMILY[op] != mod.FAMILY[a.op]:
+            ap.error(f"--also {op}: not of {a.op}'s family ({mod.FAMILY[a.op]}-like): calibrate its family's own op")
+    try:
+        fixed = {}
+        for kv in a.set:
+            k, v = kv.split("=", 1)
+            if k not in mod.DEFAULTS:
+                ap.error(f"--set {kv}: not a constant of the {name} rule ({', '.join(mod.DEFAULTS)})")
+            fixed[k] = parse_size(v)
+    except ValueError:
+        ap.error("--set takes CONST=VALUE")
+    for k in a.unset:
+        if not a.refit:
+            ap.error("--unset goes with --refit")
+        if k not in mod.DEFAULTS:
+            ap.error(f"--unset {k}: not a constant of the {name} rule ({', '.join(mod.DEFAULTS)})")
+    leaf = None
+    if a.catalog:
+        for op in ops:
+            x = {y.name: y for y in Catalog.load(a.catalog).algorithms(op)}.get(a.alg)
+            if x is None:
+                sys.exit(f"--catalog: {op} has no algorithm {a.alg}")
+            names = [p for p in x.extra_params if "=" not in p]
+            if names != mod.PARAMS or x.cvar_params != mod.CVAR_PARAMS:
+                sys.exit(f"--catalog: {op} {a.alg} has extra_params {x.extra_params}, cvar_params "
+                         f"{x.cvar_params}; the {name} rule sets {mod.PARAMS} through {mod.CVAR_PARAMS} "
+                         "(for circ_graph: an MPICH with pmodels/mpich#8186)")
+            if op == a.op:
+                leaf = x.leaf
+    if a.refit:
+        pm, lines, meas, job, run, sizes, lays, nodes, ppn, leaf0, launch = refit(a, ops, a.alg, fixed)
+        leaf = leaf or leaf0
+    else:
+        if a.site:
+            if not (a.nodes and a.ppn):
+                ap.error("--site needs --nodes and --ppn")
+            os.environ["SITE"] = a.site
+            cfg = os.path.join(REPO, "launch", "config.sh")
+            a.launcher = "bash -c 'source %s && launch %d %d \"$0\" \"$@\"'" % (cfg, a.nodes, a.ppn)
+        if not a.launcher:
+            ap.error("--site/--nodes/--ppn or --launcher (or --refit)")
+        launch = a.launch
+        pm, lines, meas, job, run, sizes, lays, nodes, ppn = measure(a, ops, a.alg, launch, fixed)
+    for line in lines:
+        print(line)
+    run["map"] = pm.hash
+    write(a, ops, a.alg, launch, pm, meas, job, run, sizes, lays, nodes, ppn, leaf)
+    print(json.dumps({"map": pm.hash, "consts": {k: size_str(v) for k, v in pm.consts.items()}}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
