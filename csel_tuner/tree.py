@@ -199,11 +199,12 @@ def select(root, x):
     return node.alg
 
 
-def json_tree(root, alg_names, leaf, names=CSEL_NAME):
+def json_tree(root, alg_names, leaf, names=CSEL_NAME, at_node=None):
     """CSEL JSON object for the tree. alg_names: index -> algorithm name;
     leaf(name) -> (key, params) of an algorithm leaf, or a string such as
     "call=<subtree>" that stands for the leaf itself; names: feature -> CSEL
-    condition."""
+    condition. at_node(name, node), if given, may return the JSON value of a leaf
+    node itself (e.g. a branch over the leaf's points), None for leaf()'s."""
     def obj(node):
         out = {}
         cur = node
@@ -225,13 +226,29 @@ def json_tree(root, alg_names, leaf, names=CSEL_NAME):
                     del out[last]
             out[cond] = val
             cur = right
-        lf = leaf(alg_names[cur.alg])
-        val = lf if isinstance(lf, str) else {lf[0]: lf[1]}
+        val = at_node(alg_names[cur.alg], cur) if at_node else None
+        if val is None:
+            lf = leaf(alg_names[cur.alg])
+            val = lf if isinstance(lf, str) else {lf[0]: lf[1]}
         if not out:
             return val
         out["any"] = val
         return out
     return obj(root)
+
+
+def label_tree(X, labels, names):
+    """A tree that separates the points by label exactly (labels: a hashable per point), splitting
+    on the features in names; None if one label covers every point. Its leaves' .alg index
+    sorted(set(labels)). The caller checks exactness (select) when the features may not determine
+    the labels."""
+    kinds = sorted(set(labels))
+    if len(kinds) < 2:
+        return None
+    k = {v: i for i, v in enumerate(kinds)}
+    L = np.ones((len(labels), len(kinds)))
+    L[np.arange(len(labels)), [k[v] for v in labels]] = 0.0
+    return fit_tree(X, L, names, min_gain=0.0)
 
 
 def set_masks(trees, coll):

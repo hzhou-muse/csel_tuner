@@ -124,7 +124,8 @@ import csel_tuner.restrict as restrict  # noqa: E402
 from csel_tuner.restrict import GPU_COLL, GPU_LOCAL, role_layout, set_name, set_prefix  # noqa: E402
 from csel_tuner.single import is_pof2  # noqa: E402
 from csel_tuner.growth import classes as growth_classes, table as growth_table  # noqa: E402
-from csel_tuner.tree import (CSEL_NAME, cond_depth, file_choice, fit_tree, json_tree,  # noqa: E402
+from csel_tuner.params import is_map_unit, model_maps, size_str  # noqa: E402
+from csel_tuner.tree import (CSEL_NAME, cond_depth, file_choice, fit_tree, json_tree, label_tree,  # noqa: E402
                              prune_to, regret_stats, select)
 
 SWAP, SWAP_LEAF = "buffer_swap", "MPIR_Coll_buffer_swap"
@@ -944,11 +945,16 @@ def main(argv=None):
             f = ModelFile.load(path)
         except (OSError, ValueError) as e:
             sys.exit(str(e))
-        found = [u for u in f.select(sel) if not want or u.op in want]
+        found = [u for u in f.select(sel) if (not want or u.op in want) and not is_map_unit(u)]
         if not found:
             sys.exit(f"{path}: no unit selected by --unit/--colls (its units: "
                      + "; ".join(tag_str(u.tags) for u in f.units) + ")")
         units += [(path, u) for u in found]
+        for u in found:                 # a param map of another rule version: refused before any work
+            try:
+                model_maps(u)
+            except ValueError as e:
+                sys.exit(f"{path}: {tag_str(u.tags)}: {e}")
     # per collective and memory kind (host, or device: launch kind gpu or device), its variant units
     colls = {}
     for path, m in units:
@@ -1032,6 +1038,43 @@ def main(argv=None):
                 warned.add((m.op, alg))
         return dict(rec, **override.get(alg, {}))
 
+    maps = {}                           # id(model) -> {alg: ParamMap}
+    mapped = {}                         # (op, mem, alg) -> [leaves, leaves split by theta, distinct theta]
+
+    def map_leaf(m, o, node, X):
+        """The JSON of a leaf won by an algorithm with a param map: one algorithm leaf with the theta
+        of every point in the leaf's region, or a branch over the region that separates the points
+        by theta (exact on the grid). None for an algorithm without a map."""
+        if id(m) not in maps:
+            try:
+                maps[id(m)] = model_maps(m)
+            except ValueError as e:
+                sys.exit(f"{tag_str(m.tags)}: {e}")
+        pm = maps[id(m)].get(o)
+        if pm is None or isinstance(o, tuple):
+            return None
+        idx = node.idx
+        th = pm.theta_arrays(X["p"][idx], X["m"][idx])
+        labels = list(zip(*(th[k].tolist() for k in pm.params)))
+        key = "algorithm=" + m.leaf(o)
+        base, force = m.algorithms.get(o, {}).get("params") or {}, override.get(o, {})
+
+        def leaf_of(lab):
+            return {key: dict(base, **dict(zip(pm.params, lab)), **force)}
+        st = mapped.setdefault((m.op, m.mem, o), [0, 0, set()])
+        st[0] += 1
+        st[2] |= set(labels)
+        sub = label_tree({f: X[f][idx] for f in fs}, labels, fs)
+        if sub is None:
+            return leaf_of(labels[0])
+        kinds = sorted(set(labels))
+        wrong = sum(kinds[select(sub, {f: X[f][i] for f in fs})] != lab for i, lab in zip(idx, labels))
+        if wrong:
+            print(f"warning: {m.op} {o}: theta not separable on {','.join(fs)} at {wrong} points; their "
+                  "leaves take their neighbours' theta", file=sys.stderr)
+        st[1] += 1
+        return json_tree(sub, kinds, lambda lab: (key, leaf_of(lab)[key]), names)
+
     out, built, report = {}, {}, []     # built: {(coll, slot): [(path, model, Sets)]}
     swap_fit = {}                       # op -> its swap choice's fitted tree, or None
     growth_cls = {}                     # id(model) -> growth.classes(model)
@@ -1112,7 +1155,9 @@ def main(argv=None):
                 if mask in dropped:
                     continue
                 key = f"name={set_name(op, mask, mem)}"
-                tree_json = json_tree(t, opts, lambda o, m=owner[mask]: sub(o, m), names)
+                X_t = owner_sets[mask].points[mask]
+                tree_json = json_tree(t, opts, lambda o, m=owner[mask]: sub(o, m), names,
+                                      at_node=lambda o, node, m=owner[mask], X=X_t: map_leaf(m, o, node, X))
                 if a.guard_above is not None:
                     m = owner[mask]
                     if id(m) not in growth_cls:
@@ -1124,7 +1169,8 @@ def main(argv=None):
                     if notes:
                         report += [f"guard {set_name(op, mask, mem)} above comm_size {P}:"] + \
                             ["  " + n for n in notes]
-                    g_json = json_tree(g, opts, lambda o, m=m: sub(o, m), names)
+                    g_json = json_tree(g, opts, lambda o, m=m: sub(o, m), names,
+                                       at_node=lambda o, node, m=m, X=X_t: map_leaf(m, o, node, X))
                     if g_json != tree_json:
                         tree_json = {"comm_size(%d)" % P: tree_json, "any": g_json}
                 out[key] = tree_json
@@ -1215,6 +1261,11 @@ def main(argv=None):
     for path, m, S in every:
         for line in S.lines:
             print(line)
+    for (op, mem, o), (n, split, th) in sorted(mapped.items()):
+        chunks = sorted({x[0] for x in th})
+        report.append(f"{op} {mem} {o}: leaf parameters from its param map: {n} leaves ({split} split by theta), "
+                      f"{len(th)} distinct theta" + (f", chunk_size {','.join(size_str(c) for c in chunks)}"
+                                                     if o == "circ_graph" else ""))
     for line in report:
         print(line)
     print(f"{a.out}: {', '.join(colls)}; features {','.join(feats)}; nesting {depth}")
