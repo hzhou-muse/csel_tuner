@@ -102,6 +102,14 @@ model's anchors (points it has are not remeasured):
 
     bin/collmodel --model bcast.model --growth-anchors --out bcast2.model --site aurora --nodes 32 --ppn 96
 
+A parameterized algorithm measured at its tuned parameters (--param-map, from bin/algoparam):
+each of its requests sets the algorithm's parameter CVARs to theta*(comm_size, msg_size) of the
+map, each measurement records the parameters it ran with, and the map goes into the algorithm's
+entry of the model, where colltree takes each leaf's parameters from. A model with a map keeps it:
+adding to it measures at the same map, and a different map is refused.
+
+    bin/collmodel --colls bcast,allreduce --algs all --catalog ... --param-map cg.model --out m.model ...
+
 Replay on recorded data in replay/data (replay/README.md), for development:
 
     bin/collmodel --algs binomial,tree --out m.model --replay [--seed 0]
@@ -160,6 +168,7 @@ from csel_tuner.model import (FORMAT, FORMAT_V4, FORMAT_V5, Model, ModelFile, de
                               tag_key, tag_str)
 from csel_tuner.model import inner_text as inner_text_of  # noqa: E402
 from csel_tuner.multi import Builder2, MultiSampler, known_sampler  # noqa: E402
+from csel_tuner.params import load_maps, model_maps, theta_of_req  # noqa: E402
 from csel_tuner.restrict import fixed_point, mem_known, plan_sets, precheck, set_name  # noqa: E402
 from csel_tuner.single import Builder, initial_layouts  # noqa: E402
 from csel_tuner.server import ServerError  # noqa: E402
@@ -180,9 +189,9 @@ OLD_OPS = {"bcast": 1, "allreduce": 4, "reduce": 4, "ireduce": 4, "iallreduce": 
 # settings that change which requests the builder makes: a resumed job must keep them
 SAME_ON_RESUME = ["mode", "op", "algs", "seed", "batches", "sync", "prune", "nodes", "ppn_max", "max_m", "counts", "inplace",
                   "compositional", "probe_m", "base", "inner", "layouts", "anchors", "mem", "exclude_algs",
-                  "growth", "grid_nodes", "max_stage"]
+                  "growth", "grid_nodes", "max_stage", "param_maps"]
 RESUME_DEFAULTS = {"mem": "host", "exclude_algs": "", "counts": "uniform", "inplace": False, "grid_nodes": None,
-                   "max_stage": None}       # for journals written before the setting existed
+                   "max_stage": None, "param_maps": {}}       # for journals written before the setting existed
 
 
 class Terminated(Exception):
@@ -397,7 +406,8 @@ def live(a, shared=None):
             m = 0
         if alg in min_count:
             m = max(m, elem * (1 << ((n * ppn).bit_length() - 1)))
-        return dict(op=a.op, m=m, p=n * ppn, ppn=ppn, batches=a.batches, sync=a.sync, **counts, **sel(alg))
+        theta = a.maps[alg].req_cvars(a.op, n * ppn, m) if alg in a.maps else {}
+        return dict(op=a.op, m=m, p=n * ppn, ppn=ppn, batches=a.batches, sync=a.sync, **counts, **sel(alg), **theta)
 
     def retrying(call):
         """call(), again on a fresh server if a call never returned (--timeout), up to 3 tries."""
@@ -651,11 +661,16 @@ def catalog_algs(a):
     return [x for x in cat.algorithms(a.op) if x.name not in skip], cat.restriction_bits()
 
 
-def alg_info(x, bits, cvar_values=None, old=None):
+def alg_info(x, bits, cvar_values=None, old=None, pmap=None):
     """An algorithm's model entry; "params" are its leaf parameters at the server's CVAR values
-    (none in replay), kept from old when the model has them already."""
+    (none in replay), kept from old when the model has them already; "param_map" the map its
+    measurements ran at (pmap, or old's)."""
     info = {"leaf": x.leaf, "restrictions": x.restrictions, "mask": x.mask(bits),
             "inner": [str(i) for i in x.inner]}
+    if pmap is not None:
+        info["param_map"] = pmap.to_dict()
+    elif old and old.get("param_map"):
+        info["param_map"] = old["param_map"]
     params, missing = x.params(cvar_values) if cvar_values is not None else (None, [])
     if missing:
         print(f"{x.name}: the server reports no {', '.join(missing)}; its leaf parameters are not recorded",
@@ -669,6 +684,44 @@ def alg_info(x, bits, cvar_values=None, old=None):
     if params is not None:
         info["params"] = params
     return info
+
+
+def bare_info(a, name):
+    """The model entry of an algorithm given without a catalog."""
+    info = {"leaf": None, "restrictions": [], "mask": 0, "inner": []}
+    if name in a.maps:
+        info["param_map"] = a.maps[name].to_dict()
+    return info
+
+
+def param_maps(a, base):
+    """{alg: ParamMap} the unit's algorithms are measured at: the model's (--model) and
+    --param-map's, which must agree; exits on a conflict."""
+    try:
+        have = model_maps(base) if base is not None else {}
+    except ValueError as e:
+        sys.exit(f"--model {a.model}: {e}")
+    given = {}
+    if a.param_map:
+        try:
+            given = load_maps(a.param_map, a.op, a.launch)
+        except (OSError, ValueError) as e:
+            sys.exit(f"--param-map {a.param_map}: {e}")
+        if not given:
+            print(f"--param-map {a.param_map}: no map for {a.op} on {a.launch} buffers; its algorithms run at "
+                  "their CVAR defaults", file=sys.stderr)
+    for alg, pm in given.items():
+        if alg in have and have[alg].hash != pm.hash:
+            sys.exit(f"--param-map: {a.op} {alg}: the model measured it at map {have[alg].hash} "
+                     f"({have[alg].describe()}), the file has {pm.hash} ({pm.describe()}); a new map needs a new "
+                     "model")
+        if alg not in have and base is not None and any(r["alg"] == alg for r in base.measurements):
+            sys.exit(f"--param-map: {a.op} {alg}: the model measured it at its CVAR defaults; a map needs a new "
+                     "model")
+    out = dict(have, **given)
+    for alg, pm in sorted(out.items()):
+        print(f"{a.op} {alg}: measured at param map {pm.hash}: {pm.describe()}", file=sys.stderr)
+    return out
 
 
 def missing_inner(x, text):
@@ -715,7 +768,7 @@ def restriction_sets(a, model, algs, probe):
     sets = plan_sets(algs1, bits, masks)
     for mask, lays, names in sets:
         print(f"set {set_name(a.op, mask)}: {len(lays)} layouts, algorithms {', '.join(names)}", file=sys.stderr)
-    model.algorithms.update({x.name: alg_info(x, bits, a.cvar_values) for x in algs1})
+    model.algorithms.update({x.name: alg_info(x, bits, a.cvar_values, pmap=a.maps.get(x.name)) for x in algs1})
     model.masks = dict(masks)
     model.left_out = sorted(broken)
     model.notes += ["precheck: " + n for n in notes]
@@ -875,7 +928,8 @@ def extend(a, model, measure, probe, inner_hash, clock, nodes, allocation, on_la
         by_name = {x.name: x for x in algs}
         for name in m.algorithms:
             if name in by_name:
-                m.algorithms[name] = alg_info(by_name[name], bits, a.cvar_values, m.algorithms[name])
+                m.algorithms[name] = alg_info(by_name[name], bits, a.cvar_values, m.algorithms[name],
+                                              a.maps.get(name))
     elif m.conditions and (a.algs or a.layouts):
         sys.exit("the model has restriction sets: give --catalog to add to it")
     else:
@@ -912,8 +966,8 @@ def extend(a, model, measure, probe, inner_hash, clock, nodes, allocation, on_la
     sample = set()
     for name in want:
         if name not in m.algorithms:
-            m.algorithms[name] = alg_info(by_name[name], bits, a.cvar_values) if name in by_name else \
-                {"leaf": None, "restrictions": [], "mask": 0, "inner": []}
+            m.algorithms[name] = alg_info(by_name[name], bits, a.cvar_values, pmap=a.maps.get(name)) \
+                if name in by_name else bare_info(a, name)
             sample.add(name)
         elif a.layouts:
             pass        # in the model: measured at --layouts only (layout_algs)
@@ -1429,6 +1483,8 @@ def parse_args(argv):
     ap.add_argument("--compositional", help="when creating a model: algorithms to leave for later, "
                     "comma-separated (default: those with an inner key in coll_algorithms.txt)")
     ap.add_argument("--probe-m", type=int, default=1024, help="message size of the precheck calls")
+    ap.add_argument("--param-map", metavar="MODEL", help="bin/algoparam's param maps: each mapped algorithm "
+                    "is measured at theta*(comm_size, msg_size), set per request through its parameter CVARs")
     ap.add_argument("--inner-selection", metavar="JSON", help="the tuning file loaded in the launch "
                     "(MPIR_CVAR_COLL_SELECTION_JSON_FILE) for a compositional algorithm's inner calls")
     ap.add_argument("--budget-h", type=float, help="per unit: stop after this many wall-clock hours, all jobs "
@@ -1479,7 +1535,7 @@ def parse_args(argv):
                    help="replay algorithm NAME from the recorded REC, runnable only on single-node, multi-node, "
                         "or multi-node layouts with several ranks per node (hier); e.g. release_gather=auto@single "
                         "(MPICH's default on one node)")
-    ap.set_defaults(cvar_values=None)          # from the server's info record, in live()
+    ap.set_defaults(cvar_values=None, maps={})     # cvar_values from the server's info record, in live(); maps in run_unit
     a = ap.parse_args(argv)
     if not a.out and not a.plan:
         ap.error("--out is required (except with --plan)")
@@ -1537,6 +1593,10 @@ def parse_args(argv):
         ap.error("--site/--nodes/--ppn or --launcher is required unless --replay")
     if a.resume and not a.log:
         ap.error("--resume needs --log (the earlier job's journal)")
+    if a.param_map and a.replay:
+        ap.error("--param-map: the recorded data ran at the CVAR defaults")
+    if a.param_map and not a.model and len(a.algs) == 1 and not a.catalog:
+        ap.error("--param-map needs a model of several algorithms (--algs, --catalog or --model)")
     return a
 
 
@@ -1697,6 +1757,7 @@ def run_unit(a, tags, t_job, shared):
             sys.exit(f"--model {a.model}: no unit {tag_str(tags)} (its units: "
                      + "; ".join(tag_str(u.tags) for u in ModelFile.load(a.model).units) + ")")
     base_hash = hashlib.sha256(open(a.model, "rb").read()).hexdigest()[:16] if a.model else None
+    a.maps = param_maps(a, base)
     inner_text = open(a.inner_selection).read() if a.inner_selection else None
     inner_hash = file_hash(inner_text_of(inner_text)) if inner_text else None
     journal = Journal(a.log, a.resume)
@@ -1707,6 +1768,10 @@ def run_unit(a, tags, t_job, shared):
     try:
         send, make_req, probe, layouts, sizes, nodes, ppn_max, max_m, meta, srv = \
             replay(a) if a.replay else live(a, shared)
+        for pm in a.maps.values():
+            w = pm.check(a.cvar_values, is_device(a.launch))
+            if w:
+                print("warning: " + w, file=sys.stderr)
         # the unit's budget in node-hours (--budget-h is wall hours; none: until the builder stops)
         a.budget = a.budget_node_h if a.budget_node_h is not None else \
             a.budget_h * nodes if a.budget_h is not None else math.inf
@@ -1717,7 +1782,8 @@ def run_unit(a, tags, t_job, shared):
                "base": base_hash, "inner": inner_hash,
                "layouts": a.layouts, "anchors": a.anchors if a.model else None, "mem": a.launch,
                "counts": a.counts, "inplace": a.inplace, "tags": tags, "growth": growth_spec(a),
-               "grid_nodes": a.grid_nodes, "max_stage": a.max_stage}
+               "grid_nodes": a.grid_nodes, "max_stage": a.max_stage,
+               "param_maps": {alg: pm.hash for alg, pm in sorted(a.maps.items())}}
         if journal.jobs:
             first = journal.jobs[0]
             err, dropped = resume_check(journal.jobs, job)
@@ -1769,7 +1835,8 @@ def run_unit(a, tags, t_job, shared):
                 elif rep.get("status") == "ok":
                     model.add_measurement(jid, alg, n, q, req["m"], rep["t_us"], rep["wall_us"],
                                           inner=inner_hash if model.is_compositional(alg) else None,
-                                          anchor=req.get("tag") == "anchor", growth=req.get("tag") == "growth")
+                                          anchor=req.get("tag") == "anchor", growth=req.get("tag") == "growth",
+                                          params=theta_of_req(req, a.op, a.maps[alg]) if alg in a.maps else None)
         else:
             on_reply = None
         measure = make_measure(journal, send, make_req, on_reply)
@@ -1824,8 +1891,7 @@ def run_unit(a, tags, t_job, shared):
             else:
                 sets = [(0, layouts, a.algs)]
                 if model is not None:
-                    model.algorithms.update({x: {"leaf": None, "restrictions": [], "mask": 0, "inner": []}
-                                             for x in a.algs})
+                    model.algorithms.update({x: bare_info(a, x) for x in a.algs})
             # a set where no algorithm can run (e.g. only in-place ones, which the requests never are)
             for mask, lays, names in sets:
                 if not names:

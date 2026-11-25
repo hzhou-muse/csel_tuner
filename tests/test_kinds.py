@@ -79,7 +79,7 @@ def test_missing_inner():
         m = Model("bcast", [1], [(1, 2)], {}, bits)
         a = argparse.Namespace(catalog=cat, op="bcast", exclude_algs="", algs=["nb"], inner_selection=sel,
                                replay=False, layouts=None, launch="host", max_stage=None,
-                               cvar_values=None)
+                               cvar_values=None, maps={})
         fail = lambda *x: sys.exit("probed")
         try:
             collmodel.extend(a, m, fail, fail, None, None, 1, None, None, None, None)
