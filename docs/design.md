@@ -869,3 +869,104 @@ of forced measurements predicts.
   only at large p) needs cost models per algorithm.
 - The v1 p90 error estimate is unreliable (few random checks); v2's regret
   estimate is reliable on the replay.
+- **Algorithm parameters** (§14): one rule (circ_graph's chunk_size and
+  q_len). Maps live inside the model's algorithm entries; per-algorithm
+  model files with links, and MPICH loading a map itself, are not there yet.
+
+## 14. Algorithm parameters: param maps
+
+Many algorithms have parameters (`extra_params` in the catalog), and their
+best values depend on the layout and the message size. Parameter tuning is
+kept apart from selection: a **param map** theta\*(comm_size, msg_size) is
+calibrated per algorithm (`bin/algoparam`), and the selection then treats the
+algorithm as a plain one, measured and written at theta\*. Selection never
+sees a parameter space; calibration never sees other algorithms.
+
+**Rule, not table.** A map is a fixed expression per algorithm family plus
+a few site constants. Only the rule's name, its
+version and the constants are stored: the expression is code, so each rule
+has a version, part of the map's hash, that is bumped whenever the code
+would give other parameters for the same constants (a test pins the
+current version's output). collmodel and colltree refuse a map of another
+version than the code's, since its algorithm was measured with parameters
+the code no longer computes; `algoparam --refit` makes a map of the
+current version, and the algorithm is measured again. A rule predicts parameters at
+layouts and sizes that were never measured; its constants come from a
+small calibration on each system. The circ_graph rule (bcast, ibcast and
+allgather are bcast-like; reduce and allreduce reduce-like):
+
+```
+chunk_size = 0 (one block)                  bcast-like and p <= 2
+           = max(F, pow2(m / D))            m <= M0
+           = clamp(pow2(sqrt(A m)), Fb, C)  otherwise
+q_len      = Qb if m >= Mq else Q
+```
+
+pow2 rounds to the nearest power of two in log2. The pipeline trades rounds
+(n - 1 + q for n blocks) against per-block cost: one block at a large
+message costs about q rounds of the whole message; tiny blocks pay the per
+message overhead n times and, on dense multi-node layouts, hit stalls (a
+floor Fb); the best large-message chunk grows about as sqrt(m) up to a cap
+C. F, A, Fb and C are fitted; M0 = 64K, D = 8, Q = 8, Qb = 16, Mq = 16M
+are defaults any of which `--set` can fix or a q_len sweep refits (Qb).
+
+**One module per rule.** `csel_tuner/params.py` is the generic part: the
+map (identity, version check, per-request CVARs), the param-map files, and
+`rule(name)`, which loads `csel_tuner/param_<name>.py` on first use. A rule
+module has its version, parameter names and their CVARs (as in the
+catalog's `cvar_params`), its constants and their defaults per collective
+family, `theta` (the expression), `describe` and `check` (a warning about
+the server's settings); for `bin/algoparam` also its families, its command
+line options, `calibrate` (which points to measure, through a context that
+runs them) and `fit` (the constants from the measurements). algoparam
+itself is generic: it starts the server, runs the rule's calibration, fits
+and writes the units. The interface is as narrow as circ_graph needs; a
+second rule (a radix `k`, say) widens it where it must. Adding a rule:
+a `param_<name>.py` with that interface, its pinned-output test, and the
+algorithm's name as the rule name (or `algoparam --rule`).
+
+**Calibration** (circ_graph). Rows of chunk sizes at q_len Q: every power of two from
+max(1K, m/16) (m <= 64K) or 4K (larger m) up to m, at m = 16K, 64K, 4M, 64M
+on one full node and on two nodes with one rank each, and at m = 256K,
+512K, 1M on the full allocation, where the floor matters most and grows
+with the node count (so calibrate at the largest scale the tuning file
+serves). About a hundred points, all in one launch (the layouts are
+sub-communicators of the allocation). The regret of a chunk at a cell is its
+time over the cell's best measured chunk; a chunk the rule picks between
+measured ones takes the nearest in log2, and chunks >= m or 0 are one block.
+The fit is a grid search over powers of two (F 2K..32K, A 1K..64K, Fb
+16K..128K, C 128K..2M, Fb <= C) minimizing the p98 regret over the cells,
+then the mean log regret; the grid is narrow on purpose, since about ten
+cells overfit a wide one. A q_len sweep at the rule's chunk on the full
+allocation at m >= Mq picks Qb (least geomean regret; Q unless that gains
+more than 3%). The report compares the rule with the default (128K) on the
+rows; the calibration's measurements stay in the map file, so `--refit`
+redoes the fit without measuring. The fit report keeps the constants fixed
+with `--set` (`"set"`), which a refit fixes again unless `--set` replaces
+or `--unset` drops them: refitting with one changed constant does not lose
+the others.
+
+**Measuring at the map.** collmodel `--param-map` sets, in every request of
+a mapped algorithm, its parameter CVARs (`MPIR_CVAR_<COLL>_<cvar_param>`,
+as MPICH's gen_coll.py names them) to theta\*(p, m), through mpisrv's
+per-request `cvar.*` (§3.5), and records the theta with each measurement.
+The algorithm is already forced by its CVAR there, so the parameters take
+the same path; the alternative, MPICH evaluating a loaded map itself for a
+forced algorithm, needs a hook in MPICH and can replace this later without
+changing the model. The map goes into the algorithm's entry with its hash;
+the journal checks it on `--resume`; a model with a map keeps measuring at
+it, and another map for the same algorithm is refused (re-tuning needs a new
+model, since the old measurements ran at the old theta). The curves are
+then the algorithm's times at theta\*, a lower envelope across theta
+switches, and the selection compares them with the other algorithms as is.
+
+**Writing the leaves.** At a leaf won by a mapped algorithm colltree
+evaluates the map at the leaf's grid points. One theta: an algorithm leaf
+with it. Several: a branch over the leaf's region that separates its points
+by theta exactly (a tree on the same conditions, with 0/1 costs), ending in
+algorithm leaves with each theta. On the grid the tuning file runs what was
+measured; between grid sizes a call takes the theta of the next larger grid
+size, as with every msg_size split. On device buffers MPICH clamps a packed
+chunk to the pool cell (`MPIR_CVAR_CIRC_GRAPH_CHUNK_SIZE`), so a cap C above
+the cell acts as the cell; algoparam measures each such schedule once and
+collmodel warns.

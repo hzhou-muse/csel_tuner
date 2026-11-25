@@ -21,6 +21,7 @@ and load the resulting tuning file into MPICH. For how it works, see
 |---|---|
 | `bin/collmodel` | builds models: one algorithm (v1) or several (v2) |
 | `bin/colltree` | turns a v2 model into an MPICH tuning file (v3) |
+| `bin/algoparam` | calibrates a parameterized algorithm's param map (circ_graph's chunk_size and q_len) |
 | `csel_tuner/` | the Python package (interpolation, server driver, builders) |
 | `server/` | the benchmark server (`mpisrv.def`, `macros/*.def`, `colls/*.def` with one file per measured operation, `gpu.c`) and its Makefile |
 | `launch/` | `config.sh` (launch function) and `sites/<site>.sh` (node topology, MPICH path) |
@@ -512,6 +513,44 @@ bin/colltree s3.json --out tuning.json
   their calls reach subtree 0, correct for any op), and reports stale
   compositional algorithms with the collmodel command that remeasures them.
 
+### 6.8 Tuned algorithm parameters (`bin/algoparam`)
+
+A parameterized algorithm can be measured at tuned parameters instead of
+its CVAR defaults (design.md §14). Today: circ_graph's `chunk_size` and
+`q_len` (an MPICH with pmodels/mpich#8186, where they are algorithm
+parameters). One calibration per family and memory kind, on the largest
+allocation the tuning file serves, then the usual collmodel run with the
+maps:
+
+```sh
+CAT=$MPICH_SRC/src/mpi/coll/coll_algorithms.txt
+bin/algoparam --op bcast --also ibcast,allgather --catalog $CAT --site aurora --nodes 32 --ppn 96 \
+    --out cg_host.model --log cg_bcast.log
+bin/algoparam --op allreduce --also reduce --catalog $CAT --site aurora --nodes 32 --ppn 96 \
+    --out cg_host.model --log cg_allreduce.log
+bin/collmodel --colls bcast,ibcast,allgather,reduce:all,allreduce:all --algs all --max-stage 1 \
+    --catalog $CAT --param-map cg_host.model --site aurora --nodes 32 --ppn 96 --out s1.model --log s1
+bin/colltree s1.model --out tuning.json        # circ_graph leaves carry the theta of their region
+```
+
+- algoparam measures rows of chunk sizes at three layouts (1 x ppn, 2x1, the
+  full allocation; `--rows` changes them), fits the rule's constants, sweeps
+  q_len at m >= 16M (`--qlen`, `--qlen-at`; `--qlen ''` skips it), and prints
+  the regret of the rule and of the default per row cell. `--set A=16K` fixes
+  a constant; `--refit cg_host.model` refits from the recorded measurements
+  without measuring, with the constants the earlier fit had fixed fixed again
+  (the fit report keeps them, `"set"`); a `--set` replaces one, `--unset A`
+  drops one. The output has a unit per collective
+  (`--op` and each `--also`, one map); an existing file keeps its other units.
+- Device buffers: `--launch gpu` (or `device`), with a separate output, e.g.
+  `cg_gpu.model`. MPICH clamps a packed chunk to the pool cell
+  `MPIR_CVAR_CIRC_GRAPH_CHUNK_SIZE` (default 128K), so set the cell to the
+  cap you want measured (`--env MPIR_CVAR_CIRC_GRAPH_CHUNK_SIZE=524288` on
+  both algoparam and collmodel).
+- collmodel prints each map it measures at. A model with a map measures at
+  it in every later run (`--model`); another `--param-map` for the same
+  algorithm is refused.
+
 ## 7. Make and load the tuning file (`bin/colltree`)
 
 ```sh
@@ -775,6 +814,8 @@ python3 tests/test_reserved.py   # colltree's reserved set names: dispatch(<mask
 python3 tests/test_kinds.py      # restriction kinds, variants; inner trees in --inner-selection
 python3 tests/test_stages.py     # algorithm stages from inner calls; disabled algorithms, leaf names and parameters
 python3 tests/test_collection.py  # colltree over several collectives and variants, --colls, --with, staleness
+python3 tests/test_params.py     # param maps: rule modules, version check, params lines, algoparam --refit, colltree leaves
+python3 tests/test_param_circ_graph.py  # the circ_graph rule: its output pinned for its version, the calibration fit
 ```
 
 They also run under pytest.

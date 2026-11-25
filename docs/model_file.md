@@ -20,6 +20,7 @@ one way (design.md §12.1), named by its **tags**:
 | `datatype` | mpisrv's element type: `int` for the reductions, `byte` otherwise |
 | `counts` | v-operations only: the blocks' pattern (`--counts`) |
 | `launch` | the launch kind (`--launch`, `--mem`): `host` (host buffers), `gpu` (device buffers with GPU_COLL) or `device` (device buffers without it) |
+| `kind` | `param_map` in a param-map file's units (below); absent in a model's |
 
 It is written as **collmodel/6**, line-oriented text (`*.model`), so grep,
 diff, less and awk read it and a user can annotate it:
@@ -104,7 +105,7 @@ An `@algo` line starts an algorithm's section; the lines up to the next
 | Line | Syntax | Meaning |
 |---|---|---|
 | `@algo` | `@algo NAME` | the algorithm, by its catalog name (e.g. `binomial`, `nb`, `buffer_swap`) |
-| `info` | `info {json}` | its catalog entry: `leaf` (the CSEL leaf function, or null for `MPIR_<Coll>_intra_<name>`), `restrictions` (condition names), `mask` (their bits), `inner` (the inner calls of a compositional algorithm, `section@comm[k=v]`), `params` (the leaf parameters at the CVAR values it ran with, below). Absent for an algorithm that was only prechecked |
+| `info` | `info {json}` | its catalog entry: `leaf` (the CSEL leaf function, or null for `MPIR_<Coll>_intra_<name>`), `restrictions` (condition names), `mask` (their bits), `inner` (the inner calls of a compositional algorithm, `section@comm[k=v]`), `params` (the leaf parameters at the CVAR values it ran with, below), `param_map` (an algorithm measured at a param map, design.md §14: `rule`, its `version`, `consts`, `hash`, and the calibration's `fit` report, not part of the hash; a map of another rule version than the code's is refused). Absent for an algorithm that was only prechecked |
 | `fit_inner` | `fit_inner HASH` | a compositional algorithm: the inner selection file its curves ran under |
 | `penalty` | `penalty intra\|inter A ...` or `penalty intra\|inter -` | the non-power-of-two penalty a(m) of its layout model, one value per grid size, for single-node (`intra`) or multi-node (`inter`) layouts; `-`: nothing fitted for that class (below) |
 | `curve` | `curve NxPPN V ...` | log2 of the time in µs at every grid size, at one layout where it was sampled: measured sizes exactly, the others interpolated or, where pruned, the cross-layout prediction corrected by the measured residuals |
@@ -206,6 +207,14 @@ penalty was stored) refits it on load.
 
 collmodel/2 and /3, written by earlier versions, convert with
 `bin/collmodel --import`.
+
+## Param-map files
+
+A param-map file (`bin/algoparam`, design.md §14) is a model file too: one
+unit per collective with the extra tag `kind=param_map`, holding the
+algorithm's entry with its `param_map` and the calibration's measurements
+with their parameters. colltree skips such units; collmodel `--param-map`
+reads them.
 
 ## collmodel/5 and /4 (JSON, read only)
 

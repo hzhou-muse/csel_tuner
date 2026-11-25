@@ -9,8 +9,9 @@ per node) and message sizes, models where each algorithm wins, and writes a
 decision tree in MPICH's collective-selection JSON format (CSEL).
 
 ```
+bin/algoparam --op bcast --also ibcast,allgather ...  tuned parameters (optional)  ->  cg.model
 bin/collmodel --plan --colls ... --catalog CAT      the units and their stages
-bin/collmodel --colls bcast,allreduce:all --algs all --max-stage 1 ...   measure  ->  m1.model
+bin/collmodel --colls bcast,allreduce:all --algs all --max-stage 1 [--param-map cg.model] ...  measure  ->  m1.model
 bin/collmodel --model m1.model --max-stage 2 --inner-selection t1.json ...  add  ->  m2.model
 bin/colltree m2.model                               decision trees, one file  ->  tuning.json
 MPIR_CVAR_COLL_SELECTION_JSON_FILE=tuning.json mpiexec ... ./app
