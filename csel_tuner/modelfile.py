@@ -26,6 +26,10 @@ text that grep, diff, less and awk can read and a user can annotate:
     curve 2x4 2.181421 2.190931 ...     # log2 T on the size grid
     meas 2 4 1 4406.8 0 - - 269.7395 269.521 ...
     pre 1 2 1 0 <msg>
+    @algo circ_graph                    # an algorithm measured at its param map (info's param_map)
+    info {"leaf":null,...,"param_map":{"rule":"circ_graph","consts":{...},"hash":"..."}}
+    params 0 {"chunk_size":65536,"q_len":8} # the parameters of its measurements, by index
+    meas 2 4 262144 812.5 0 p0 - 101.2 ...
 
 Lines: blank lines and lines whose first non-blank character is # are ignored; fields are
 separated by runs of blanks; a # elsewhere is ordinary text (no trailing comments in data).
@@ -34,8 +38,11 @@ structured values are one-line JSON. A verbatim block runs from "---- <label> --
 "---- end" and keeps everything between, byte for byte (its text always ends with a newline); the
 reader checks an inner file's hash against its label.
 
-meas: N ppn m wall_us job flags inner t_us..., flags "a" (drift anchor), "g" (growth anchor) or
-"-", inner the hash of the inner selection or "-". pre: N ppn ok(1/0) job msg, msg the rest of
+meas: N ppn m wall_us job flags inner t_us..., flags "a" (drift anchor), "g" (growth anchor),
+"p<k>" (ran with the algorithm's params line k: its parameters, set per request) or "-", inner the
+hash of the inner selection or "-". params: k {param: value}, the distinct parameters of the
+algorithm's measurements, numbered from 0 in the order of first use; a file without params lines
+is one whose measurements all ran at the CVAR defaults. pre: N ppn ok(1/0) job msg, msg the rest of
 the line.
 
 Jobs and inner files belong to the unit: a job measures many algorithms and an inner selection can
@@ -83,7 +90,7 @@ def write(path_or_file, units, created):
 
 def dumps(units, created):
     out = ["%s created=%s" % (MAGIC, created),
-           "# meas: N ppn m wall_us job flags(a: anchor, g: growth) inner t_us...",
+           "# meas: N ppn m wall_us job flags(a: anchor, g: growth, p<k>: params k) inner t_us...",
            "# pre: N ppn ok job msg"]
     for u in units:
         out += _unit_lines(u)
@@ -92,6 +99,10 @@ def dumps(units, created):
 
 def _js(v):
     return json.dumps(v, separators=(",", ":"))
+
+
+def _params_key(d):
+    return json.dumps(d, sort_keys=True, separators=(",", ":"))
 
 
 def _num(x):
@@ -176,8 +187,15 @@ def _unit_lines(u):
                 out.append(" ".join(["penalty", cls] + (["-"] if v is None else [_num(x) for x in v])))
         for c in fit["curves"].get(a, []):
             out.append(" ".join(["curve", _lay(c["N"], c["ppn"])] + [_num(x) for x in c["log2_t"]]))
+        pnum = {}
         for r in meas.get(a, []):
-            out.append(_meas_line(r))
+            if r.get("params") is not None:
+                k = _params_key(r["params"])
+                if k not in pnum:
+                    pnum[k] = len(pnum)
+                    out.append("params %d %s" % (pnum[k], k))
+        for r in meas.get(a, []):
+            out.append(_meas_line(r, pnum))
         for r in pre.get(a, []):
             if "\n" in r["msg"]:
                 raise ValueError("precheck message %r: one line in a .model file" % r["msg"])
@@ -186,14 +204,16 @@ def _unit_lines(u):
     return out
 
 
-_MEAS_KEYS = {"alg", "N", "ppn", "m", "t_us", "wall_us", "job", "inner", "anchor", "growth"}
+_MEAS_KEYS = {"alg", "N", "ppn", "m", "t_us", "wall_us", "job", "inner", "anchor", "growth", "params"}
+_FLAGS = re.compile(r"^(a?)(g?)(?:p(\d+))?$")
 
 
-def _meas_line(r):
+def _meas_line(r, pnum):
     extra = set(r) - _MEAS_KEYS
     if extra:
         raise ValueError("measurement %r: keys %s have no column in a .model file" % (r, sorted(extra)))
-    flags = ("a" if r.get("anchor") else "") + ("g" if r.get("growth") else "")
+    flags = ("a" if r.get("anchor") else "") + ("g" if r.get("growth") else "") + \
+        ("p%d" % pnum[_params_key(r["params"])] if r.get("params") is not None else "")
     return " ".join(["meas", "%d" % r["N"], "%d" % r["ppn"], _num(r["m"]), _num(r["wall_us"]), "%d" % r["job"],
                      flags or "-", _name(r["inner"], "hash") if r.get("inner") else "-"]
                     + [_num(t) for t in r["t_us"]])
@@ -305,7 +325,7 @@ def _new_unit(tags):
             "layout_masks": [], "left_out": [], "notes": [],
             "data": {"jobs": [], "measurements": [], "prechecks": [], "inner_files": {}},
             "fit": {"version": FIT_VERSION, "inner": {}, "curves": {}, "penalty": {}}, "runs": [],
-            "_masks": {}}
+            "_masks": {}, "_params": {}}
 
 
 def _parse_lay(s):
@@ -369,13 +389,24 @@ def _algo_line(u, alg, key, rest, f, fail):
              "t_us": [_number(x) for x in f[7:]], "wall_us": _number(f[3]), "job": int(f[4])}
         if f[6] != "-":
             r["inner"] = f[6]
-        if set(f[5]) - set("ag-"):
-            fail("meas flags %r (a, g or -)" % f[5])
-        if "a" in f[5]:
+        fl = _FLAGS.match(f[5]) if f[5] != "-" else _FLAGS.match("")
+        if not fl:
+            fail("meas flags %r (a, g, p<k> or -)" % f[5])
+        if fl.group(1):
             r["anchor"] = True
-        if "g" in f[5]:
+        if fl.group(2):
             r["growth"] = True
+        if fl.group(3) is not None:
+            pnum = u["_params"].get(alg, {})
+            if int(fl.group(3)) not in pnum:
+                fail("meas flag p%s: no params line %s above it" % (fl.group(3), fl.group(3)))
+            r["params"] = dict(pnum[int(fl.group(3))])
         u["data"]["measurements"].append(r)
+    elif key == "params":
+        pnum = u["_params"].setdefault(alg, {})
+        if int(f[0]) != len(pnum):
+            fail("params %s out of order (expected %d)" % (f[0], len(pnum)))
+        pnum[int(f[0])] = json.loads(rest[len(f[0]):])
     elif key == "pre":
         parts = rest.split(None, 4)
         if len(parts) < 4 or parts[2] not in ("0", "1"):
@@ -389,6 +420,7 @@ def _algo_line(u, alg, key, rest, f, fail):
 def _finish(u, path):
     """The unit dict as model.Model.from_dict takes it (masks over the layouts, 0 by default)."""
     masks = u.pop("_masks")
+    u.pop("_params")
     for lay in masks:
         if list(lay) not in u["layouts"]:
             raise ParseError("%s: unit %s: mask %s is not one of its layouts" % (path, u["tags"], _lay(*lay)))

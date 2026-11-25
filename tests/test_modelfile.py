@@ -108,8 +108,32 @@ def test_errors():
         assert "no blanks" in str(e)
 
 
+def test_params():
+    """Measurements with their parameters: params lines numbered in the order of first use (equal
+    parameters in any key order are one line), the p<k> flag after a/g, and the reader refusing a
+    flag without its params line."""
+    m = unit()
+    m.add_measurement(0, "ring", 2, 4, 1, [1.0], 1.0, params={"chunk_size": 4096, "q_len": 8})
+    m.add_measurement(0, "ring", 2, 4, 2, [1.0], 1.0, params={"q_len": 8, "chunk_size": 4096})
+    m.add_measurement(1, "ring", 2, 4, 4, [1.0], 1.0, anchor=True, growth=True, params={"chunk_size": 0, "q_len": 2})
+    m.add_measurement(0, "smp", 2, 4, 1, [1.0], 1.0, params={"k": 4})
+    d = m.to_dict()
+    text = modelfile.dumps([d], "T")
+    assert text.count("\nparams ") == 3, text
+    assert '\nparams 0 {"chunk_size":4096,"q_len":8}\n' in text and '\nparams 1 {"chunk_size":0,"q_len":2}\n' in text
+    flags = [x.split()[6] for x in text.splitlines() if x.startswith("meas ") and "p" in x.split()[6]]
+    assert flags == ["p0", "p0", "agp1", "p0"], flags
+    back = roundtrip(d)
+    assert same(back.to_dict(), d)
+    assert sum(1 for r in back.measurements if r.get("params")) == 4
+    fails(text.replace('\nparams 1 {"chunk_size":0,"q_len":2}', "\n# params 1"), "params line")
+    fails(text.replace("\nparams 1 ", "\nparams 2 "), "out of order")
+    fails(text.replace(" agp1 ", " pa1 "), "flags")
+
+
 if __name__ == "__main__":
     test_roundtrip()
     test_hand_edited()
     test_errors()
+    test_params()
     print("ok")
