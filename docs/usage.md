@@ -542,6 +542,10 @@ bin/colltree s1.model --out tuning.json        # circ_graph leaves carry the the
   (the fit report keeps them, `"set"`); a `--set` replaces one, `--unset A`
   drops one. The output has a unit per collective
   (`--op` and each `--also`, one map); an existing file keeps its other units.
+- A file with host and gpu units: `--refit cg.model --launch gpu --op bcast
+  --out cg.model` refits the gpu unit (that launch kind, else one with the
+  same buffers, as `--param-map` picks) and, without `--also`, the units that
+  carry its map (ibcast, allgather); the other units stay.
 - Device buffers: `--launch gpu` (or `device`), with a separate output, e.g.
   `cg_gpu.model`. MPICH clamps a packed chunk to the pool cell
   `MPIR_CVAR_CIRC_GRAPH_CHUNK_SIZE` (default 128K), so set the cell to the
@@ -814,7 +818,7 @@ python3 tests/test_reserved.py   # colltree's reserved set names: dispatch(<mask
 python3 tests/test_kinds.py      # restriction kinds, variants; inner trees in --inner-selection
 python3 tests/test_stages.py     # algorithm stages from inner calls; disabled algorithms, leaf names and parameters
 python3 tests/test_collection.py  # colltree over several collectives and variants, --colls, --with, staleness
-python3 tests/test_params.py     # param maps: rule modules, version check, params lines, algoparam --refit, colltree leaves
+python3 tests/test_params.py     # param maps: rule modules, version check, params lines, algoparam --refit (--launch), colltree leaves
 python3 tests/test_param_circ_graph.py  # the circ_graph rule: its output pinned for its version, the calibration fit
 ```
 

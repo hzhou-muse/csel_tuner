@@ -85,14 +85,14 @@ def test_identity():
 
 
 LAYS = [(1, 4), (2, 1), (2, 4)]
-def param_unit(op="bcast", pm=None, meas=True):
+def param_unit(op="bcast", pm=None, meas=True, launch="host", truth=None):
     pm = pm or ParamMap.default(op, "circ_graph")
-    u = Model(op, [1], LAYS, {"N": [1, 2], "ppn": [1, 4], "m": [1, 4 * M]},
-              tags=map_tags(op, "host"),
+    u = Model(op, [1], LAYS, {"N": [1, 2], "ppn": [1, 4], "m": [1, 4 * M]}, mem=launch,
+              tags=map_tags(op, launch),
               algorithms={"circ_graph": {"leaf": None, "restrictions": [], "mask": 0, "inner": [],
                                          "param_map": pm.to_dict()}})
     if meas:
-        truth = ParamMap.default(op, "circ_graph", F=8 * K, A=4 * K, Fb=32 * K, C=256 * K)
+        truth = truth or ParamMap.default(op, "circ_graph", F=8 * K, A=4 * K, Fb=32 * K, C=256 * K)
         u.jobs = [{"start": 0}]
         for c in synth_cells(truth):
             for ch, t in c["t"].items():
@@ -134,8 +134,9 @@ def test_algoparam_refit():
         assert maps["ibcast"].fit == {"from": "bcast", "op": "ibcast"}
         assert load_maps(g, "bcast", "gpu") == {}           # host maps do not serve device buffers
         # --set keeps a constant; the refit replaces the units of the same tags, keeps others
-        with redirect_stdout(io.StringIO()):
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
             ap.main(["--op", "bcast", "--refit", f, "--out", g, "--set", "A=64K"])
+        assert "stays on ibcast, allgather" in err.getvalue(), err.getvalue()
         assert load_maps(g, "bcast", "host")["circ_graph"].consts["A"] == 64 * K
         assert load_maps(g, "ibcast", "host")["circ_graph"].consts["A"] != 64 * K
         assert len(ModelFile.load(g).units) == 3
@@ -166,6 +167,67 @@ def test_algoparam_refit():
                 assert False, bad
             except SystemExit:
                 pass
+
+
+def test_algoparam_refit_launch():
+    """A param-map file with a host and a gpu calibration of bcast (and ibcast, which carries each
+    map) and a host allreduce unit: --launch picks the unit, a refit in place replaces only that
+    launch kind's bcast family."""
+    ap = tool("algoparam")
+    gpu_truth = ParamMap.default("bcast", "circ_graph", F=16 * K, A=8 * K, Fb=64 * K, C=512 * K)
+
+    def follower(op, launch):
+        pm = ParamMap.default(op, "circ_graph")
+        return param_unit(op, ParamMap("circ_graph", "circ_graph", pm.consts, {"from": "bcast", "op": op}),
+                          meas=False, launch=launch)
+
+    def run(*args):
+        with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+            ap.main(["--op", "bcast"] + list(args))
+        return out.getvalue(), err.getvalue()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        f, g = os.path.join(tmp, "cg.model"), os.path.join(tmp, "x.model")
+        units = [param_unit(), follower("ibcast", "host"), param_unit(launch="gpu", truth=gpu_truth),
+                 follower("ibcast", "gpu"), param_unit("allreduce", meas=False)]
+        ModelFile(units).save(f)
+        before = {(u.op, u.mem): u.algorithms["circ_graph"]["param_map"]["hash"] for u in ModelFile.load(f).units}
+        # without --launch: refused, naming the launch kinds
+        try:
+            run("--refit", f, "--out", g)
+            assert False, "two launch kinds need --launch"
+        except SystemExit as e:
+            assert "launch gpu, host" in str(e) and "--launch" in str(e), e
+        # --launch picks the unit; ibcast, which carries that map in the file, is refitted with it
+        _, err = run("--refit", f, "--launch", "gpu", "--out", g)
+        assert "also serves ibcast" in err, err
+        assert sorted((u.op, u.mem) for u in ModelFile.load(g).units) == [("bcast", "gpu"), ("ibcast", "gpu")]
+        gpu = load_maps(g, "bcast", "gpu")["circ_graph"]
+        assert (gpu.consts["F"], gpu.consts["A"]) == (16 * K, 8 * K), gpu.consts     # the gpu rows, not host
+        assert load_maps(g, "ibcast", "gpu")["circ_graph"].hash == gpu.hash
+        # device buffers without GPU_COLL: the gpu unit (same buffers), written as it was
+        _, err = run("--refit", f, "--launch", "device", "--out", os.path.join(tmp, "d.model"))
+        assert "no device unit" in err and "launch=gpu" in err, err
+        assert load_maps(os.path.join(tmp, "d.model"), "bcast", "gpu")["circ_graph"].hash == gpu.hash
+        # in place, host: the host bcast family is replaced, the gpu units and allreduce stay
+        run("--refit", f, "--launch", "host", "--set", "A=64K", "--out", f)
+        after = {(u.op, u.mem): u.algorithms["circ_graph"]["param_map"]["hash"] for u in ModelFile.load(f).units}
+        assert sorted(after) == sorted(before)
+        changed = {k for k in after if after[k] != before[k]}
+        assert changed == {("bcast", "host"), ("ibcast", "host")}, changed
+        assert load_maps(f, "ibcast", "host")["circ_graph"].consts["A"] == 64 * K
+        assert ModelFile.load(f).units[2].measurements == units[2].measurements      # gpu data kept
+        # an --also without ibcast leaves it on the earlier map, and says so
+        _, err = run("--refit", f, "--launch", "host", "--also", "allgather", "--set", "A=32K", "--out", f)
+        assert "stays on ibcast" in err, err
+        assert load_maps(f, "ibcast", "host")["circ_graph"].consts["A"] == 64 * K
+        # a launch kind the file lacks
+        ModelFile(units[:2]).save(g)
+        try:
+            run("--refit", g, "--launch", "gpu", "--out", os.path.join(tmp, "z.model"))
+            assert False, "no gpu unit"
+        except SystemExit as e:
+            assert "--launch gpu" in str(e) and "host" in str(e), e
 
 
 def test_collmodel_maps():
