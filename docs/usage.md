@@ -175,7 +175,7 @@ bin/collmodel --op bcast --algs all \
 - Needs an MPICH whose `release_gather` condition has no side effects
   (pmodels/mpich#8048); with an older one the precheck of `release_gather`
   depends on how often it was evaluated.
-- The model file is collmodel/6 text, `*.model` (design.md §8 and §12): units, each one
+- The model file is collmodel/6 text, `*.model` (model_file.md; design.md §12): units, each one
   collective measured one way and named by its tags (`coll`, `variant` such
   as `inplace`, `datatype`, `counts`, `launch`), with every measurement and
   its job, the precheck results, the catalog's conditions and each layout's
@@ -360,7 +360,7 @@ The algorithm is selected per request when the server supports it, else
 for the whole launch (`--switch auto|request|launch`). It stops when the
 estimated median error ≤ `--tau-med` (5%) and p90 ≤ `--tau-p90` (20%), at a
 plateau, or at the budget. The output (collmodel/1) is a performance model
-of that algorithm (design.md §8).
+of that algorithm (model_file.md).
 
 ### 6.4 Options
 
@@ -545,7 +545,7 @@ predicted regret and the algorithms used.
 | `--stale-tol` | 1.05 | report a compositional algorithm's changed inner choice when the two are predicted more than this apart |
 | `--format` | `reserved` | `reserved`: MPICH's reserved set names, reached by its built-in dispatch; `legacy`: the `<op>-intra-auto` dispatches, `<op>-intra-main` swap choices and `name=main`, for an MPICH without the reserved names |
 | `--nested-dispatch` | off | with `--format legacy`: dispatch on restrictions with nested conditions instead of `dispatch=` (MPICH without pmodels/mpich#8048) |
-| `--param ALG.KEY=VALUE` | | override an algorithm leaf's parameter, e.g. `tree.k=4`; by default the leaves get the parameters the model recorded (the CVAR values of the measurements, design §8) |
+| `--param ALG.KEY=VALUE` | | override an algorithm leaf's parameter, e.g. `tree.k=4`; by default the leaves get the parameters the model recorded (the CVAR values of the measurements, model_file.md) |
 
 A compact file for MPICH's built-in default (subtrees of a few levels, no
 node conditions), spliced into the source tree:

@@ -320,137 +320,8 @@ predicted regret of choosing a at point i):
 
 ## 8. File formats
 
-**collmodel/1** (one algorithm):
-
-```json
-{"format": "collmodel/1", "inputs": ["N", "ppn", "m"], "output": "t_us", "what": "bcast-latency",
- "alg": "binomial",
- "model": {"type": "layout-grid-pof2", "sizes": [1, 2, 3, ...],
-           "layouts": [{"N": 2, "ppn": 1, "log2_t": [...]}, ...],
-           "penalty": {"form": "1 + a*s", "a_intra": [...], "a_inter": [...]}},
- "domain": {"N": [1, 32], "ppn": [1, 96], "m": [1, 67108864]},
- "jumps": [{"N": 2, "ppn": 1, "lo": ..., "hi": ..., "ratio": ...}, ...],
- "meta": {"created": "...", "tool": "collmodel 0.1", "launch": {...}, "library": "...",
-          "n_measurements": ..., "n_layouts": ..., "node_h": ..., "stop": "plateau",
-          "estimate": {"med": ..., "p90": ...}, "checks": [...]}}
-```
-
-`log2_t` is the measured layout's curve on the size grid; prediction at
-other layouts follows §5 (`LayoutModel.from_json`).
-
-**The model file** (several algorithms, `csel_tuner/model.py`; §12.1): a list
-of units, each one model of one collective measured one way, named by its
-**tags**:
-
-| Tag | Meaning |
-|---|---|
-| `coll` | the collective (`--op`) |
-| `variant` | the input-condition assignment the requests had (`kinds.run_variant`): `inplace` where MPI allows `MPI_IN_PLACE`, `builtin_op`/`commutative` (always 1: mpisrv sums with `MPI_SUM`) for the reductions |
-| `datatype` | mpisrv's element type: `int` for the reductions, `byte` otherwise |
-| `counts` | v-operations only: the blocks' pattern (`--counts`) |
-| `launch` | the buffers' memory, `host` or `device` (`--mem`) |
-
-It is written as **collmodel/6**, line-oriented text (`*.model`,
-`csel_tuner/modelfile.py`, whose docstring has the full grammar), so grep,
-diff, less and awk read it and a user can annotate it:
-
-```
-collmodel/6 created=2026-11-22T10:00:00Z
-@unit coll=allreduce variant={"builtin_op":1,"commutative":1,"inplace":0} datatype=int launch=host
-sizes 1 2 3 4 ...
-domain {"N":[1,8],"ppn":[1,12],"m":[1,67108864]}
-layouts 1x2 1x3 ... 8x12
-conditions inplace not_inplace pof2 ...
-mask 1x2 6144                      # nonzero layout masks
-left_out nb
-fit_version 2
-job 0 {"start":...,"mode":"live",...}
-run {"mode":"create",...}
----- 3fa2c1d09b7e4a55 ----         # an inner selection file, verbatim, named by its hash
-{...}
----- end
-@algo binomial
-info {"leaf":null,"restrictions":[],"mask":0,"inner":[]}
-penalty intra 0.0 0.1 ...
-penalty inter -
-curve 2x4 2.181421 2.190931 ...
-meas 2 4 1 4406.8 0 - - 269.7395 269.521 272.277
-pre 1 2 1 0
-```
-
-- `#` starts a comment line; fields are separated by any blanks; small
-  structured values are one-line JSON.
-- The unit keeps what its algorithms share: the layouts and their masks,
-  the jobs (a measurement cites one by index), the runs and the inner
-  selection files. The reader checks each file against its hash, so a hand
-  edit can't detach the measurements that name it.
-- An `@algo` section holds what is one algorithm's own: its catalog entry
-  (`info`), its fit, and its records. `meas` is N ppn m wall_us job flags
-  (`a` drift anchor, `g` growth anchor, `-`) inner (hash or `-`) and the
-  repetitions t_us; `pre` is N ppn ok job and the message. These sections
-  are the shape that per-algorithm model files will take.
-- Measurements are columns instead of JSON objects, so the file is smaller
-  than the JSON. A gzipped `.model` loads as it is.
-- `collmodel --convert old.json --out new.model` converts a JSON model;
-  any load and save does the same.
-
-**collmodel/5** (JSON, read only) holds the same units:
-
-```json
-{"format": "collmodel/5", "created": "...",
- "units": [{"tags": {"coll": "allreduce", "variant": {"builtin_op": 1, "commutative": 1, "inplace": 0},
-                     "datatype": "int", "launch": "host"},
-            "sizes": [...], ...the rest as in a collmodel/4 file, below, without format, op and mem...}]}
-```
-
-A unit is self-contained (its jobs, inner files and runs are its own), so
-units copy between files unchanged: a collmodel run puts its unit into
-`--out` and keeps the file's other units (adding those of `--model` it
-lacks, so adding to a model keeps its other units), `collmodel --merge` combines
-files, `collmodel --model` and `colltree --unit` select units by their tags.
-A collmodel/4 file reads as one unit; new tags get defaults (a unit written
-before a tag existed has its default value).
-
-**collmodel/4** (JSON, read only), one unit per file. Its fields are the unit's
-fields in every format:
-
-```json
-{"format": "collmodel/4", "op": "bcast", "sizes": [...], "domain": {...}, "layouts": [[1, 2], ...],
- "conditions": ["inplace", ...], "algorithms": {"binomial": {"leaf": "...", "restrictions": [], "mask": 0,
-                                                              "inner": []}, ...},
- "layout_masks": [[1, 2, 2048], ...], "left_out": ["nb"],
- "data": {"jobs": [{...}], "measurements": [{"alg": "binomial", "N": 2, "ppn": 4, "m": 1024,
-                                             "t_us": [...], "wall_us": ..., "job": 0}, ...],
-          "prechecks": [{"alg": ..., "N": ..., "ppn": ..., "ok": true, "msg": "", "job": 0}, ...],
-          "inner_files": {"<hash>": "<tuning file text>"}},
- "fit": {"version": 2, "inner": {"smp": "<hash>"},
-         "curves": {"binomial": [{"N": 2, "ppn": 4, "log2_t": [...]}, ...], ...},
-         "penalty": {"binomial": {"intra": [...], "inter": null}, ...}},
- "runs": [{"mode": "create" | "add" | "import", "jobs": [...], "stop": ..., "node_h": ..., ...}]}
-```
-
-`"mem"` is the buffers' memory kind, `host` (also when the field is
-absent) or `device`.
-
-An algorithm with `extra_params` in the catalog also has `"params"`, the
-leaf parameters at the values the server ran with: mpisrv's info record
-lists every global int and enum CVAR (`cvar_values`, enums by item name),
-and each non-constant parameter takes `MPIR_CVAR_<COLL>_<cvar_param>`, as
-MPICH's `maint/gen_coll.py` maps them. colltree writes them into the
-leaves, so a tuning file runs an algorithm the way it was measured, also
-under `--env` overrides. A boolean comes out as 0 or 1 (MPI_T reports it as
-an int), which MPICH's JSON parser accepts since csel-json-bool-int. A
-model without `params` (recorded earlier, or replay) gets colltree's
-frozen table of the 2026-10 defaults.
-
-A measurement of a compositional algorithm also has `"inner": "<hash>"`,
-an anchor `"anchor": true`. An algorithm's model across layouts is a
-LayoutModel (§5) over all its curves. Its penalty a(m), per class (intra:
-N = 1, inter: N > 1; `null` where there is nothing to fit), is the only
-costly part of that fit (a leave-one-out search over a grid of a), so the fit
-stores it and a load builds the LayoutModel from it; a file of fit version 1
-(before the penalty was stored) refits it on load. collmodel/2 and /3,
-written by earlier versions, convert with `bin/collmodel --import`.
+**Model files** (collmodel/6 text, `*.model`; the JSON collmodel/5, /4
+and the one-algorithm collmodel/1): see [model_file.md](model_file.md).
 
 **Tuning JSON:** CSEL subtrees, the restriction sets (`name=bcast-intra-0`,
 ...), loaded with `MPIR_CVAR_COLL_SELECTION_JSON_FILE`; each replaces MPICH's
@@ -747,7 +618,7 @@ measure when outside both:
 
 ### 12.1 The model file: data and fit
 
-One unit of a model file (§8) has two sections:
+One unit of a model file ([model_file.md](model_file.md)) has two sections:
 
 - **`data`**, the source of truth: every measurement as a record (op,
   algorithm, N, ppn, m, the repetitions `t_us`, `wall_us`, the job, the
@@ -859,7 +730,7 @@ import from their journals.
   files from split jobs (a unit in two files must be the same).
 - **Leaf parameters.** mpisrv's info record lists the global int and enum
   CVARs; each algorithm with `extra_params` records the values of its
-  parameters' CVARs (§8), which colltree writes into the leaves.
+  parameters' CVARs (model_file.md), which colltree writes into the leaves.
 
 ### 12.3 colltree: models to one file
 

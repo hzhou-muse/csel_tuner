@@ -65,6 +65,8 @@ stages.
 - [docs/design.md](docs/design.md): the server and its measurement method,
   the three builders, file formats, evaluation by replay, and the lessons
   from measurements behind the design.
+- [docs/model_file.md](docs/model_file.md): the model file format
+  (collmodel/6 text, the JSON formats read).
 
 ## Layout
 
@@ -76,7 +78,7 @@ server/       mpisrv.def, macros/*.def, colls/*.def (benchmark server, MyDef; ge
 launch/       config.sh, sites/*.sh
 replay/       replay of recorded measurements: converter, scripts
 groundtruth/  batch-mode plans, runner, checks
-docs/         design.md, usage.md
+docs/         design.md, usage.md, model_file.md
 skills/       csel-tuner-batch: batch strategies and kit templates, as a Claude Code skill
 tests/        quick checks
 ```
