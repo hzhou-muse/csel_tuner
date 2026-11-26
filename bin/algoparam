@@ -27,7 +27,10 @@ The output holds one unit per collective (--op and each --also of its family, th
 model unit's tags plus kind=param_map): the algorithm's entry with its param_map, and the lead's
 measurements with the parameters of each. An existing --out keeps its other units. --refit FILE
 refits from the measurements in FILE without measuring: the constants its fit had fixed with --set
-(recorded in the fit report, "set") are fixed again; a --set replaces one, --unset drops one.
+(recorded in the fit report, "set") are fixed again; a --set replaces one, --unset drops one. In a
+file with units of several launch kinds, --launch picks one (as collmodel --param-map does: that
+kind, else one with the same buffers). Without --also, the collectives whose unit in FILE carries
+the map are refitted with it. Units of other ops and launch kinds in --out (FILE itself too) stay.
 """
 import argparse
 import datetime
@@ -83,6 +86,10 @@ def write(a, ops, alg, launch, pm, meas, job, run, sizes, lays, nodes, ppn, leaf
             u.notes.append(f"param map from {ops[0]}'s calibration")
         replaced = f.put(u)
         print(f"{a.out}: {'replaced' if replaced else 'added'} unit {tag_str(tags)}")
+    stale = [op for op in followers(f, ops[0], alg, launch) if op not in ops]
+    if stale:
+        print(f"{a.out}: the earlier {launch} map of {ops[0]} stays on {', '.join(stale)} (not in --also)",
+              file=sys.stderr)
     f.save(a.out)
 
 
@@ -172,12 +179,53 @@ def measure(a, ops, alg, launch, fixed):
     return pm, lines, meas, job, run_rec, sizes, lays, ctx.nodes, ctx.ppn
 
 
+def pick_unit(a, op, alg, units):
+    """The unit of FILE to refit: of op, a param map of alg with measurements, of the launch kind
+    --launch names, else of one with the same buffers (params.load_maps' rule); without --launch,
+    the only one."""
+    found = [u for u in units if u.op == op and is_map_unit(u) and alg in u.algorithms and u.measurements]
+    kinds = ", ".join(sorted({u.mem for u in found})) or "none"
+    what = f"--refit {a.refit}: {op} {alg}"
+    if a.launch is None:
+        if len(found) == 1:
+            return found[0]
+        if not found:
+            sys.exit(f"{what}: no unit with measurements")
+        sys.exit(f"{what}: {len(found)} units with measurements (launch {kinds}); pick one with --launch")
+    same = [u for u in found if u.mem == a.launch] or \
+        [u for u in found if is_device(u.mem) == is_device(a.launch)]
+    if len(same) != 1:
+        sys.exit(f"{what}: {len(same)} units with measurements for --launch {a.launch} (need one; "
+                 f"launch kinds with measurements: {kinds})")
+    if same[0].mem != a.launch:
+        print(f"{what}: no {a.launch} unit; refitting the {same[0].mem} unit (same buffers), written as "
+              f"launch={same[0].mem}", file=sys.stderr)
+    return same[0]
+
+
+def followers(f, op, alg, launch):
+    """The collectives whose unit in f, of that launch kind, carries op's map (an --also of the
+    calibration: its fit is {"from": op})."""
+    out = []
+    for u in f.units:
+        pm = (u.algorithms.get(alg) or {}).get("param_map") or {}
+        if is_map_unit(u) and u.mem == launch and u.op != op and (pm.get("fit") or {}).get("from") == op:
+            out.append(u.op)
+    return out
+
+
 def refit(a, ops, alg, fixed):
+    """Refit ops[0]'s map from one unit of FILE; returns ops too: without --also, those of FILE's
+    units that carry the map (refitted with it, so that a family's units agree)."""
     f = ModelFile.load(a.refit)
-    found = [u for u in f.units if u.op == ops[0] and is_map_unit(u) and alg in u.algorithms and u.measurements]
-    if len(found) != 1:
-        sys.exit(f"--refit {a.refit}: {len(found)} units of {ops[0]} {alg} with measurements (need one)")
-    u = found[0]
+    u = pick_unit(a, ops[0], alg, f.units)
+    if not a.also:
+        more = [op for op in followers(f, ops[0], alg, u.mem) if op in a.mod.FAMILY
+                and a.mod.FAMILY[op] == a.mod.FAMILY[ops[0]]]
+        if more:
+            print(f"--refit: in {a.refit}, the {u.mem} map of {ops[0]} also serves {', '.join(more)}; refitted "
+                  "with it (--also names others)", file=sys.stderr)
+            ops = ops + more
     meas = [{k: v for k, v in r.items() if k != "alg"} for r in u.measurements if r["alg"] == alg]
     # the constants the earlier fit had fixed (read from the raw entry: a map of another rule version,
     # which a refit replaces, would not load), then --unset and --set over them
@@ -196,7 +244,7 @@ def refit(a, ops, alg, fixed):
     pm, lines = fit_map(a, ops[0], alg, meas, merged)
     run = {"mode": "refit", "fit": pm.fit, "from": a.refit, "n_measurements": 0}
     job = u.jobs[0] if u.jobs else None
-    return pm, lines, meas, job, run, u.sizes, u.layouts, u.domain["N"][1], u.domain["ppn"][1], \
+    return ops, pm, lines, meas, job, run, u.sizes, u.layouts, u.domain["N"][1], u.domain["ppn"][1], \
         u.algorithms.get(alg, {}).get("leaf"), u.mem
 
 
@@ -217,13 +265,14 @@ def main(argv=None):
                     "its fit had fixed with --set are fixed again")
     ap.add_argument("--unset", action="append", default=[], metavar="CONST",
                     help="with --refit: no longer fix a constant the earlier fit had fixed")
+    ap.add_argument("--launch", choices=["host", "gpu", "device"], help="the launch kind (collmodel --launch): "
+                    "host buffers (default), or device buffers with (gpu) or without GPU_COLL; with --refit, the "
+                    "unit of FILE to refit (that launch kind, else one with the same buffers)")
     g = ap.add_argument_group("live")
     g.add_argument("--launcher", help="command prefix that starts the server; mpisrv and max-m are appended")
     g.add_argument("--site", help="launch through launch/config.sh with launch/sites/SITE.sh")
     g.add_argument("--nodes", type=int)
     g.add_argument("--ppn", type=int)
-    g.add_argument("--launch", default="host", choices=["host", "gpu", "device"], help="the launch kind "
-                   "(collmodel --launch): host buffers, or device buffers with (gpu) or without GPU_COLL")
     g.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
     g.add_argument("--server", default=os.path.join(REPO, "server", "mpisrv"))
     g.add_argument("--max-m", type=int, default=1 << 26)
@@ -279,7 +328,7 @@ def main(argv=None):
             if op == a.op:
                 leaf = x.leaf
     if a.refit:
-        pm, lines, meas, job, run, sizes, lays, nodes, ppn, leaf0, launch = refit(a, ops, a.alg, fixed)
+        ops, pm, lines, meas, job, run, sizes, lays, nodes, ppn, leaf0, launch = refit(a, ops, a.alg, fixed)
         leaf = leaf or leaf0
     else:
         if a.site:
@@ -290,7 +339,7 @@ def main(argv=None):
             a.launcher = "bash -c 'source %s && launch %d %d \"$0\" \"$@\"'" % (cfg, a.nodes, a.ppn)
         if not a.launcher:
             ap.error("--site/--nodes/--ppn or --launcher (or --refit)")
-        launch = a.launch
+        launch = a.launch or "host"
         pm, lines, meas, job, run, sizes, lays, nodes, ppn = measure(a, ops, a.alg, launch, fixed)
     for line in lines:
         print(line)
